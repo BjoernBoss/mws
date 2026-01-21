@@ -138,12 +138,18 @@ export class ClientBase {
 	/* raw (URI encoded) absolute path */
 	public rawpath: string;
 
+	/* raw host of the request */
+	public host: string;
+
+	/* incoming header fields */
+	public headers: libHttp.IncomingHttpHeaders;
+
 	/* unique id to identify client in logs */
 	readonly id: number;
 
-	protected constructor(url: libURL.URL);
+	protected constructor(url: libURL.URL, host: string, headers: libHttp.IncomingHttpHeaders);
 	protected constructor(client: ClientBase);
-	protected constructor(arg: libURL.URL | ClientBase) {
+	protected constructor(arg: libURL.URL | ClientBase, host?: string, headers?: libHttp.IncomingHttpHeaders) {
 		if (arg instanceof libURL.URL) {
 			this.logLayer = '';
 			this.id = ++NextClientId;
@@ -151,6 +157,8 @@ export class ClientBase {
 			this.rawpath = arg.pathname;
 			this.fullpath = this.path;
 			this.basepath = '/';
+			this.host = host!;
+			this.headers = headers!;
 		}
 		else {
 			this.logLayer = arg.logLayer;
@@ -158,7 +166,9 @@ export class ClientBase {
 			this.fullpath = arg.fullpath;
 			this.basepath = arg.basepath;
 			this.rawpath = arg.rawpath;
+			this.host = arg.host;
 			this.id = arg.id;
+			this.headers = arg.headers;
 		}
 	}
 
@@ -185,15 +195,15 @@ export class ClientBase {
 export abstract class HttpBase extends ClientBase {
 	protected request: libHttp.IncomingMessage;
 	protected state: HttpRequestState;
-	protected headers: Record<string, string>;
+	protected outputHeaders: Record<string, string>;
 
 	protected abstract setupResponse(status: number, message: string, content: string, fileType: string): void;
 
-	constructor(request: libHttp.IncomingMessage) {
-		super(new libURL.URL(`http://host.server${request.url}`));
+	constructor(request: libHttp.IncomingMessage, host: string) {
+		super(new libURL.URL(`http://host.server${request.url}`), host, request.headers);
 		this.request = request;
 		this.state = HttpRequestState.none;
-		this.headers = {};
+		this.outputHeaders = {};
 	}
 
 	public finalize() {
@@ -210,7 +220,7 @@ export abstract class HttpBase extends ClientBase {
 	public respondInternalError(msg: string): void {
 		if (this.state == HttpRequestState.none || this.state == HttpRequestState.received) {
 			this.log(`Responded with Internal error [${msg}]`);
-			this.headers = {};
+			this.outputHeaders = {};
 			this.setupResponse(StatusCode.InternalError.code, StatusCode.InternalError.msg, msg, 'txt');
 		}
 	}
@@ -228,8 +238,8 @@ export abstract class HttpBase extends ClientBase {
 export class HttpRequest extends HttpBase {
 	private response: libHttp.ServerResponse;
 
-	constructor(request: libHttp.IncomingMessage, response: libHttp.ServerResponse) {
-		super(request);
+	constructor(request: libHttp.IncomingMessage, response: libHttp.ServerResponse, host: string) {
+		super(request, host);
 		this.response = response;
 	}
 
@@ -241,12 +251,12 @@ export class HttpRequest extends HttpBase {
 
 		/* setup the response */
 		this.response.statusCode = statusCode;
-		for (const key in this.headers)
-			this.response.setHeader(key, this.headers[key]);
+		for (const key in this.outputHeaders)
+			this.response.setHeader(key, this.outputHeaders[key]);
 		this.response.setHeader('Server', libConfig.getServerName());
 		this.response.setHeader('Content-Type', MakeContentType(fileType));
 		this.response.setHeader('Date', new Date().toUTCString());
-		if (!('Accept-Ranges' in this.headers))
+		if (!('Accept-Ranges' in this.outputHeaders))
 			this.response.setHeader('Accept-Ranges', 'none');
 		if (length != null)
 			this.response.setHeader('Content-Length', length);
@@ -264,8 +274,8 @@ export class HttpRequest extends HttpBase {
 			throw new Error('Request has already been handled');
 
 		/* check if too many data have been promised */
-		if (maxLength != null && this.request.headers['content-length'] != undefined) {
-			const length = parseInt(this.request.headers['content-length']);
+		if (maxLength != null && this.headers['content-length'] != undefined) {
+			const length = parseInt(this.headers['content-length']);
 
 			/* check if the length is valid and otherwise mark the state as 'handled' */
 			if (!isFinite(length) || length < 0 || length > maxLength) {
@@ -317,7 +327,7 @@ export class HttpRequest extends HttpBase {
 	}
 
 	public addHeader(key: string, value: string): void {
-		this.headers[key] = value;
+		this.outputHeaders[key] = value;
 	}
 	public ensureMethod(methods: string[]): string | null {
 		if (methods.indexOf(this.request.method!) >= 0)
@@ -329,7 +339,7 @@ export class HttpRequest extends HttpBase {
 		return null;
 	}
 	public ensureMediaType(types: string[]): string | null {
-		const type = this.request.headers['content-type'];
+		const type = this.headers['content-type'];
 		if (type === undefined)
 			return types[0];
 		for (let i = 0; i < types.length; ++i) {
@@ -343,7 +353,7 @@ export class HttpRequest extends HttpBase {
 		return null;
 	}
 	public getMediaTypeCharset(defEncoding: string): string {
-		const type = this.request.headers['content-type'];
+		const type = this.headers['content-type'];
 		if (type === undefined)
 			return defEncoding;
 
@@ -433,20 +443,20 @@ export class HttpRequest extends HttpBase {
 		}
 
 		/* mark byte-ranges to be supported in principle */
-		this.headers['Accept-Ranges'] = 'bytes';
+		this.outputHeaders['Accept-Ranges'] = 'bytes';
 
 		/* parse the range and check if it is invalid */
-		const [offset, size, rangeResult] = ParseRangeHeader(this.request.headers.range, fileSize);
+		const [offset, size, rangeResult] = ParseRangeHeader(this.headers.range, fileSize);
 		if (rangeResult == RangeParseState.malformed) {
-			this.log(`Malformed range-request encountered [${this.request.headers.range}]`);
-			const content = libTemplates.ErrorBadRequest({ path: this.rawpath, reason: `Issues while parsing http-header range: [${this.request.headers.range}]` });
+			this.log(`Malformed range-request encountered [${this.headers.range}]`);
+			const content = libTemplates.ErrorBadRequest({ path: this.rawpath, reason: `Issues while parsing http-header range: [${this.headers.range}]` });
 			this.respondString(StatusCode.BadRequest, 'html', content);
 			return;
 		}
 		else if (rangeResult == RangeParseState.issue) {
-			this.log(`Unsatisfiable range-request encountered [${this.request.headers.range}] with file-size [${fileSize}]`);
-			this.headers['Content-Range'] = `bytes */${fileSize}`;
-			const content = libTemplates.ErrorRangeIssue({ path: this.rawpath, range: this.request.headers.range!, fileSize: fileSize });
+			this.log(`Unsatisfiable range-request encountered [${this.headers.range}] with file-size [${fileSize}]`);
+			this.outputHeaders['Content-Range'] = `bytes */${fileSize}`;
+			const content = libTemplates.ErrorRangeIssue({ path: this.rawpath, range: this.headers.range!, fileSize: fileSize });
 			this.respondString(StatusCode.RangeIssue, 'html', content);
 			return;
 		}
@@ -470,7 +480,7 @@ export class HttpRequest extends HttpBase {
 
 		/* setup the response */
 		if (rangeResult == RangeParseState.valid)
-			this.headers['Content-Range'] = `bytes ${offset}-${offset + size - 1}/${fileSize}`;
+			this.outputHeaders['Content-Range'] = `bytes ${offset}-${offset + size - 1}/${fileSize}`;
 		this.closeHeader((rangeResult == RangeParseState.noRange ? StatusCode.Ok : StatusCode.PartialContent), fileType, size);
 
 		/* write the content to the stream */
@@ -595,8 +605,8 @@ export class HttpUpgrade extends HttpBase {
 	private socket: libStream.Duplex;
 	private head: Buffer;
 
-	constructor(request: libHttp.IncomingMessage, socket: libStream.Duplex, head: Buffer) {
-		super(request);
+	constructor(request: libHttp.IncomingMessage, socket: libStream.Duplex, head: Buffer, host: string) {
+		super(request, host);
 		this.socket = socket;
 		this.head = head;
 	}
@@ -628,10 +638,10 @@ export class HttpUpgrade extends HttpBase {
 	}
 
 	public tryAcceptWebSocket(cb: (ws: ClientSocket) => void): boolean {
-		let connection = this.request.headers?.connection?.toLowerCase().split(',').map((v) => v.trim());
+		let connection = this.headers?.connection?.toLowerCase().split(',').map((v) => v.trim());
 		if (connection == undefined || connection.indexOf('upgrade') == -1)
 			return false;
-		if (this.request.headers?.upgrade?.toLowerCase() != 'websocket' || this.request.method != 'GET')
+		if (this.headers?.upgrade?.toLowerCase() != 'websocket' || this.request.method != 'GET')
 			return false;
 
 		/* ensure the connection can be accepted */

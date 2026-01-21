@@ -21,15 +21,17 @@ export class Server implements libCommon.ServerInterface {
 		client.respondNotFound(`No resource found at [${request.headers.host ?? ''}]:[${client.rawpath}]`);
 		client.finalize();
 	}
-	private handleWrapper(wasRequest: boolean, request: libHttp.IncomingMessage, checkHost: libCommon.CheckHost, handler: libCommon.ModuleInterface, port: number, establish: () => libClient.HttpRequest | libClient.HttpUpgrade): void {
+	private handleWrapper(wasRequest: boolean, request: libHttp.IncomingMessage, checkHost: libCommon.CheckHost, handler: libCommon.ModuleInterface, port: number, establish: (host: string) => libClient.HttpRequest | libClient.HttpUpgrade): void {
 		let client = null;
 		try {
-			client = establish();
+			/* setup the client object */
+			const rawHostName = (request.headers.host ?? '').toLowerCase();
+			client = establish(rawHostName);
 			client.log(`${wasRequest ? 'Request' : 'Upgrade'}:${port} from [${request.socket.remoteAddress}]:${request.socket.remotePort} to [${request.headers.host}]:[${request.url}] (user-agent: [${request.headers['user-agent']}])`);
 
 			/* extract the host to be used and validate its port */
-			let hostName = (request.headers.host ?? '').toLowerCase();
-			const hostNameRegex = hostName.match(/^(.*):(\d+)$/);
+			const hostNameRegex = rawHostName.match(/^(.*):(\d+)$/);
+			let hostName = rawHostName;
 			if (hostNameRegex != null) {
 				if (parseInt(hostNameRegex[2], 10) != port) {
 					client.error(`Host [${hostName}] port does not match [${port}]`);
@@ -59,13 +61,13 @@ export class Server implements libCommon.ServerInterface {
 		}
 	}
 	private handleRequest(request: libHttp.IncomingMessage, response: libHttp.ServerResponse, check: libCommon.CheckHost, handler: libCommon.ModuleInterface, port: number): void {
-		this.handleWrapper(true, request, check, handler, port, function (): libClient.HttpRequest {
-			return new libClient.HttpRequest(request, response);
+		this.handleWrapper(true, request, check, handler, port, function (host: string): libClient.HttpRequest {
+			return new libClient.HttpRequest(request, response, host);
 		});
 	}
 	private handleUpgrade(request: libHttp.IncomingMessage, socket: libStream.Duplex, head: Buffer, check: libCommon.CheckHost, handler: libCommon.ModuleInterface, port: number): void {
-		this.handleWrapper(false, request, check, handler, port, function (): libClient.HttpUpgrade {
-			return new libClient.HttpUpgrade(request, socket, head);
+		this.handleWrapper(false, request, check, handler, port, function (host: string): libClient.HttpUpgrade {
+			return new libClient.HttpUpgrade(request, socket, head, host);
 		});
 	}
 

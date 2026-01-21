@@ -4,7 +4,7 @@ import * as libUrl from 'url';
 import * as libPath from "path";
 
 /* sanitize path and remove relative path components */
-export function Sanitize(path: string): string {
+export function Sanitize(path: string, allowTraversal: boolean = false): string {
 	let out = '/';
 
 	/* iterate over the characters and write them to the output
@@ -23,7 +23,7 @@ export function Sanitize(path: string): string {
 		/* check if its a relative path step and remove it */
 		if (out.endsWith('/.'))
 			out = out.substring(0, out.length - 1);
-		else if (!out.endsWith('/..')) {
+		else if (!out.endsWith('/..') || allowTraversal) {
 			if (i + 1 >= path.length)
 				return out;
 			out += '/';
@@ -72,6 +72,6 @@ export function MakeLocation(path: string): (path: string) => string {
 export function MakeSelfPath(urlFilePath: string, path: string | null = null): (path: string) => string {
 	let dirName = libPath.dirname(libUrl.fileURLToPath(urlFilePath));
 	if (path != null)
-		dirName = libPath.join(dirName, Sanitize(path));
+		dirName = libPath.join(dirName, Sanitize(path, true));
 	return MakeLocation(dirName);
 }
