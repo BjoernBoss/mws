@@ -42,15 +42,11 @@ export class LambdaModule implements ModuleInterface {
 	public request(client: libClient.HttpRequest): void {
 		if (this.requestLambda != undefined)
 			this.requestLambda(client);
-		else
-			client.respondNotFound();
 	}
 
 	public upgrade(client: libClient.HttpUpgrade): void {
 		if (this.upgradeLambda != undefined)
 			this.upgradeLambda(client);
-		else
-			client.respondNotFound();
 	}
 };
 
@@ -88,7 +84,6 @@ export class DispatchModule implements ModuleInterface {
 			return this.mapping[bestMatch];
 		}
 		client.log(`Request cannot be dispatched`);
-		client.respondNotFound();
 		return null;
 	}
 
@@ -101,5 +96,34 @@ export class DispatchModule implements ModuleInterface {
 		const module = this.dispatch(client);
 		if (module != null)
 			module.upgrade(client);
+	}
+};
+
+/*
+*	Simple module interface implementation, which forwards unhandled requests to a lambda.
+*/
+export class UnhandledModule implements ModuleInterface {
+	private handler: ModuleInterface;
+	private requestLambda?: RequestLambda;
+	private upgradeLambda?: UpgradeLambda;
+
+	public name: string = 'unhandler';
+	constructor(handler: ModuleInterface, request?: RequestLambda, upgrade?: UpgradeLambda) {
+		this.handler = handler;
+		libLog.Info(`Wrapping [${handler.name}]`);
+		this.requestLambda = request;
+		this.upgradeLambda = upgrade;
+	}
+
+	public request(client: libClient.HttpRequest): void {
+		this.handler.request(client);
+		if (!client.handled() && this.requestLambda != undefined)
+			this.requestLambda(client);
+	}
+
+	public upgrade(client: libClient.HttpUpgrade): void {
+		this.handler.upgrade(client);
+		if (!client.handled() && this.upgradeLambda != undefined)
+			this.upgradeLambda(client);
 	}
 };

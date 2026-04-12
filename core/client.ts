@@ -124,6 +124,7 @@ const WebSocketServerInstance: libWs.Server = new libWs.WebSocketServer({ noServ
 
 export class ClientBase {
 	protected logLayer: string;
+	protected context: Record<string, unknown>;
 
 	/* path relative to current module base-path */
 	public path: string;
@@ -151,6 +152,7 @@ export class ClientBase {
 	protected constructor(arg: libURL.URL | ClientBase, host?: string, headers?: libHttp.IncomingHttpHeaders) {
 		if (arg instanceof libURL.URL) {
 			this.logLayer = '';
+			this.context = {};
 			this.id = ++NextClientId;
 			this.path = libLocation.Sanitize(decodeURIComponent(arg.pathname));
 			this.rawpath = arg.pathname;
@@ -161,6 +163,7 @@ export class ClientBase {
 		}
 		else {
 			this.logLayer = arg.logLayer;
+			this.context = arg.context;
 			this.path = arg.path;
 			this.fullpath = arg.fullpath;
 			this.basepath = arg.basepath;
@@ -171,6 +174,14 @@ export class ClientBase {
 		}
 	}
 
+	public getContext(name: string): unknown | null {
+		if (name in this.context)
+			return this.context[name];
+		return null;
+	}
+	public setContext(name: string, value: unknown): void {
+		this.context[name] = value;
+	}
 	public tryTranslate(path: string): boolean {
 		if (!libLocation.IsSubDirectory(path, this.path))
 			return false;
@@ -209,9 +220,12 @@ export abstract class HttpBase extends ClientBase {
 		this.outputHeaders = {};
 	}
 
-	public finalize() {
+	public handled(): boolean {
+		return (this.state != HttpRequestState.none && this.state != HttpRequestState.received);
+	}
+	public finalize(): void {
 		if (this.state == HttpRequestState.none || this.state == HttpRequestState.received)
-			throw new Error('Request has not been handled');
+			this.respondNotFound();
 		if (this.state != HttpRequestState.responded)
 			return;
 		let that = this;
@@ -256,7 +270,7 @@ export class HttpRequest extends HttpBase {
 		this.response.statusCode = statusCode;
 		for (const key in this.outputHeaders)
 			this.response.setHeader(key, this.outputHeaders[key]);
-		this.response.setHeader('Server', libConfig.getServerName());
+		this.response.setHeader('Server', libConfig.GetServerName());
 		this.response.setHeader('Content-Type', MakeContentType(fileType));
 		this.response.setHeader('Date', new Date().toUTCString());
 		if (!('Accept-Ranges' in this.outputHeaders))
@@ -429,20 +443,19 @@ export class HttpRequest extends HttpBase {
 		this.log(`Responded with ${fsKind}: [${content.substring(0, 32).replaceAll('\n', ' ').replaceAll('\r', ' ').replaceAll('\t', ' ')}...]`);
 		this.respondString(status, fsKind, content);
 	}
-	public tryRespondFile(filePath: string): void {
+	public tryRespondFile(filePath: string): boolean {
 		/* check if the file exists */
 		let fileSize: number = 0;
 		try {
 			if (!libFs.existsSync(filePath) || !libFs.lstatSync(filePath).isFile()) {
 				this.log(`Request to unknown resource`);
-				this.respondNotFound();
-				return;
+				return false;
 			}
 			fileSize = libFs.statSync(filePath).size;
 		} catch (e: any) {
 			libLog.Error(`Filesystem error while processing [${filePath}]: ${e.message}`);
 			this.respondInternalError('File operation failed');
-			return;
+			return true;
 		}
 
 		/* mark byte-ranges to be supported in principle */
@@ -454,14 +467,14 @@ export class HttpRequest extends HttpBase {
 			this.log(`Malformed range-request encountered [${this.headers.range}]`);
 			const content = libTemplates.ErrorBadRequest({ path: this.rawpath, reason: `Issues while parsing http-header range: [${this.headers.range}]` });
 			this.respondString(StatusCode.BadRequest, 'html', content);
-			return;
+			return true;
 		}
 		else if (rangeResult == RangeParseState.issue) {
 			this.log(`Unsatisfiable range-request encountered [${this.headers.range}] with file-size [${fileSize}]`);
 			this.outputHeaders['Content-Range'] = `bytes */${fileSize}`;
 			const content = libTemplates.ErrorRangeIssue({ path: this.rawpath, range: this.headers.range!, fileSize: fileSize });
 			this.respondString(StatusCode.RangeIssue, 'html', content);
-			return;
+			return true;
 		}
 
 		/* extract the file-type */
@@ -473,7 +486,7 @@ export class HttpRequest extends HttpBase {
 		if (size == 0) {
 			this.log(`Sending empty content for [${filePath}]`);
 			this.respondString(StatusCode.Ok, fileType, '');
-			return;
+			return true;
 		}
 
 		/* setup the filestream object */
@@ -491,6 +504,7 @@ export class HttpRequest extends HttpBase {
 		libStream.pipeline(stream, this.response, (err) => {
 			this.log(err == undefined ? `All content has been sent` : `Error while sending content: [${err}]`);
 		});
+		return true;
 	}
 	public receiveChunks(maxLength: number | null, cb: (data: Buffer | null, error: Error | null) => boolean): boolean {
 		return this.receiveClientChunks(cb, maxLength);
@@ -624,7 +638,7 @@ export class HttpUpgrade extends HttpBase {
 
 		let header = `HTTP/1.1 ${status}\r\n`;
 		header += `Date: ${new Date().toUTCString()}\r\n`;
-		header += `Server: ${libConfig.getServerName()}\r\n`;
+		header += `Server: ${libConfig.GetServerName()}\r\n`;
 		header += `Content-Type: ${MakeContentType(fileType)}\r\n`;
 		header += `Content-Length: ${buffer.length}\r\n`;
 		header += `Accept-Ranges: none\r\n`;

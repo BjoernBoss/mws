@@ -14,12 +14,11 @@ To setup this server simply clone the project:
 Afterwards implement the `modules/setup.js` file with its `Run` method.
 This method should setup any listeners, as well as register the modules themselves, and configure the system accordingly.
 
-Finally install the dependencies, transpile, and start the server:
+Finally install the dependencies, transpile, and start the server (both done by `start`):
 
     $ cd mws-base
     $ npm install
-    $ tsc
-    $ node server/main.js
+    $ npm run start
 
 ## Example setup.js
 
@@ -36,3 +35,5 @@ export async function Run(server) {
     }
 }
 ```
+
+Other possible configurations include `SetServerName` in `core/config.js`.

@@ -3,15 +3,15 @@
 import * as libLog from "./log.js";
 
 let _serverName = '';
-export function setServerName(name: string): void {
+export function SetServerName(name: string): void {
 	_serverName = name;
 	libLog.Info(`Server name configured as: [${_serverName}]`);
 }
-export function getServerName(): string {
+export function GetServerName(): string {
 	return _serverName;
 }
 
 /* initialize the default configuration */
 export function initialize(): void {
-	setServerName('modular-web-server');
+	SetServerName('modular-web-server');
 }
