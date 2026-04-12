@@ -27,7 +27,7 @@ This is an example implementation of the `Run` method in the `modules/setup.js` 
 ```JavaScript
 export async function Run(server) {
     try {
-        const module = await import("./some-module/app.js");
+        const module = await import("some-module/app.js");
         server.listenHttp(93, new module.Module('some-parameter'), (host) => host == 'localhost');
     }
     catch (e) {
@@ -36,4 +36,4 @@ export async function Run(server) {
 }
 ```
 
-Other possible configurations include `SetServerName` in `core/config.js`.
+Other possible configurations include `SetServerName` in `core/config.js`, or the logging configurations in `core/log.js`.

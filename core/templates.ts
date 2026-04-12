@@ -1,21 +1,12 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 /* Copyright (c) 2024-2026 Bjoern Boss Henrichsen */
 import * as libLog from "./log.js";
+import * as libLocation from "./location.js";
 import * as libFs from "fs";
-import * as libPath from "path";
 
+const RelativeBasePath = libLocation.MakeSelfPath(import.meta.url);
 function LoadRelative(path: string): string {
-	/* workaround! (7 => file://) */
-	const dirName = import.meta.dirname ?? libPath.dirname(import.meta.url.slice(7));
-	if (path.startsWith('/'))
-		path = libPath.join(dirName, '.' + path);
-	if (!path.startsWith('./'))
-		path = libPath.join(dirName, './' + path);
-	else
-		path = libPath.join(dirName, path);
-
-	/* try to load the actual file */
-	return libFs.readFileSync(path, 'utf-8');
+	return libFs.readFileSync(RelativeBasePath(path), 'utf-8');
 }
 function ExpandPlaceholders(content: string, map: Record<string, string>): string {
 	var out = '', name = '';

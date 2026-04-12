@@ -4,6 +4,7 @@ import * as libConfig from "./config.js";
 import * as libTemplates from "./templates.js";
 import * as libLog from "./log.js";
 import * as libLocation from "./location.js";
+import * as libBuilder from "./builder.js";
 import * as libPath from "path";
 import * as libBuffer from "buffer";
 import * as libFs from "fs";
@@ -110,14 +111,21 @@ function MakeContentType(fileType: string): string {
 	return 'application/octet-stream';
 }
 
-enum HttpRequestState {
+enum HttpResponseState {
+	/* not yet handled */
 	none,
-	responded,
-	awaiting,
-	upgrading,
-	received,
-	finalized
-}
+
+	/* was acknowledged, but no header sent yet */
+	preparing,
+
+	/* header was sent */
+	responded
+};
+enum HttpReceiveState {
+	none,
+	requested,
+	received
+};
 
 var NextClientId: number = 0;
 const WebSocketServerInstance: libWs.Server = new libWs.WebSocketServer({ noServer: true });
@@ -208,34 +216,31 @@ export class ClientBase {
 
 export abstract class HttpBase extends ClientBase {
 	protected request: libHttp.IncomingMessage;
-	protected state: HttpRequestState;
+	protected state: HttpResponseState;
 	protected outputHeaders: Record<string, string>;
 
 	protected abstract setupResponse(status: number, message: string, content: string, fileType: string): void;
+	protected abstract finalizeBuild(): void;
 
 	constructor(request: libHttp.IncomingMessage, host: string) {
 		super(new libURL.URL(`http://host.server${request.url}`), host, request.headers);
 		this.request = request;
-		this.state = HttpRequestState.none;
+		this.state = HttpResponseState.none;
 		this.outputHeaders = {};
 	}
 
 	public handled(): boolean {
-		return (this.state != HttpRequestState.none && this.state != HttpRequestState.received);
+		return (this.state != HttpResponseState.none);
 	}
 	public finalize(): void {
-		if (this.state == HttpRequestState.none || this.state == HttpRequestState.received)
+		/* check if the content needs to be finalized */
+		if (this.state == HttpResponseState.preparing)
+			this.finalizeBuild();
+		if (this.state == HttpResponseState.none)
 			this.respondNotFound();
-		if (this.state != HttpRequestState.responded)
-			return;
-		let that = this;
-		this.request.on('data', function () {
-			that.error(`Connection sent unexpected data: [${that.rawpath}]`);
-			that.request.destroy();
-		});
 	}
 	public respondInternalError(msg: string): void {
-		if (this.state == HttpRequestState.none || this.state == HttpRequestState.received) {
+		if (this.state != HttpResponseState.responded) {
 			this.log(`Responded with Internal error [${msg}]`);
 			this.outputHeaders = {};
 			this.setupResponse(StatusCode.InternalError.code, StatusCode.InternalError.msg, msg, 'txt');
@@ -254,17 +259,22 @@ export abstract class HttpBase extends ClientBase {
 
 export class HttpRequest extends HttpBase {
 	private response: libHttp.ServerResponse;
+	private htmlBuilder?: libBuilder.HtmlBuilder;
+	private htmlBuildStatus: number;
+	private payload: HttpReceiveState;
 
 	constructor(request: libHttp.IncomingMessage, response: libHttp.ServerResponse, host: string) {
 		super(request, host);
 		this.response = response;
+		this.htmlBuildStatus = StatusCode.Ok;
+		this.payload = HttpReceiveState.none;
 	}
 
 	private closeHeader(statusCode: number, fileType: string, length: number | null = null): void {
 		/* check if the header has already been sent */
-		if (this.state != HttpRequestState.none && this.state != HttpRequestState.received)
+		if (this.state == HttpResponseState.responded)
 			throw new Error('Request has already been handled');
-		this.state = (this.state == HttpRequestState.received ? HttpRequestState.finalized : HttpRequestState.responded);
+		this.state = HttpResponseState.responded;
 
 		/* setup the response */
 		this.response.statusCode = statusCode;
@@ -286,9 +296,11 @@ export class HttpRequest extends HttpBase {
 	private receiveClientChunks(cb: (data: Buffer | null, error: Error | null) => boolean, maxLength: number | null): boolean {
 		let failed = false, accumulated = 0, that = this;
 
-		/* check if a receiver has already been attached */
-		if (this.state != HttpRequestState.none)
+		/* check if the object is ready for receiving */
+		if (this.state == HttpResponseState.responded || this.payload != HttpReceiveState.none)
 			throw new Error('Request has already been handled');
+		this.state = HttpResponseState.preparing;
+		this.payload = HttpReceiveState.requested;
 
 		/* check if too many data have been promised */
 		if (maxLength != null && this.headers['content-length'] != undefined) {
@@ -296,14 +308,12 @@ export class HttpRequest extends HttpBase {
 
 			/* check if the length is valid and otherwise mark the state as 'handled' */
 			if (!isFinite(length) || length < 0 || length > maxLength) {
-				this.state = HttpRequestState.received;
 				this.log(`Request is too large or has no size [${length}]`);
 				const content = libTemplates.ErrorContentTooLarge({ path: this.rawpath, allowedLength: maxLength, providedLength: length });
 				this.respondString(StatusCode.ContentTooLarge, 'html', content);
 				return false;
 			}
 		}
-		this.state = HttpRequestState.awaiting;
 
 		/* register the data recipient */
 		this.request.on('data', function (data: Buffer) {
@@ -328,12 +338,15 @@ export class HttpRequest extends HttpBase {
 			if (!failed) {
 				that.error(`Error while receiving data [${e.message}]`);
 				failed = true;
+				that.request.destroy();
 				cb(null, e);
 			}
 		});
 		this.request.on('end', function () {
 			if (failed) return;
-			that.state = HttpRequestState.received;
+			that.payload = HttpReceiveState.received;
+			if (that.htmlBuilder == undefined && that.state == HttpResponseState.preparing)
+				that.state = HttpResponseState.none;
 			cb(null, null);
 			that.finalize();
 		});
@@ -341,6 +354,12 @@ export class HttpRequest extends HttpBase {
 	}
 	protected setupResponse(status: number, message: string, content: string, fileType: string): void {
 		this.respondString(status, fileType, content);
+	}
+	protected finalizeBuild(): void {
+		if (this.payload != HttpReceiveState.requested && this.state == HttpResponseState.preparing) {
+			const content = this.htmlBuilder!.finalize();
+			this.respondString(this.htmlBuildStatus, 'html', content);
+		}
 	}
 
 	public addHeader(key: string, value: string): void {
@@ -386,6 +405,20 @@ export class HttpRequest extends HttpBase {
 		if (index == end)
 			return defEncoding;
 		return type.substring(index, end);
+	}
+	public getHtmlBuilder(): libBuilder.HtmlBuilder | null {
+		return this.htmlBuilder || null;
+	}
+	public respondHtml(status: number = StatusCode.Ok): libBuilder.HtmlBuilder {
+		if (this.state == HttpResponseState.responded || this.htmlBuilder != undefined)
+			throw new Error('Request has already been handled');
+		const builder = new libBuilder.HtmlBuilder();
+
+		this.log(`Responded with HTML content`);
+		this.htmlBuilder = builder;
+		this.htmlBuildStatus = status;
+		this.state = HttpResponseState.preparing;
+		return builder;
 	}
 	public respondOk(operation: string, msg: string | null = null): void {
 		this.log(`Responded with Ok`);
@@ -632,9 +665,9 @@ export class HttpUpgrade extends HttpBase {
 		const buffer = libBuffer.Buffer.from(text, 'utf-8');
 
 		/* check if the header has already been sent (always set to finalized, as it is closed) */
-		if (this.state != HttpRequestState.none && this.state != HttpRequestState.received)
+		if (this.state == HttpResponseState.responded)
 			throw new Error('Request has already been handled');
-		this.state = HttpRequestState.finalized;
+		this.state = HttpResponseState.responded;
 
 		let header = `HTTP/1.1 ${status}\r\n`;
 		header += `Date: ${new Date().toUTCString()}\r\n`;
@@ -653,6 +686,8 @@ export class HttpUpgrade extends HttpBase {
 	protected setupResponse(status: number, message: string, content: string, fileType: string): void {
 		this.responseString(`${status} ${message}`, fileType, content);
 	}
+	protected finalizeBuild(): void {
+	}
 
 	public tryAcceptWebSocket(cb: (ws: ClientSocket) => void): boolean {
 		let connection = this.headers?.connection?.toLowerCase().split(',').map((v) => v.trim());
@@ -662,9 +697,9 @@ export class HttpUpgrade extends HttpBase {
 			return false;
 
 		/* ensure the connection can be accepted */
-		if (this.state != HttpRequestState.none)
+		if (this.state != HttpResponseState.none)
 			throw new Error('Request has already been handled');
-		this.state = HttpRequestState.upgrading;
+		this.state = HttpResponseState.responded;
 
 		const that = this;
 		WebSocketServerInstance.handleUpgrade(this.request, this.socket, this.head, function (ws, request) {

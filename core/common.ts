@@ -89,13 +89,17 @@ export class DispatchModule implements ModuleInterface {
 
 	public request(client: libClient.HttpRequest): void {
 		const module = this.dispatch(client);
-		if (module != null)
+		if (module != null) {
+			client.pushLog(module.name);
 			module.request(client);
+		}
 	}
 	public upgrade(client: libClient.HttpUpgrade): void {
 		const module = this.dispatch(client);
-		if (module != null)
+		if (module != null) {
+			client.pushLog(module.name);
 			module.upgrade(client);
+		}
 	}
 };
 
@@ -116,12 +120,14 @@ export class UnhandledModule implements ModuleInterface {
 	}
 
 	public request(client: libClient.HttpRequest): void {
+		client.pushLog(this.handler.name);
 		this.handler.request(client);
 		if (!client.handled() && this.requestLambda != undefined)
 			this.requestLambda(client);
 	}
 
 	public upgrade(client: libClient.HttpUpgrade): void {
+		client.pushLog(this.handler.name);
 		this.handler.upgrade(client);
 		if (!client.handled() && this.upgradeLambda != undefined)
 			this.upgradeLambda(client);
