@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
-/* Copyright (c) 2024-2025 Bjoern Boss Henrichsen */
+/* Copyright (c) 2024-2026 Bjoern Boss Henrichsen */
 import * as libConfig from "./config.js";
 import * as libTemplates from "./templates.js";
 import * as libLog from "./log.js";
@@ -18,7 +18,7 @@ export const StatusCode = {
 	PermanentlyMoved: 301,
 	TemporaryRedirect: 307,
 	BadRequest: 400,
-	NotFound: { code: 404, msg: 'Not Fouund' },
+	NotFound: { code: 404, msg: 'Not Found' },
 	MethodNotAllowed: 405,
 	Conflict: 409,
 	ContentTooLarge: 413,
@@ -122,7 +122,6 @@ enum HttpRequestState {
 var NextClientId: number = 0;
 const WebSocketServerInstance: libWs.Server = new libWs.WebSocketServer({ noServer: true });
 
-
 export class ClientBase {
 	protected logLayer: string;
 
@@ -172,14 +171,18 @@ export class ClientBase {
 		}
 	}
 
-	public translate(path: string): void {
+	public tryTranslate(path: string): boolean {
 		if (!libLocation.IsSubDirectory(path, this.path))
-			throw new Error(`Path [${path}] is not a base of [${this.path}]`);
+			return false;
 
 		this.basepath = libLocation.Join(this.basepath, path);
 		this.path = this.path.substring(path.endsWith('/') ? path.length - 1 : path.length);
 		if (this.path == '')
 			this.path = '/';
+		return true;
+	}
+	public makePath(path: string): string {
+		return libLocation.Join(this.basepath, path);
 	}
 	public pushLog(name: string) {
 		this.logLayer = `${this.logLayer}::${name}`;

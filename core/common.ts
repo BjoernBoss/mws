@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
-/* Copyright (c) 2025 Bjoern Boss Henrichsen */
+/* Copyright (c) 2025-2026 Bjoern Boss Henrichsen */
 import * as libClient from './client.js';
+import * as libLog from "./log.js";
+import * as libLocation from "./location.js";
 
 export interface ModuleInterface {
 	name: string;
@@ -20,3 +22,84 @@ export interface ServerInterface {
 	listenHttp(port: number, handler: ModuleInterface, checkHost: CheckHost): void;
 	listenHttps(port: number, key: string, cert: string, handler: ModuleInterface, checkHost: CheckHost): void;
 }
+
+export type RequestLambda = (client: libClient.HttpRequest) => void;
+export type UpgradeLambda = (client: libClient.HttpUpgrade) => void;
+
+/*
+*	Simple module interface implementation, which allows requests to be handled by a lambdas.
+*/
+export class LambdaModule implements ModuleInterface {
+	private requestLambda?: RequestLambda;
+	private upgradeLambda?: UpgradeLambda;
+
+	public name: string = 'lambda';
+	constructor(request?: RequestLambda, upgrade?: UpgradeLambda) {
+		this.requestLambda = request;
+		this.upgradeLambda = upgrade;
+	}
+
+	public request(client: libClient.HttpRequest): void {
+		if (this.requestLambda != undefined)
+			this.requestLambda(client);
+		else
+			client.respondNotFound();
+	}
+
+	public upgrade(client: libClient.HttpUpgrade): void {
+		if (this.upgradeLambda != undefined)
+			this.upgradeLambda(client);
+		else
+			client.respondNotFound();
+	}
+};
+
+/*
+*	Simple module interface implementation, which dispatches requests to different children.
+*/
+export class DispatchModule implements ModuleInterface {
+	private mapping: Record<string, ModuleInterface>;
+
+	public name: string = 'dispatch';
+	constructor(map: Record<string, ModuleInterface>) {
+		this.mapping = {};
+		for (const key in map) {
+			const handler = map[key];
+			libLog.Info(`Mapping [${handler.name}] to [${key}]`);
+			this.mapping[key] = handler;
+		}
+	}
+
+	private dispatch(client: libClient.HttpBase): ModuleInterface | null {
+		let bestMatch: string | null = null;
+
+		/* iterate over the mappings and look for the corresponding best handler */
+		for (const path in this.mapping) {
+			if (!libLocation.IsSubDirectory(path, client.path))
+				continue;
+			if (bestMatch == null || bestMatch.length < path.length)
+				bestMatch = path;
+		}
+
+		/* check if a handler has been found and translate the path accordingly */
+		if (bestMatch != null) {
+			client.log(`Client dispatched to handler [${this.mapping[bestMatch].name}] at [${bestMatch}]`);
+			client.tryTranslate(bestMatch);
+			return this.mapping[bestMatch];
+		}
+		client.log(`Request cannot be dispatched`);
+		client.respondNotFound();
+		return null;
+	}
+
+	public request(client: libClient.HttpRequest): void {
+		const module = this.dispatch(client);
+		if (module != null)
+			module.request(client);
+	}
+	public upgrade(client: libClient.HttpUpgrade): void {
+		const module = this.dispatch(client);
+		if (module != null)
+			module.upgrade(client);
+	}
+};

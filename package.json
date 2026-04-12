@@ -12,5 +12,8 @@
 		"@types/node": "^24.9.2",
 		"@types/ws": "^8.18.1",
 		"typescript": "^5.5.3"
+	},
+	"scripts": {
+		"start": "tsc && node server/main.js"
 	}
 }
