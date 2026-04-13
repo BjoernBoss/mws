@@ -6,7 +6,7 @@ import * as libCache from "./cache.js";
 
 const RelativeBasePath = libLocation.MakeSelfPath(import.meta.url);
 function LoadRelative(path: string): string {
-	const data: Buffer | null = libCache.Read(RelativeBasePath(path));
+	const data: Buffer | null | undefined = libCache.CachedFile.make(RelativeBasePath(path))?.read();
 	if (data != null)
 		return data.toString('utf-8');
 

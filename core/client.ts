@@ -34,13 +34,13 @@ enum RangeParseState {
 	issue,
 	malformed
 };
-function ParseRangeHeader(range: string | undefined, size: number): [number, number, RangeParseState] {
+function ParseRangeHeader(range: string | undefined, fileSize: number): { first: number, last?: number, state: RangeParseState } {
 	if (range == undefined)
-		return [0, size, RangeParseState.noRange];
+		return { first: 0, state: RangeParseState.noRange };
 
 	/* check if it requests bytes */
 	if (!range.startsWith('bytes='))
-		return [0, size, RangeParseState.issue];
+		return { first: 0, state: RangeParseState.issue };
 	range = range.substring(6);
 
 	/* extract the first number */
@@ -50,7 +50,7 @@ function ParseRangeHeader(range: string | undefined, size: number): [number, num
 
 	/* check if the separator exists */
 	if (firstSize >= range.length || range[firstSize] != '-')
-		return [0, 0, RangeParseState.malformed];
+		return { first: 0, state: RangeParseState.malformed };
 
 	/* extract the second number */
 	let secondSize = firstSize + 1;
@@ -60,35 +60,17 @@ function ParseRangeHeader(range: string | undefined, size: number): [number, num
 	/* check if a valid end has been found or another range (only the first
 	*	range will be respected) and that at least one number has been given */
 	if (secondSize < range.length && range[secondSize] != ',')
-		return [0, 0, RangeParseState.malformed];
+		return { first: 0, state: RangeParseState.malformed };
 	secondSize -= firstSize + 1;
 	if (firstSize == 0 && secondSize == 0)
-		return [0, 0, RangeParseState.malformed];
+		return { first: 0, state: RangeParseState.malformed };
 
-	/* parse the two numbers */
-	const begin = (firstSize == 0 ? undefined : parseInt(range.substring(0, firstSize)));
-	const end = (secondSize == 0 ? undefined : parseInt(range.substring(firstSize + 1, secondSize)));
-
-	/* check if only an offset has been requested */
-	if (end == undefined) {
-		if (begin! >= size)
-			return [0, 0, RangeParseState.issue];
-		return [begin!, size - begin!, RangeParseState.valid];
-	}
-
-	/* check if only a suffix has been requested */
-	if (begin == undefined) {
-		if (end >= size)
-			return [0, 0, RangeParseState.issue];
-		return [size - end, end, RangeParseState.valid];
-	}
-
-	/* check that the range is well defined */
-	if (end < begin || begin >= size || end >= size)
-		return [0, 0, RangeParseState.issue];
-
-	/* setup the corrected range */
-	return [begin, end - begin + 1, RangeParseState.valid];
+	/* parse the two numbers and validate the range */
+	const first: number = (firstSize == 0 ? 0 : parseInt(range.substring(0, firstSize)));
+	const last: number | undefined = (secondSize == 0 ? undefined : parseInt(range.substring(firstSize + 1, secondSize)));
+	if (first >= fileSize || (last != undefined && (first > last || last >= fileSize)))
+		return { first: 0, state: RangeParseState.issue };
+	return { first, last, state: RangeParseState.valid };
 }
 
 function MakeContentType(fileType: string): string {
@@ -563,35 +545,26 @@ export class HttpRequest extends HttpBase {
 
 	/* try to respond with the given file (extracting media-type from the file-path), and return false, if not found (http-range aware) */
 	public tryRespondFile(filePath: string): boolean {
-		/* check if the file exists */
-		let fileSize: number = 0;
-		try {
-			if (!libFs.existsSync(filePath) || !libFs.lstatSync(filePath).isFile()) {
-				this.log(`Request to unknown resource`);
-				return false;
-			}
-			fileSize = libFs.statSync(filePath).size;
-		} catch (e: any) {
-			libLog.Error(`Filesystem error while processing [${filePath}]: ${e.message}`);
-			this.respondInternalError('File operation failed');
-			return true;
-		}
+		/* lookup the file in the cache */
+		const cached: libCache.CachedFile | null = libCache.CachedFile.make(filePath);
+		if (cached == null)
+			return false;
 
 		/* mark byte-ranges to be supported in principle */
 		this.outputHeaders['Accept-Ranges'] = 'bytes';
 
 		/* parse the range and ensure that its well formed */
-		const [offset, size, rangeResult] = ParseRangeHeader(this.headers.range, fileSize);
-		if (rangeResult == RangeParseState.malformed) {
+		const range = ParseRangeHeader(this.headers.range, cached.fileSize());
+		if (range.state == RangeParseState.malformed) {
 			this.log(`Malformed range-request encountered [${this.headers.range}]`);
 			const content = libTemplates.ErrorBadRequest({ path: this.rawpath, reason: `Issues while parsing http-header range: [${this.headers.range}]` });
 			this.respondString(StatusCode.BadRequest, 'html', content);
 			return true;
 		}
-		else if (rangeResult == RangeParseState.issue) {
-			this.log(`Unsatisfiable range-request encountered [${this.headers.range}] with file-size [${fileSize}]`);
-			this.outputHeaders['Content-Range'] = `bytes */${fileSize}`;
-			const content = libTemplates.ErrorRangeIssue({ path: this.rawpath, range: this.headers.range!, fileSize: fileSize });
+		else if (range.state == RangeParseState.issue) {
+			this.log(`Unsatisfiable range-request encountered [${this.headers.range}] with file-size [${cached.fileSize()}]`);
+			this.outputHeaders['Content-Range'] = `bytes */${cached.fileSize()}`;
+			const content = libTemplates.ErrorRangeIssue({ path: this.rawpath, range: this.headers.range!, fileSize: cached.fileSize() });
 			this.respondString(StatusCode.RangeIssue, 'html', content);
 			return true;
 		}
@@ -602,25 +575,28 @@ export class HttpRequest extends HttpBase {
 			fileType = fileType.substring(1);
 
 		/* check if the file is empty (can only happen for unused ranges) */
-		if (size == 0) {
+		if (cached.fileSize() == 0) {
 			this.log(`Sending empty content for [${filePath}]`);
 			this.closeHeader(StatusCode.Ok, fileType, 0);
 			this.response.end(Buffer.alloc(0));
 			return true;
 		}
+		range.last = (range.last == undefined ? cached.fileSize() - 1 : range.last);
 
-		/* setup the filestream object */
-		let stream = libFs.createReadStream(filePath, {
-			flags: 'r', start: offset, end: offset + size - 1
-		});
+		/* create the stream for the file */
+		const stream: libStream.Readable | null = cached.stream({ start: range.first, end: range.last });
+		if (stream == null) {
+			this.respondInternalError('File operation failed');
+			return true;
+		}
 
 		/* setup the response */
-		if (rangeResult == RangeParseState.valid)
-			this.outputHeaders['Content-Range'] = `bytes ${offset}-${offset + size - 1}/${fileSize}`;
-		this.closeHeader((rangeResult == RangeParseState.noRange ? StatusCode.Ok : StatusCode.PartialContent), fileType, size);
+		if (range.state == RangeParseState.valid)
+			this.outputHeaders['Content-Range'] = `bytes ${range.first}-${range.last}/${cached.fileSize()}`;
+		this.closeHeader((range.state == RangeParseState.noRange ? StatusCode.Ok : StatusCode.PartialContent), fileType, (range.last - range.first) + 1);
 
 		/* write the content to the stream */
-		this.log(`Sending content [${offset} - ${offset + size - 1}/${fileSize}] from [${filePath}]`);
+		this.log(`Sending content [${range.first} - ${range.last}/${cached.fileSize()}] from [${filePath}]`);
 		libStream.pipeline(stream, this.response, (err) => {
 			this.log(err == undefined ? `All content has been sent` : `Error while sending content: [${err}]`);
 		});

@@ -51,118 +51,130 @@ function CacheDrop(path: string): void {
 	delete cacheMap[path];
 }
 
-interface CheckState {
-	exists: boolean;
-	size: number;
-	mtime: number;
-	data: Buffer | null;
-}
-function LookupFileState(path: string): CheckState {
-	/* read the file size */
-	let fileSize: number = 0, mtime: number = 0;
-	try {
-		if (!libFs.existsSync(path))
-			return { exists: false, data: null, size: 0, mtime: 0 };
-		const stats = libFs.lstatSync(path);
-		if (!stats.isFile())
-			return { exists: false, data: null, size: 0, mtime: 0 };
-		fileSize = stats.size;
-		mtime = stats.mtime.getTime();
-	} catch (e: any) {
-		libLog.Error(`Filesystem error while checking [${path}]: ${e.message}`);
-		throw new Error('File operation failed');
+export class CachedFile {
+	private path: string;
+	private size: number;
+	private data: Buffer | null;
+	private mtime: number;
+
+	private constructor(path: string, size: number, data: Buffer | null, mtime: number) {
+		this.path = path;
+		this.size = size;
+		this.data = data;
+		this.mtime = mtime;
 	}
 
-	/* check if the entry is cached */
-	if (path in cacheMap) {
-		const entry = cacheMap[path];
-
-		/* validate that the entry is still up-to-date and return it */
-		if (entry.mtime == mtime && entry.data.length == fileSize) {
-			entry.touched = ++nextTouchStamp;
-			return { exists: true, data: entry.data, size: fileSize, mtime };
+	static make(path: string, options?: { persistent?: boolean }): CachedFile | null {
+		/* read the file size */
+		let fileSize: number = 0, mtime: number = 0;
+		try {
+			if (!libFs.existsSync(path))
+				return null;
+			const stats = libFs.lstatSync(path);
+			if (!stats.isFile())
+				return null;
+			fileSize = stats.size;
+			mtime = stats.mtime.getTime();
+		} catch (e: any) {
+			libLog.Error(`Filesystem error while checking [${path}]: ${e.message}`);
+			throw new Error('File operation failed');
 		}
 
-		/* remove the entry as it seems to be outdated */
-		CacheDrop(path);
-	}
-	return { exists: true, data: null, size: fileSize, mtime: mtime };
-}
+		/* check if the entry is cached */
+		if (path in cacheMap) {
+			const entry = cacheMap[path];
 
-export function Stream(path: string, options?: { start?: number, end?: number, check?: (size: number) => boolean }): libStream.Readable | null {
-	/* check if the file exists and if the stream should continue and if the data have already been cached */
-	const state = LookupFileState(path);
-	if (!state.exists)
-		return null;
-	if (options?.check != undefined && !options.check(state.size))
-		return null;
-	if (state.data != null)
-		return libStream.Readable.from(state.data.subarray(options?.start, options?.end));
+			/* validate that the entry is still up-to-date and return it */
+			if (entry.mtime == mtime && entry.data.length == fileSize) {
+				entry.touched = ++nextTouchStamp;
+				return new CachedFile(path, fileSize, entry.data, mtime);
+			}
 
-	/* create the data stream */
-	let stream: libFs.ReadStream | null = null;
-	try {
-		stream = libFs.createReadStream(path, { flags: 'r', start: options?.start, end: options?.end });
-	} catch (e: any) {
-		libLog.Error(`Filesystem error while reading [${path}]: ${e.message}`);
-		throw new Error('File operation failed');
-	}
-
-	/* check if only a partial file is being read, or it is too large, in which case it will not be added to the cache */
-	if (state.size > maxLargestSize || state.size > totalCacheCapacity || (options?.start != undefined && options.start != 0) || (options?.end != undefined && options.end != state.size))
-		return stream;
-
-	/* create the transformer stream to cache the data */
-	let buffers: Buffer[] = [], failed: boolean = false, totalLength: number = 0;
-	const transformer = new libStream.Transform({
-		transform(chunk, _, cb) {
-			if (failed) return;
-			buffers.push(chunk);
-			totalLength += chunk.byteLength;
-			cb(null, chunk);
-		},
-		final(cb) {
-			if (failed) return;
-			if (totalLength == state.size && state.size <= maxLargestSize && state.size <= totalCacheCapacity)
-				CacheAdd(path, Buffer.concat(buffers), state.mtime);
-			cb(null);
+			/* remove the entry as it seems to be outdated */
+			CacheDrop(path);
 		}
-	});
-
-	/* setup the file exceptions to be propagated to the stream */
-	let wrapped = stream.pipe(transformer);
-	stream.on('error', function (e: Error) {
-		libLog.Error(`Filesystem error while reading [${path}]: ${e.message}`);
-		failed = true;
-		wrapped.destroy(e);
-	});
-	return stream;
-}
-export function Read(path: string, options?: { check?: (size: number) => boolean }): Buffer | null {
-	/* check if the file exists and if the stream should continue and if the data have already been cached */
-	const state = LookupFileState(path);
-	if (!state.exists)
-		return null;
-	if (options?.check != undefined && !options.check(state.size))
-		return null;
-	if (state.data != null)
-		return state.data;
-
-	/* read the data into memory */
-	let data: Buffer | null = null;
-	try {
-		data = libFs.readFileSync(path);
-	} catch (e: any) {
-		libLog.Error(`Filesystem error while reading [${path}]: ${e.message}`);
-		throw new Error('File operation failed');
+		return new CachedFile(path, fileSize, null, mtime);
 	}
 
-	/* add the read buffer back to the cache (using the fetched data from before
-	*	reading the file - to detect a file-change since before reading the file) */
-	if (data.byteLength == state.size && state.size <= maxLargestSize && state.size <= totalCacheCapacity)
-		CacheAdd(path, data, state.mtime);
-	return data;
-}
+	public fileSize(): number {
+		return this.size;
+	}
+
+	/* object must not be used anymore after reading or streaming from it, returns null on filesystem errors (already logged) */
+	public stream(options?: { start?: number, end?: number }): libStream.Readable | null {
+		/* check if the data have already been cached */
+		if (this.data != null)
+			return libStream.Readable.from(this.data.subarray(options?.start, (options?.end == undefined ? undefined : options.end + 1)));
+
+		/* create the data stream */
+		let stream: libFs.ReadStream | null = null;
+		try {
+			stream = libFs.createReadStream(this.path, { flags: 'r', start: options?.start, end: options?.end });
+		} catch (e: any) {
+			libLog.Error(`Filesystem error while streaming [${this.path}]: ${e.message}`);
+			return null;
+		}
+
+		/* check if only a partial file is being read, or it is too large, in which case it will not be added to the cache */
+		if (this.size > maxLargestSize || this.size > totalCacheCapacity || (options?.start != undefined && options.start != 0) || (options?.end != undefined && options.end + 1 != this.size))
+			return stream;
+		let that = this;
+
+		/* create the transformer stream to cache the data */
+		let buffers: Buffer[] = [], failed: boolean = false, totalLength: number = 0;
+		const transformer = new libStream.Transform({
+			transform(chunk, _, cb) {
+				if (failed) return;
+				totalLength += chunk.byteLength;
+				buffers.push(chunk);
+				cb(null, chunk);
+			},
+			final(cb) {
+				if (failed) return;
+				if (totalLength == that.size && that.size <= maxLargestSize && that.size <= totalCacheCapacity)
+					CacheAdd(that.path, Buffer.concat(buffers), that.mtime);
+				cb(null);
+			}
+		});
+
+		/* setup the file exceptions to be propagated to the stream */
+		let wrapped = stream.pipe(transformer);
+		stream.on('error', function (e: Error) {
+			libLog.Error(`Filesystem error while streaming [${that.path}]: ${e.message}`);
+			failed = true;
+			wrapped.destroy(e);
+		});
+		return wrapped;
+	}
+
+	/* object must not be used anymore after reading or streaming from it, returns null on filesystem errors (already logged) */
+	public read(): Buffer | null {
+		/* check if the data have already been cached */
+		if (this.data != null)
+			return this.data;
+
+		/* read the data into memory */
+		try {
+			this.data = libFs.readFileSync(this.path);
+		} catch (e: any) {
+			libLog.Error(`Filesystem error while reading [${this.path}]: ${e.message}`);
+			return null;
+		}
+
+		/* check if the file-size changed mid operation */
+		if (this.data.byteLength != this.size) {
+			libLog.Error(`File size changed mid operation [${this.path}]: [${this.data.byteLength}] != [${this.size}]`);
+			return null;
+		}
+
+		/* add the read buffer back to the cache (using the fetched data from before
+		*	reading the file - to detect a file-change since before reading the file) */
+		if (this.size <= maxLargestSize && this.size <= totalCacheCapacity)
+			CacheAdd(this.path, this.data, this.mtime);
+		return this.data;
+	}
+};
+
 export function SetCacheOptions(options: { cacheSize?: number, largestFile?: number }): void {
 	if (options.cacheSize != undefined && options.cacheSize > 0)
 		totalCacheCapacity = options.cacheSize;
