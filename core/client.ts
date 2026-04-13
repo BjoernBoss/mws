@@ -112,18 +112,14 @@ function MakeContentType(fileType: string): string {
 }
 
 enum HttpResponseState {
-	/* not yet handled */
 	none,
-
-	/* was acknowledged, but no header sent yet */
-	preparing,
-
-	/* header was sent */
-	responded
+	prepared,
+	responded,
+	failed
 };
 enum HttpReceiveState {
 	none,
-	requested,
+	awaiting,
 	received
 };
 
@@ -214,9 +210,14 @@ export class ClientBase {
 	}
 };
 
+/*
+*	Request is considered acknowledged, as soon as a payload receiver is registered, a response has been triggered, or a preparation started.
+*/
 export abstract class HttpBase extends ClientBase {
 	protected request: libHttp.IncomingMessage;
+	protected payload: HttpReceiveState;
 	protected state: HttpResponseState;
+	protected processed: boolean;
 	protected outputHeaders: Record<string, string>;
 
 	protected abstract setupResponse(status: number, message: string, content: string, fileType: string): void;
@@ -226,26 +227,35 @@ export abstract class HttpBase extends ClientBase {
 		super(new libURL.URL(`http://host.server${request.url}`), host, request.headers);
 		this.request = request;
 		this.state = HttpResponseState.none;
+		this.payload = HttpReceiveState.none;
+		this.processed = false;
 		this.outputHeaders = {};
 	}
 
 	public handled(): boolean {
-		return (this.state != HttpResponseState.none);
+		return (this.state != HttpResponseState.none || this.payload == HttpReceiveState.awaiting);
 	}
+
+	/* called by framework to indicate that the client has been passed through the modules */
 	public finalize(): void {
-		/* check if the content needs to be finalized */
-		if (this.state == HttpResponseState.preparing)
-			this.finalizeBuild();
-		if (this.state == HttpResponseState.none)
+		this.processed = true;
+		this.finalizeBuild();
+		if (this.state == HttpResponseState.none && this.payload != HttpReceiveState.awaiting)
 			this.respondNotFound();
 	}
+
+	/* respond with [internal-error], if the header has not yet been sent, and otherwise silently discard (only one to not fail, if request was already responded to) */
 	public respondInternalError(msg: string): void {
-		if (this.state != HttpResponseState.responded) {
+		if (this.state != HttpResponseState.responded && this.state != HttpResponseState.failed) {
 			this.log(`Responded with Internal error [${msg}]`);
+			this.state = HttpResponseState.none;
 			this.outputHeaders = {};
 			this.setupResponse(StatusCode.InternalError.code, StatusCode.InternalError.msg, msg, 'txt');
 		}
+		this.state = HttpResponseState.failed;
 	}
+
+	/* respond with [not-found] and either a pre-defined template response or the given msg */
 	public respondNotFound(msg: string | null = null): void {
 		this.log(`Responded with Not-Found`);
 		if (msg != null)
@@ -257,22 +267,24 @@ export abstract class HttpBase extends ClientBase {
 	}
 };
 
+/*
+*	Unhandled exceptions thrown by a request handler will result in [internal-server-errors]
+*	Not responded requests will result in [not-found]
+*	Html response is sent once its content has been set and the client is processed
+*/
 export class HttpRequest extends HttpBase {
 	private response: libHttp.ServerResponse;
 	private htmlBuilder?: libBuilder.HtmlBuilder;
-	private htmlBuildStatus: number;
-	private payload: HttpReceiveState;
+	private queuedStatus?: number;
 
 	constructor(request: libHttp.IncomingMessage, response: libHttp.ServerResponse, host: string) {
 		super(request, host);
 		this.response = response;
-		this.htmlBuildStatus = StatusCode.Ok;
-		this.payload = HttpReceiveState.none;
 	}
 
 	private closeHeader(statusCode: number, fileType: string, length: number | null = null): void {
 		/* check if the header has already been sent */
-		if (this.state == HttpResponseState.responded)
+		if (this.state != HttpResponseState.none)
 			throw new Error('Request has already been handled');
 		this.state = HttpResponseState.responded;
 
@@ -297,10 +309,9 @@ export class HttpRequest extends HttpBase {
 		let failed = false, accumulated = 0, that = this;
 
 		/* check if the object is ready for receiving */
-		if (this.state == HttpResponseState.responded || this.payload != HttpReceiveState.none)
-			throw new Error('Request has already been handled');
-		this.state = HttpResponseState.preparing;
-		this.payload = HttpReceiveState.requested;
+		if (this.payload != HttpReceiveState.none)
+			throw new Error('Payload has already been handled');
+		this.payload = HttpReceiveState.awaiting;
 
 		/* check if too many data have been promised */
 		if (maxLength != null && this.headers['content-length'] != undefined) {
@@ -324,6 +335,12 @@ export class HttpRequest extends HttpBase {
 			if (maxLength != null && accumulated > maxLength) {
 				that.log(`Request payload is too large [${accumulated} > ${maxLength}]`);
 				failed = true;
+
+				/* check if the response was already sent and otherwise update to the content size error */
+				if (that.state == HttpResponseState.none) {
+					const content = libTemplates.ErrorContentTooLarge({ path: that.rawpath, allowedLength: maxLength, providedLength: length });
+					that.respondString(StatusCode.ContentTooLarge, 'html', content);
+				}
 				that.request.destroy();
 				cb(null, new Error('Request is too large'));
 			}
@@ -345,10 +362,9 @@ export class HttpRequest extends HttpBase {
 		this.request.on('end', function () {
 			if (failed) return;
 			that.payload = HttpReceiveState.received;
-			if (that.htmlBuilder == undefined && that.state == HttpResponseState.preparing)
-				that.state = HttpResponseState.none;
 			cb(null, null);
-			that.finalize();
+			if (that.processed)
+				that.finalize();
 		});
 		return true;
 	}
@@ -356,15 +372,22 @@ export class HttpRequest extends HttpBase {
 		this.respondString(status, fileType, content);
 	}
 	protected finalizeBuild(): void {
-		if (this.payload != HttpReceiveState.requested && this.state == HttpResponseState.preparing) {
-			const content = this.htmlBuilder!.finalize();
-			this.respondString(this.htmlBuildStatus, 'html', content);
+		/* check if html is in the pipeline and is ready */
+		if (this.state == HttpResponseState.prepared && this.htmlBuilder != undefined && this.htmlBuilder.isReady()) {
+			const content = this.htmlBuilder.finalize();
+			this.state = HttpResponseState.none;
+			this.respondString(this.queuedStatus!, 'html', content);
 		}
 	}
 
+	/* add the given header to the response */
 	public addHeader(key: string, value: string): void {
+		if (this.state == HttpResponseState.responded || this.state == HttpResponseState.failed)
+			throw new Error('Cannot modify headers of sent response');
 		this.outputHeaders[key] = value;
 	}
+
+	/* ensure the method is one of the list and otherwise return null and auto-respond with [method-not-allowed] */
 	public ensureMethod(methods: string[]): string | null {
 		if (methods.indexOf(this.request.method!) >= 0)
 			return this.request.method!;
@@ -374,6 +397,8 @@ export class HttpRequest extends HttpBase {
 		this.respondString(StatusCode.MethodNotAllowed, 'html', content);
 		return null;
 	}
+
+	/* ensure the media-type is one of the list and otherwise return null and auto-respond with [unsupported-media-type] */
 	public ensureMediaType(types: string[]): string | null {
 		const type = this.headers['content-type'];
 		if (type === undefined)
@@ -388,6 +413,8 @@ export class HttpRequest extends HttpBase {
 		this.respondString(StatusCode.UnsupportedMediaType, 'html', content);
 		return null;
 	}
+
+	/* check the content-type for a media-type and otherwise return the default type */
 	public getMediaTypeCharset(defEncoding: string): string {
 		const type = this.headers['content-type'];
 		if (type === undefined)
@@ -406,20 +433,67 @@ export class HttpRequest extends HttpBase {
 			return defEncoding;
 		return type.substring(index, end);
 	}
+
+	/* return the builder, if a child module plans to produce html */
 	public getHtmlBuilder(): libBuilder.HtmlBuilder | null {
 		return this.htmlBuilder || null;
 	}
-	public respondHtml(status: number = StatusCode.Ok): libBuilder.HtmlBuilder {
-		if (this.state == HttpResponseState.responded || this.htmlBuilder != undefined)
+
+	/* prepare the response to be html, can be built on by parent modules, sent once the client is cleared and the builder is ready */
+	public prepareHtml(status: number = StatusCode.Ok): libBuilder.HtmlBuilder {
+		if (this.state != HttpResponseState.none)
 			throw new Error('Request has already been handled');
 		const builder = new libBuilder.HtmlBuilder();
 
-		this.log(`Responded with HTML content`);
+		this.log(`Responding with HTML content and status [${status}]`);
+		this.state = HttpResponseState.prepared;
+		this.queuedStatus = status;
 		this.htmlBuilder = builder;
-		this.htmlBuildStatus = status;
-		this.state = HttpResponseState.preparing;
+
+		/* register the ready-callback */
+		const that = this;
+		builder.notifyOnReady(function () {
+			if (that.processed)
+				that.finalize();
+		});
 		return builder;
 	}
+
+	/* prepare the response to be delayed, sent through the returned callback */
+	public prepareReponse(status: number = StatusCode.Ok, fileType: string = 'html'): (data: Buffer, last: boolean, ready: ((e: Error | null) => void) | null) => void {
+		if (this.state != HttpResponseState.none)
+			throw new Error('Request has already been handled');
+
+		this.log(`Responding with delayed response and status [${status}]`);
+		this.state = HttpResponseState.prepared;
+		this.queuedStatus = status;
+
+		/* return the send callback */
+		const that = this;
+		let sent = false;
+		return function (data, last, ready) {
+			if (that.state == HttpResponseState.failed)
+				return;
+			if (sent)
+				throw new Error('Responding to closed response');
+
+			/* check if the header needs to be sent */
+			if (that.state == HttpResponseState.prepared) {
+				that.state = HttpResponseState.none;
+				that.closeHeader(that.queuedStatus!, fileType, (last ? data.length : null));
+			}
+			if (last) {
+				that.response.end(data);
+				sent = true;
+			}
+			else if (ready != null)
+				that.response.write(data, (e) => ready(e == undefined ? null : e));
+			else
+				that.response.write(data);
+		};
+	}
+
+	/* respond with [ok] and either a pre-defined template response or the given msg */
 	public respondOk(operation: string, msg: string | null = null): void {
 		this.log(`Responded with Ok`);
 
@@ -430,6 +504,8 @@ export class HttpRequest extends HttpBase {
 			this.respondString(StatusCode.Ok, 'html', content);
 		}
 	}
+
+	/* respond with [conflict] and either a pre-defined template response or the given msg */
 	public respondConflict(conflict: string, msg: string | null = null): void {
 		this.log(`Responded with Conflict of [${conflict}]`);
 
@@ -440,6 +516,8 @@ export class HttpRequest extends HttpBase {
 			this.respondString(StatusCode.Conflict, 'html', content);
 		}
 	}
+
+	/* respond with [permanently-moved] to the given target and either a pre-defined template response or the given msg */
 	public respondMoved(target: string, msg: string | null = null): void {
 		this.log(`Responded with Permanently-Moved to [${target}]`);
 		this.response.setHeader('Location', target);
@@ -451,6 +529,8 @@ export class HttpRequest extends HttpBase {
 			this.respondString(StatusCode.PermanentlyMoved, 'html', content);
 		}
 	}
+
+	/* respond with [temporary-redirect] to the given target and either a pre-defined template response or the given msg */
 	public respondRedirect(target: string, msg: string | null = null): void {
 		this.log(`Responded with Redirect to [${target}]`);
 		this.response.setHeader('Location', target);
@@ -462,6 +542,8 @@ export class HttpRequest extends HttpBase {
 			this.respondString(StatusCode.TemporaryRedirect, 'html', content);
 		}
 	}
+
+	/* respond with [bad-request] to the given target and either a pre-defined template response or the given msg */
 	public respondBadRequest(reason: string, msg: string | null = null): void {
 		this.log(`Responded with Bad-Request`);
 
@@ -472,10 +554,14 @@ export class HttpRequest extends HttpBase {
 			this.respondString(StatusCode.BadRequest, 'html', content);
 		}
 	}
+
+	/* respond with a textual response of the given media-type and given status code */
 	public respondText(content: string, fsKind: string = 'html', status: number = StatusCode.Ok): void {
 		this.log(`Responded with ${fsKind}: [${content.substring(0, 32).replaceAll('\n', ' ').replaceAll('\r', ' ').replaceAll('\t', ' ')}...]`);
 		this.respondString(status, fsKind, content);
 	}
+
+	/* try to respond with the given file (extracting media-type from the file-path), and return false, if not found (http-range aware) */
 	public tryRespondFile(filePath: string): boolean {
 		/* check if the file exists */
 		let fileSize: number = 0;
@@ -518,7 +604,8 @@ export class HttpRequest extends HttpBase {
 		/* check if the file is empty (can only happen for unused ranges) */
 		if (size == 0) {
 			this.log(`Sending empty content for [${filePath}]`);
-			this.respondString(StatusCode.Ok, fileType, '');
+			this.closeHeader(StatusCode.Ok, fileType, 0);
+			this.response.end(libBuffer.Buffer.alloc(0));
 			return true;
 		}
 
@@ -539,9 +626,15 @@ export class HttpRequest extends HttpBase {
 		});
 		return true;
 	}
+
+	/* receive the payload of given max length in chunks until the end has been reached (null, null) an error occurred, or the callback returned false
+	*	(returns false, or aborts if the payload is too large, and automatically responds with [content-too-large]) */
 	public receiveChunks(maxLength: number | null, cb: (data: Buffer | null, error: Error | null) => boolean): boolean {
 		return this.receiveClientChunks(cb, maxLength);
 	}
+
+	/* receive the payload of given max length as a single complete buffer
+	*	(returns false, if the payload is too large, and automatically responds with [content-too-large]) */
 	public receiveAllBuffer(maxLength: number | null, cb: (data: Buffer | null, error: Error | null) => void): boolean {
 		const body: Buffer[] = [];
 
@@ -555,6 +648,9 @@ export class HttpRequest extends HttpBase {
 			return true;
 		}, maxLength);
 	}
+
+	/* receive the payload of given max length as a single complete decoded string
+	*	(returns false, if the payload is too large, and automatically responds with [content-too-large]) */
 	public receiveAllText(maxLength: number | null, encoding: string, cb: (text: string | null, error: Error | null) => void): boolean {
 		const body: Buffer[] = [];
 
@@ -573,6 +669,9 @@ export class HttpRequest extends HttpBase {
 			return true;
 		}, maxLength);
 	}
+
+	/* receive the payload of given max length and write it directly to a file; will fail if the file already exists and delete the file, if it could not be received in full
+	*	(returns false, if the payload is too large, and automatically responds with [content-too-large]) */
 	public receiveToFile(maxLength: number | null, file: string, cb: (error: Error | null) => void): boolean {
 		this.log(`Collecting data from [${this.rawpath}] to: [${file}]`);
 
@@ -589,7 +688,7 @@ export class HttpRequest extends HttpBase {
 			if (fdBusy)
 				return;
 
-			/* check if the fd is to be closed (leave if busy indefinitely) */
+			/* check if the fd is to be closed (leave it busy indefinitely) */
 			if (fdClose) {
 				fdBusy = true;
 				if (fd == null)
@@ -665,7 +764,7 @@ export class HttpUpgrade extends HttpBase {
 		const buffer = libBuffer.Buffer.from(text, 'utf-8');
 
 		/* check if the header has already been sent (always set to finalized, as it is closed) */
-		if (this.state == HttpResponseState.responded)
+		if (this.state != HttpResponseState.none)
 			throw new Error('Request has already been handled');
 		this.state = HttpResponseState.responded;
 

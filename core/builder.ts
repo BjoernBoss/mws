@@ -15,6 +15,7 @@ export class HtmlBuilder {
 	private bodySuffix: string;
 	private title?: string;
 	private language?: string;
+	private readyNotify: (() => void)[];
 
 	constructor() {
 		this.state = BuilderState.none;
@@ -24,6 +25,18 @@ export class HtmlBuilder {
 		this.bodySuffix = '';
 		this.title = '';
 		this.language = '';
+		this.readyNotify = [];
+	}
+
+	private notifyAllListener(): void {
+		for (const entry of this.readyNotify)
+			entry();
+		this.readyNotify = [];
+	}
+	public notifyOnReady(cb: () => void): void {
+		if (this.state != BuilderState.none)
+			throw new Error('Cannot listen on ready builder');
+		this.readyNotify.push(cb);
 	}
 
 	public addHeader(line: string): void {
@@ -34,6 +47,10 @@ export class HtmlBuilder {
 			throw new Error('Html document with multiple contents');
 		this.content = fullDocument;
 		this.state = BuilderState.full;
+		this.notifyAllListener();
+	}
+	public isReady(): boolean {
+		return (this.state != BuilderState.none);
 	}
 
 	/* language defaults to 'en' if empty */
@@ -44,6 +61,7 @@ export class HtmlBuilder {
 		this.content = body;
 		this.title = config.title;
 		this.language = (config.language == undefined ? 'en' : config.language);
+		this.notifyAllListener();
 	}
 	public wrap(prefix: string, suffix: string): void {
 		if (prefix.length > 0)
