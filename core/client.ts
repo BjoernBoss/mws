@@ -5,8 +5,8 @@ import * as libTemplates from "./templates.js";
 import * as libLog from "./log.js";
 import * as libLocation from "./location.js";
 import * as libBuilder from "./builder.js";
+import * as libCache from "./cache.js";
 import * as libPath from "path";
-import * as libBuffer from "buffer";
 import * as libFs from "fs";
 import * as libStream from "stream";
 import * as libURL from "url";
@@ -301,7 +301,7 @@ export class HttpRequest extends HttpBase {
 			this.response.setHeader('Content-Length', length);
 	}
 	private respondString(code: number, fileType: string, string: string): void {
-		const buffer = libBuffer.Buffer.from(string, 'utf-8');
+		const buffer = Buffer.from(string, 'utf-8');
 		this.closeHeader(code, fileType, buffer.length);
 		this.response.end(buffer);
 	}
@@ -580,7 +580,7 @@ export class HttpRequest extends HttpBase {
 		/* mark byte-ranges to be supported in principle */
 		this.outputHeaders['Accept-Ranges'] = 'bytes';
 
-		/* parse the range and check if it is invalid */
+		/* parse the range and ensure that its well formed */
 		const [offset, size, rangeResult] = ParseRangeHeader(this.headers.range, fileSize);
 		if (rangeResult == RangeParseState.malformed) {
 			this.log(`Malformed range-request encountered [${this.headers.range}]`);
@@ -605,7 +605,7 @@ export class HttpRequest extends HttpBase {
 		if (size == 0) {
 			this.log(`Sending empty content for [${filePath}]`);
 			this.closeHeader(StatusCode.Ok, fileType, 0);
-			this.response.end(libBuffer.Buffer.alloc(0));
+			this.response.end(Buffer.alloc(0));
 			return true;
 		}
 
@@ -644,7 +644,7 @@ export class HttpRequest extends HttpBase {
 			else if (buf != null)
 				body.push(buf);
 			else
-				cb(libBuffer.Buffer.concat(body), null);
+				cb(Buffer.concat(body), null);
 			return true;
 		}, maxLength);
 	}
@@ -662,7 +662,7 @@ export class HttpRequest extends HttpBase {
 
 			/* convert the buffers to a string */
 			else try {
-				cb(libBuffer.Buffer.concat(body).toString(encoding as BufferEncoding), null);
+				cb(Buffer.concat(body).toString(encoding as BufferEncoding), null);
 			} catch (e: any) {
 				cb(null, e);
 			}
@@ -760,8 +760,8 @@ export class HttpUpgrade extends HttpBase {
 		this.head = head;
 	}
 
-	private responseString(status: string, fileType: string, text: string): void {
-		const buffer = libBuffer.Buffer.from(text, 'utf-8');
+	private responseString(status: string, fileType: string, text: string, badRequest: boolean): void {
+		const buffer = Buffer.from(text, 'utf-8');
 
 		/* check if the header has already been sent (always set to finalized, as it is closed) */
 		if (this.state != HttpResponseState.none)
@@ -774,8 +774,10 @@ export class HttpUpgrade extends HttpBase {
 		header += `Content-Type: ${MakeContentType(fileType)}\r\n`;
 		header += `Content-Length: ${buffer.length}\r\n`;
 		header += `Accept-Ranges: none\r\n`;
-		header += 'Connection: keep-alive\r\n';
-		header += 'Keep-Alive: timeout=5\r\n';
+		if (!badRequest && (this.request.headers.connection || "").toLowerCase() != "close" && this.request.httpVersionMajor < 2) {
+			header += 'Connection: keep-alive\r\n';
+			header += 'Keep-Alive: timeout=5\r\n';
+		}
 		header += '\r\n';
 
 		this.socket.write(header, 'utf-8');
@@ -783,7 +785,7 @@ export class HttpUpgrade extends HttpBase {
 		this.socket.destroy();
 	}
 	protected setupResponse(status: number, message: string, content: string, fileType: string): void {
-		this.responseString(`${status} ${message}`, fileType, content);
+		this.responseString(`${status} ${message}`, fileType, content, (status >= 400));
 	}
 	protected finalizeBuild(): void {
 	}

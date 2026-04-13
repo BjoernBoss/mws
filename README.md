@@ -36,4 +36,4 @@ export async function Run(server) {
 }
 ```
 
-Other possible configurations include `SetServerName` in `core/config.js`, or the logging configurations in `core/log.js`.
+Other possible configurations include `SetServerName` in `core/config.js`, or the logging configurations in `core/log.js`, or cache configurations in `core/cache.js`.

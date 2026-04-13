@@ -3,6 +3,7 @@
 import * as libServer from "./server.js";
 import * as libLog from "core/log.js";
 import * as libConfig from "core/config.js";
+import * as libCache from "core/cache.js";
 
 async function Setup(setupModule: any) {
 	if (setupModule == null || setupModule.Run === undefined) {
@@ -23,7 +24,8 @@ async function Setup(setupModule: any) {
 }
 
 /* initialize the default configuration (before loading the local module!) */
-libConfig.initialize();
+libConfig.Initialize();
+libCache.Initialize();
 
 /* try to load the local configuration and otherwise perform the default-setup */
 import("../modules/setup.js")
