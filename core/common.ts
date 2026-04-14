@@ -18,11 +18,6 @@ export interface ModuleInterface {
 */
 export type CheckHost = (host: string) => boolean;
 
-export interface ServerInterface {
-	listenHttp(port: number, handler: ModuleInterface, checkHost: CheckHost): void;
-	listenHttps(port: number, key: string, cert: string, handler: ModuleInterface, checkHost: CheckHost): void;
-}
-
 export type RequestLambda = (client: libClient.HttpRequest) => void;
 export type UpgradeLambda = (client: libClient.HttpUpgrade) => void;
 

@@ -1,5 +1,8 @@
 {
-    "type": "module",
-    "private": true,
-    "name": "core"
+	"type": "module",
+	"private": true,
+	"name": "core",
+	"scripts": {
+		"build": "tsc"
+	}
 }

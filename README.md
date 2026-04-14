@@ -5,6 +5,7 @@
 Small custom webserver written in TypeScript/JavaScript, capable to host mutliple separate modules with support for simple http requests and websockets.
 
 To write a module for the server, simply implement the `ModuleInterface` defined in `core/common.ts`. 
+For this, the workspace `core` provides all functionality to interact with the server and incoming connections.
 
 ## Using the Server
 To setup this server simply clone the project:
@@ -14,7 +15,9 @@ To setup this server simply clone the project:
 Afterwards implement the `modules/setup.js` file with its `Run` method.
 This method should setup any listeners, as well as register the modules themselves, and configure the system accordingly.
 
-Finally install the dependencies, transpile, and start the server (both done by `start`):
+Configurations include `SetServerName` in `core/config.js`, the logging configurations in `core/log.js`, or cache configurations in `core/cache.js`.
+
+Finally install the dependencies, build, and start the server (building and running done by `start`):
 
     $ cd mws-base
     $ npm install
@@ -35,5 +38,3 @@ export async function Run(server) {
     }
 }
 ```
-
-Other possible configurations include `SetServerName` in `core/config.js`, or the logging configurations in `core/log.js`, or cache configurations in `core/cache.js`.

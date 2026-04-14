@@ -2,6 +2,5 @@ package-lock.json
 node_modules
 .vscode
 core/*.js
-server/*.js
 modules/*
 !modules/setup.d.ts

@@ -9,7 +9,7 @@ import * as libFs from "fs";
 import * as libStream from "stream";
 import * as libNet from "net";
 
-export class Server implements libCommon.ServerInterface {
+export class Server {
 	private stopList: (() => void)[];
 
 	constructor() {
