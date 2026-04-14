@@ -8,11 +8,12 @@ interface CacheEntry {
 	data: Buffer;
 	mtime: number;
 	touched: number;
+	persistent: boolean;
 }
 const cacheMap: Record<string, CacheEntry> = {};
 let nextTouchStamp: number = 0, totalCacheSize: number = 0, totalCacheCapacity: number = 0, maxLargestSize: number = 0;
 
-function CacheAdd(path: string, data: Buffer, mtime: number): void {
+function CacheAdd(path: string, data: Buffer, mtime: number, persistent: boolean): void {
 	if (data.byteLength > totalCacheCapacity || data.byteLength > maxLargestSize)
 		return;
 
@@ -31,7 +32,7 @@ function CacheAdd(path: string, data: Buffer, mtime: number): void {
 	/* add the entry to the cache */
 	libLog.Log(`Added [${path}] to the cache`);
 	totalCacheSize += data.byteLength;
-	cacheMap[path] = { data: data, mtime: mtime, touched: ++nextTouchStamp };
+	cacheMap[path] = { data: data, mtime: mtime, touched: ++nextTouchStamp, persistent };
 }
 function CacheReduce(capacity: number): void {
 	/* create the list of all cached objects sorted by the touched count */
@@ -56,15 +57,24 @@ export class CachedFile {
 	private size: number;
 	private data: Buffer | null;
 	private mtime: number;
+	private persistent: boolean;
 
-	private constructor(path: string, size: number, data: Buffer | null, mtime: number) {
+	private constructor(path: string, size: number, data: Buffer | null, mtime: number, persistent: boolean) {
 		this.path = path;
 		this.size = size;
 		this.data = data;
 		this.mtime = mtime;
+		this.persistent = persistent;
 	}
 
 	static make(path: string, options?: { persistent?: boolean }): CachedFile | null {
+		/* check if the entry is marked as persistent and already in the cache, in which case the file doesn't even need to be checked */
+		if (options?.persistent === true && cacheMap[path]?.persistent === true) {
+			const entry = cacheMap[path];
+			entry.touched = ++nextTouchStamp;
+			return new CachedFile(path, entry.data.byteLength, entry.data, entry.mtime, entry.persistent);
+		}
+
 		/* read the file size */
 		let fileSize: number = 0, mtime: number = 0;
 		try {
@@ -87,13 +97,13 @@ export class CachedFile {
 			/* validate that the entry is still up-to-date and return it */
 			if (entry.mtime == mtime && entry.data.length == fileSize) {
 				entry.touched = ++nextTouchStamp;
-				return new CachedFile(path, fileSize, entry.data, mtime);
+				return new CachedFile(path, fileSize, entry.data, mtime, options?.persistent || false);
 			}
 
 			/* remove the entry as it seems to be outdated */
 			CacheDrop(path);
 		}
-		return new CachedFile(path, fileSize, null, mtime);
+		return new CachedFile(path, fileSize, null, mtime, options?.persistent || false);
 	}
 
 	public fileSize(): number {
@@ -132,7 +142,7 @@ export class CachedFile {
 			final(cb) {
 				if (failed) return;
 				if (totalLength == that.size && that.size <= maxLargestSize && that.size <= totalCacheCapacity)
-					CacheAdd(that.path, Buffer.concat(buffers), that.mtime);
+					CacheAdd(that.path, Buffer.concat(buffers), that.mtime, that.persistent);
 				cb(null);
 			}
 		});
@@ -170,7 +180,7 @@ export class CachedFile {
 		/* add the read buffer back to the cache (using the fetched data from before
 		*	reading the file - to detect a file-change since before reading the file) */
 		if (this.size <= maxLargestSize && this.size <= totalCacheCapacity)
-			CacheAdd(this.path, this.data, this.mtime);
+			CacheAdd(this.path, this.data, this.mtime, this.persistent);
 		return this.data;
 	}
 };
