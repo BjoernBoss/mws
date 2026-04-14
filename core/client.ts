@@ -545,61 +545,61 @@ export class HttpRequest extends HttpBase {
 
 	/* try to respond with the given file (extracting media-type from the file-path), and return false, if not found (http-range aware) */
 	public tryRespondFile(filePath: string): boolean {
-		/* lookup the file in the cache */
-		const cached: libCache.CachedFile | null = libCache.CachedFile.make(filePath);
-		if (cached == null)
-			return false;
+		try {
+			/* lookup the file in the cache */
+			const cached: libCache.CachedFile | null = libCache.CachedFile.make(filePath);
+			if (cached == null)
+				return false;
 
-		/* mark byte-ranges to be supported in principle */
-		this.outputHeaders['Accept-Ranges'] = 'bytes';
+			/* mark byte-ranges to be supported in principle */
+			this.outputHeaders['Accept-Ranges'] = 'bytes';
 
-		/* parse the range and ensure that its well formed */
-		const range = ParseRangeHeader(this.headers.range, cached.fileSize());
-		if (range.state == RangeParseState.malformed) {
-			this.log(`Malformed range-request encountered [${this.headers.range}]`);
-			const content = libTemplates.ErrorBadRequest({ path: this.rawpath, reason: `Issues while parsing http-header range: [${this.headers.range}]` });
-			this.respondString(StatusCode.BadRequest, 'html', content);
-			return true;
-		}
-		else if (range.state == RangeParseState.issue) {
-			this.log(`Unsatisfiable range-request encountered [${this.headers.range}] with file-size [${cached.fileSize()}]`);
-			this.outputHeaders['Content-Range'] = `bytes */${cached.fileSize()}`;
-			const content = libTemplates.ErrorRangeIssue({ path: this.rawpath, range: this.headers.range!, fileSize: cached.fileSize() });
-			this.respondString(StatusCode.RangeIssue, 'html', content);
-			return true;
-		}
+			/* parse the range and ensure that its well formed */
+			const range = ParseRangeHeader(this.headers.range, cached.fileSize());
+			if (range.state == RangeParseState.malformed) {
+				this.log(`Malformed range-request encountered [${this.headers.range}]`);
+				const content = libTemplates.ErrorBadRequest({ path: this.rawpath, reason: `Issues while parsing http-header range: [${this.headers.range}]` });
+				this.respondString(StatusCode.BadRequest, 'html', content);
+				return true;
+			}
+			else if (range.state == RangeParseState.issue) {
+				this.log(`Unsatisfiable range-request encountered [${this.headers.range}] with file-size [${cached.fileSize()}]`);
+				this.outputHeaders['Content-Range'] = `bytes */${cached.fileSize()}`;
+				const content = libTemplates.ErrorRangeIssue({ path: this.rawpath, range: this.headers.range!, fileSize: cached.fileSize() });
+				this.respondString(StatusCode.RangeIssue, 'html', content);
+				return true;
+			}
 
-		/* extract the file-type */
-		let fileType = libPath.extname(filePath).toLowerCase();
-		if (fileType.startsWith('.'))
-			fileType = fileType.substring(1);
+			/* extract the file-type */
+			let fileType = libPath.extname(filePath).toLowerCase();
+			if (fileType.startsWith('.'))
+				fileType = fileType.substring(1);
 
-		/* check if the file is empty (can only happen for unused ranges) */
-		if (cached.fileSize() == 0) {
-			this.log(`Sending empty content for [${filePath}]`);
-			this.closeHeader(StatusCode.Ok, fileType, 0);
-			this.response.end(Buffer.alloc(0));
-			return true;
-		}
-		range.last = (range.last == undefined ? cached.fileSize() - 1 : range.last);
+			/* check if the file is empty (can only happen for unused ranges) */
+			if (cached.fileSize() == 0) {
+				this.log(`Sending empty content for [${filePath}]`);
+				this.closeHeader(StatusCode.Ok, fileType, 0);
+				this.response.end(Buffer.alloc(0));
+				return true;
+			}
+			range.last = (range.last == undefined ? cached.fileSize() - 1 : range.last);
 
-		/* create the stream for the file */
-		const stream: libStream.Readable | null = cached.stream({ start: range.first, end: range.last });
-		if (stream == null) {
+			/* create the stream for the file */
+			const stream: libStream.Readable = cached.stream({ start: range.first, end: range.last });
+
+			/* setup the response */
+			if (range.state == RangeParseState.valid)
+				this.outputHeaders['Content-Range'] = `bytes ${range.first}-${range.last}/${cached.fileSize()}`;
+			this.closeHeader((range.state == RangeParseState.noRange ? StatusCode.Ok : StatusCode.PartialContent), fileType, (range.last - range.first) + 1);
+
+			/* write the content to the stream */
+			this.log(`Sending content [${range.first} - ${range.last}/${cached.fileSize()}] from [${filePath}]`);
+			libStream.pipeline(stream, this.response, (err) => {
+				this.log(err == undefined ? `All content has been sent` : `Error while sending content: [${err}]`);
+			});
+		} catch (_) {
 			this.respondInternalError('File operation failed');
-			return true;
 		}
-
-		/* setup the response */
-		if (range.state == RangeParseState.valid)
-			this.outputHeaders['Content-Range'] = `bytes ${range.first}-${range.last}/${cached.fileSize()}`;
-		this.closeHeader((range.state == RangeParseState.noRange ? StatusCode.Ok : StatusCode.PartialContent), fileType, (range.last - range.first) + 1);
-
-		/* write the content to the stream */
-		this.log(`Sending content [${range.first} - ${range.last}/${cached.fileSize()}] from [${filePath}]`);
-		libStream.pipeline(stream, this.response, (err) => {
-			this.log(err == undefined ? `All content has been sent` : `Error while sending content: [${err}]`);
-		});
 		return true;
 	}
 

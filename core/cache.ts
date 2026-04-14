@@ -111,7 +111,7 @@ export class CachedFile {
 	}
 
 	/* object must not be used anymore after reading or streaming from it, returns null on filesystem errors (already logged) */
-	public stream(options?: { start?: number, end?: number }): libStream.Readable | null {
+	public stream(options?: { start?: number, end?: number }): libStream.Readable {
 		/* check if the data have already been cached */
 		if (this.data != null)
 			return libStream.Readable.from(this.data.subarray(options?.start, (options?.end == undefined ? undefined : options.end + 1)));
@@ -122,7 +122,7 @@ export class CachedFile {
 			stream = libFs.createReadStream(this.path, { flags: 'r', start: options?.start, end: options?.end });
 		} catch (e: any) {
 			libLog.Error(`Filesystem error while streaming [${this.path}]: ${e.message}`);
-			return null;
+			throw new Error('File operation failed');
 		}
 
 		/* check if only a partial file is being read, or it is too large, in which case it will not be added to the cache */
@@ -152,13 +152,13 @@ export class CachedFile {
 		stream.on('error', function (e: Error) {
 			libLog.Error(`Filesystem error while streaming [${that.path}]: ${e.message}`);
 			failed = true;
-			wrapped.destroy(e);
+			wrapped.destroy(new Error('File operation failed'));
 		});
 		return wrapped;
 	}
 
 	/* object must not be used anymore after reading or streaming from it, returns null on filesystem errors (already logged) */
-	public read(): Buffer | null {
+	public read(): Buffer {
 		/* check if the data have already been cached */
 		if (this.data != null)
 			return this.data;
@@ -168,13 +168,13 @@ export class CachedFile {
 			this.data = libFs.readFileSync(this.path);
 		} catch (e: any) {
 			libLog.Error(`Filesystem error while reading [${this.path}]: ${e.message}`);
-			return null;
+			throw new Error('File operation failed');
 		}
 
 		/* check if the file-size changed mid operation */
 		if (this.data.byteLength != this.size) {
 			libLog.Error(`File size changed mid operation [${this.path}]: [${this.data.byteLength}] != [${this.size}]`);
-			return null;
+			throw new Error('File operation failed');
 		}
 
 		/* add the read buffer back to the cache (using the fetched data from before
