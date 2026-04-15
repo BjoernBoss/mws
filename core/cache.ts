@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 /* Copyright (c) 2026 Bjoern Boss Henrichsen */
 import * as libLog from "./log.js";
+import * as libBuilder from "./builder.js";
+import * as libClient from "./client.js";
 import * as libFs from "fs";
 import * as libStream from "stream";
 
@@ -52,7 +54,7 @@ function CacheDrop(path: string): void {
 	delete cacheMap[path];
 }
 
-export class CachedFile {
+export class Cached {
 	private path: string;
 	private size: number;
 	private data: Buffer | null;
@@ -83,57 +85,64 @@ export class CachedFile {
 		/* check if only a partial file is being read, or it is too large, in which case it will not be added to the cache */
 		if (this.size > maxLargestSize || this.size > totalCacheCapacity || (options?.start != undefined && options.start != 0) || (options?.end != undefined && options.end + 1 != this.size))
 			return stream;
-		let that = this;
 
 		/* create the transformer stream to cache the data */
 		let buffers: Buffer[] = [], failed: boolean = false, totalLength: number = 0;
 		const transformer = new libStream.Transform({
-			transform(chunk, _, cb) {
+			transform: (chunk, _, cb) => {
 				if (failed) return;
 				totalLength += chunk.byteLength;
 				buffers.push(chunk);
 				cb(null, chunk);
 			},
-			final(cb) {
+			final: (cb) => {
 				if (failed) return;
-				if (totalLength == that.size && that.size <= maxLargestSize && that.size <= totalCacheCapacity)
-					CacheAdd(that.path, Buffer.concat(buffers), that.mtime, that.persistent);
+				if (totalLength == this.size && this.size <= maxLargestSize && this.size <= totalCacheCapacity)
+					CacheAdd(this.path, Buffer.concat(buffers), this.mtime, this.persistent);
 				cb(null);
 			}
 		});
 
 		/* setup the file exceptions to be propagated to the stream */
 		let wrapped = stream.pipe(transformer);
-		stream.on('error', function (e: Error) {
-			libLog.Error(`Filesystem error while streaming [${that.path}]: ${e.message}`);
+		stream.on('error', (e: Error) => {
+			libLog.Error(`Filesystem error while streaming [${this.path}]: ${e.message}`);
 			failed = true;
 			wrapped.destroy(new Error('File operation failed'));
 		});
 		return wrapped;
 	}
-
-	static make(path: string, options?: { persistent?: boolean }): CachedFile | null {
-		/* check if the entry is marked as persistent and already in the cache, in which case the file doesn't even need to be checked */
-		if (options?.persistent === true && cacheMap[path]?.persistent === true) {
-			const entry = cacheMap[path];
-			entry.touched = ++nextTouchStamp;
-			return new CachedFile(path, entry.data.byteLength, entry.data, entry.mtime, entry.persistent);
-		}
-
-		/* read the file size */
-		let fileSize: number = 0, mtime: number = 0;
+	private static checkStats(path: string): [number | null, number] {
+		/* check if the file exists and read its file-size and mtime */
 		try {
+			/* check if the file exists and is a file */
 			if (!libFs.existsSync(path))
-				return null;
+				return [null, 0];
 			const stats = libFs.lstatSync(path);
 			if (!stats.isFile())
-				return null;
-			fileSize = stats.size;
-			mtime = stats.mtime.getTime();
+				return [null, 0];
+
+			/* extract the file size and modified time */
+			return [stats.size, stats.mtime.getTime()];
 		} catch (e: any) {
 			libLog.Error(`Filesystem error while checking [${path}]: ${e.message}`);
 			throw new Error('File operation failed');
 		}
+	}
+
+	/* [persistent]: if cached, dont check if the underlying file has changed since caching */
+	static make(path: string, options?: { persistent?: boolean }): Cached | null {
+		/* check if the entry is marked as persistent and already in the cache, in which case the file doesn't even need to be checked */
+		if (options?.persistent === true && cacheMap[path]?.persistent === true) {
+			const entry = cacheMap[path];
+			entry.touched = ++nextTouchStamp;
+			return new Cached(path, entry.data.byteLength, entry.data, entry.mtime, entry.persistent);
+		}
+
+		/* check if the file exists and read its stats */
+		const [fileSize, mtime] = Cached.checkStats(path);
+		if (fileSize == null)
+			return null;
 
 		/* check if the entry is cached */
 		if (path in cacheMap) {
@@ -142,13 +151,13 @@ export class CachedFile {
 			/* validate that the entry is still up-to-date and return it */
 			if (entry.mtime == mtime && entry.data.length == fileSize) {
 				entry.touched = ++nextTouchStamp;
-				return new CachedFile(path, fileSize, entry.data, mtime, options?.persistent || false);
+				return new Cached(path, fileSize, entry.data, mtime, options?.persistent || false);
 			}
 
 			/* remove the entry as it seems to be outdated */
 			CacheDrop(path);
 		}
-		return new CachedFile(path, fileSize, null, mtime, options?.persistent || false);
+		return new Cached(path, fileSize, null, mtime, options?.persistent || false);
 	}
 
 	public fileSize(): number {
@@ -213,8 +222,8 @@ export class CachedFile {
 	}
 };
 
-export function Get(path: string, options?: { persistent?: boolean }): CachedFile | null {
-	return CachedFile.make(path, options);
+export function Get(path: string, options?: { persistent?: boolean }): Cached | null {
+	return Cached.make(path, options);
 }
 export function SetCacheOptions(options: { cacheSize?: number, largestFile?: number }): void {
 	if (options.cacheSize != undefined && options.cacheSize > 0)
@@ -231,4 +240,26 @@ export function SetCacheOptions(options: { cacheSize?: number, largestFile?: num
 /* initialize the default configuration */
 export function Initialize(): void {
 	SetCacheOptions({ cacheSize: 50_000_000, largestFile: 10_000_000 });
+}
+
+/* helper function to retrieve content from cache and appending it to the body of an html page */
+export function HtmlFromCache(path: string, client: libClient.HttpRequest, page: libBuilder.HtmlPage, done: () => void, persistent?: boolean): void {
+	/* try to fetch the object from the cache */
+	const cached: Cached | null = Cached.make(path, { persistent });
+	if (cached == null) {
+		client.error(`Failed to find HTML content [${path}]`);
+		page.body += libBuilder.LoadError();
+		return done();
+	}
+
+	/* read the actual content and write it to the builder */
+	cached.async((content: Buffer | null, error: Error | null) => {
+		if (error != null) {
+			client.error(`Failed to retrieve HTML content: ${error.message}`);
+			page.body += libBuilder.LoadError();
+		}
+		else
+			page.body += `\t${content!.toString('utf-8')}\n`;
+		done();
+	});
 }

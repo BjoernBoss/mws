@@ -288,7 +288,7 @@ export class HttpRequest extends HttpBase {
 		this.response.end(buffer);
 	}
 	private receiveClientChunks(cb: (data: Buffer | null, error: Error | null) => boolean, maxLength: number | null): boolean {
-		let failed = false, accumulated = 0, that = this;
+		let failed = false, accumulated = 0;
 
 		/* check if the object is ready for receiving */
 		if (this.payload != HttpReceiveState.none)
@@ -309,44 +309,44 @@ export class HttpRequest extends HttpBase {
 		}
 
 		/* register the data recipient */
-		this.request.on('data', function (data: Buffer) {
+		this.request.on('data', (data: Buffer) => {
 			if (failed) return;
 
 			/* check the maximum count */
 			accumulated += data.byteLength;
 			if (maxLength != null && accumulated > maxLength) {
-				that.log(`Request payload is too large [${accumulated} > ${maxLength}]`);
+				this.log(`Request payload is too large [${accumulated} > ${maxLength}]`);
 				failed = true;
 
 				/* check if the response was already sent and otherwise update to the content size error */
-				if (that.state == HttpResponseState.none) {
-					const content = libTemplates.ErrorContentTooLarge({ path: that.rawpath, allowedLength: maxLength, providedLength: length });
-					that.respondString(StatusCode.ContentTooLarge, 'html', content);
+				if (this.state == HttpResponseState.none) {
+					const content = libTemplates.ErrorContentTooLarge({ path: this.rawpath, allowedLength: maxLength, providedLength: length });
+					this.respondString(StatusCode.ContentTooLarge, 'html', content);
 				}
-				that.request.destroy();
+				this.request.destroy();
 				cb(null, new Error('Request is too large'));
 			}
 
 			/* pass the data to the handler */
 			else if (failed = !cb(data, null))
-				that.request.destroy();
+				this.request.destroy();
 		});
 
 		/* register the error and end handler */
-		this.request.on('error', function (e) {
+		this.request.on('error', (e) => {
 			if (!failed) {
-				that.error(`Error while receiving data [${e.message}]`);
+				this.error(`Error while receiving data [${e.message}]`);
 				failed = true;
-				that.request.destroy();
+				this.request.destroy();
 				cb(null, e);
 			}
 		});
-		this.request.on('end', function () {
+		this.request.on('end', () => {
 			if (failed) return;
-			that.payload = HttpReceiveState.received;
+			this.payload = HttpReceiveState.received;
 			cb(null, null);
-			if (that.processed)
-				that.finalize();
+			if (this.processed)
+				this.finalize();
 		});
 		return true;
 	}
@@ -357,11 +357,10 @@ export class HttpRequest extends HttpBase {
 		/* check if a html page has been queued and startup the process and register the corresponding handler */
 		if (this.state != HttpResponseState.prepared || this.htmlQueue == undefined)
 			return;
-		const that = this;
-		this.htmlQueue.process(function (page: libBuilder.HtmlPage) {
-			if (that.state == HttpResponseState.prepared) {
-				that.state = HttpResponseState.none;
-				that.respondString(that.queuedStatus!, 'html', page.finalize());
+		this.htmlQueue.process((page: libBuilder.HtmlPage) => {
+			if (this.state == HttpResponseState.prepared) {
+				this.state = HttpResponseState.none;
+				this.respondString(this.queuedStatus!, 'html', page.finalize());
 			}
 		});
 	}
@@ -447,27 +446,26 @@ export class HttpRequest extends HttpBase {
 		this.queuedStatus = status;
 
 		/* return the send callback */
-		const that = this;
 		let sent = false;
-		return function (data, last, ready) {
-			if (that.state == HttpResponseState.failed)
+		return (data, last, ready) => {
+			if (this.state == HttpResponseState.failed)
 				return;
 			if (sent)
 				throw new Error('Responding to closed response');
 
 			/* check if the header needs to be sent */
-			if (that.state == HttpResponseState.prepared) {
-				that.state = HttpResponseState.none;
-				that.closeHeader(that.queuedStatus!, fileType, (last ? data.length : null));
+			if (this.state == HttpResponseState.prepared) {
+				this.state = HttpResponseState.none;
+				this.closeHeader(this.queuedStatus!, fileType, (last ? data.length : null));
 			}
 			if (last) {
-				that.response.end(data);
+				this.response.end(data);
 				sent = true;
 			}
 			else if (ready != null)
-				that.response.write(data, (e) => ready(e == undefined ? null : e));
+				this.response.write(data, (e) => ready(e == undefined ? null : e));
 			else
-				that.response.write(data);
+				this.response.write(data);
 		};
 	}
 
@@ -543,7 +541,7 @@ export class HttpRequest extends HttpBase {
 	public tryRespondFile(filePath: string): boolean {
 		try {
 			/* lookup the file in the cache */
-			const cached: libCache.CachedFile | null = libCache.Get(filePath);
+			const cached: libCache.Cached | null = libCache.Get(filePath);
 			if (cached == null)
 				return false;
 
@@ -649,14 +647,14 @@ export class HttpRequest extends HttpBase {
 
 		/* initialize busy until the file has been opened */
 		let queue: Buffer[] = [], fd: number | null = null, cbResult: Error | null = null;
-		let fdBusy = true, fdClose = false, that = this;
+		let fdBusy = true, fdClose = false;
 		const failure = function (e: Error): void {
 			if (cbResult == null)
 				cbResult = e;
 			fdClose = true;
 			queue = [];
 		};
-		const process = function (): void {
+		const process = () => {
 			if (fdBusy)
 				return;
 
@@ -667,11 +665,11 @@ export class HttpRequest extends HttpBase {
 					cb(cbResult);
 
 				/* close the file and check if it should be removed */
-				else libFs.close(fd, function () {
+				else libFs.close(fd, () => {
 					if (cbResult != null) try {
 						libFs.unlinkSync(file);
 					} catch (e: any) {
-						that.error(`Failed to remove file [${file}] after writing uploaded data to it failed: ${e.message}`);
+						this.error(`Failed to remove file [${file}] after writing uploaded data to it failed: ${e.message}`);
 					}
 					cb(cbResult);
 				});
@@ -774,10 +772,9 @@ export class HttpUpgrade extends HttpBase {
 			throw new Error('Request has already been handled');
 		this.state = HttpResponseState.responded;
 
-		const that = this;
-		WebSocketServerInstance.handleUpgrade(this.request, this.socket, this.head, function (ws, request) {
+		WebSocketServerInstance.handleUpgrade(this.request, this.socket, this.head, (ws, request) => {
 			WebSocketServerInstance.emit('connection', ws, request);
-			cb(new ClientSocket(ws, that));
+			cb(new ClientSocket(ws, this));
 		});
 		return true;
 	}
@@ -795,18 +792,17 @@ export class ClientSocket extends ClientBase {
 		this.ws = ws;
 
 		/* register the callbacks */
-		const that = this;
-		this.ws.on('message', function (data, isBinary) {
-			if (that.ondata != null)
-				that.ondata(data, isBinary);
+		this.ws.on('message', (data, isBinary) => {
+			if (this.ondata != null)
+				this.ondata(data, isBinary);
 		});
-		this.ws.on('close', function () {
-			if (that.onclose != null)
-				that.onclose();
+		this.ws.on('close', () => {
+			if (this.onclose != null)
+				this.onclose();
 		});
-		this.ws.on('pong', function () {
-			if (that.onpong != null)
-				that.onpong();
+		this.ws.on('pong', () => {
+			if (this.onpong != null)
+				this.onpong();
 		});
 	}
 

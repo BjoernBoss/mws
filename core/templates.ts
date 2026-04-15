@@ -13,7 +13,7 @@ function LoadRelative(path: string): string {
 	} catch (_) { }
 
 	/* return the default place-holder */
-	libLog.Error(`Template [${path}] not found`);
+	libLog.Error(`Unable to load template [${path}] properly`);
 	return '<!doctype html><html><body><p style="font-family: monospace;">Response message not found.</p></body></html>';
 }
 function ExpandPlaceholders(content: string, map: Record<string, string>): string {

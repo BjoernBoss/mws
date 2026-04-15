@@ -13,10 +13,9 @@ export class HtmlQueue {
 
 	private handleNext(): void {
 		if (this.queue.length > 0) {
-			const that = this;
-			this.queue[0](this.page, function () {
-				that.queue.splice(0, 1);
-				that.handleNext();
+			this.queue[0](this.page, () => {
+				this.queue.splice(0, 1);
+				this.handleNext();
 			});
 		}
 		else if (this.completed != undefined)
@@ -41,9 +40,9 @@ export class HtmlQueue {
 *	Defaults the language to be 'en'
 */
 export class HtmlPage {
-	private head: string;
-	private body: string;
-	private language: string;
+	public head: string;
+	public body: string;
+	public language: string;
 
 	constructor(language: string = 'en') {
 		this.head = '';
@@ -51,45 +50,29 @@ export class HtmlPage {
 		this.language = language;
 	}
 
-	public setLanguage(language: string): this {
-		this.language = language;
-		return this;
-	}
-	public addHead(content: string): this {
-		this.head += `\n\t${content}`;
-		return this;
-	}
-	public addBody(content: string): this {
-		this.body += `\n\t${content}`;
-		return this;
-	}
-	public wrapBody(wrap: (body: string) => string): this {
-		this.body = wrap(this.body);
-		return this;
-	}
 	public finalize(): string {
 		return `<!DOCTYPE html>
-<html${this.language.length > 0 ? ` lang="${this.language}"` : ''}>
+<html${this.language.length > 0 ? ` lang="${this.language}"` : ''} style="margin:0;height:100%;">
 <head>
-	<meta charset="utf-8">${this.head}
-</head>
-<body>${this.body}
-</body>
+	<meta charset="utf-8">
+${this.head}</head>
+<body style="margin:0;height:100%;display:flex;">
+${this.body}</body>
 </html>
 `;
 	}
 };
 
 export function SingleTag(name: string, attributes: string = ''): string {
-	return `<${name}${attributes.length == 0 ? '' : ` ${attributes}`}>`;
+	return `\t<${name}${attributes.length == 0 ? '' : ` ${attributes}`}>\n`;
 }
 export function DualTag(name: string, attributes: string, body: string, short: boolean = false): string {
 	if (body.length == 0 || short)
-		return `<${name}${attributes.length == 0 ? '' : ` ${attributes}`}>${body}</${name}>`;
-	return `<${name}${attributes.length == 0 ? '' : ` ${attributes}`}>\n\t${body}\n</${name}>`;
+		return `\t<${name}${attributes.length == 0 ? '' : ` ${attributes}`}>${body}</${name}>\n`;
+	return `\t<${name}${attributes.length == 0 ? '' : ` ${attributes}`}>\n${body}</${name}>\n`;
 }
 export function Meta(name: string, content: string): string {
-	return SingleTag('meta', `name = "${name}" "content="${content}"`);
+	return SingleTag('meta', `name="${name}" content="${content}"`);
 }
 export function Title(name: string): string {
 	return DualTag('title', '', name, true);
@@ -103,8 +86,8 @@ export function StyleSheet(path: string): string {
 export function Script(path: string): string {
 	return DualTag('script', `src="${path}"`, '', true);
 }
-export function Div(attributes: string): (body: string) => string {
-	return (body: string) => DualTag('div', attributes, body);
+export function Div(attributes: string, body: string): string {
+	return DualTag('div', attributes, body);
 }
 export function LoadError(): string {
 	return Text('Failed to load page content', 'style="font-family: monospace; color: red;"');
