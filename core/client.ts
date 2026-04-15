@@ -256,7 +256,7 @@ export abstract class HttpBase extends ClientBase {
 */
 export class HttpRequest extends HttpBase {
 	private response: libHttp.ServerResponse;
-	private htmlBuilder?: libBuilder.HtmlBuilder;
+	private htmlQueue?: libBuilder.HtmlQueue;
 	private queuedStatus?: number;
 
 	constructor(request: libHttp.IncomingMessage, response: libHttp.ServerResponse, host: string) {
@@ -354,12 +354,16 @@ export class HttpRequest extends HttpBase {
 		this.respondString(status, fileType, content);
 	}
 	protected finalizeBuild(): void {
-		/* check if html is in the pipeline and is ready */
-		if (this.state == HttpResponseState.prepared && this.htmlBuilder != undefined && this.htmlBuilder.isReady()) {
-			const content = this.htmlBuilder.finalize();
-			this.state = HttpResponseState.none;
-			this.respondString(this.queuedStatus!, 'html', content);
-		}
+		/* check if a html page has been queued and startup the process and register the corresponding handler */
+		if (this.state != HttpResponseState.prepared || this.htmlQueue == undefined)
+			return;
+		const that = this;
+		this.htmlQueue.process(function (page: libBuilder.HtmlPage) {
+			if (that.state == HttpResponseState.prepared) {
+				that.state = HttpResponseState.none;
+				that.respondString(that.queuedStatus!, 'html', page.finalize());
+			}
+		});
 	}
 
 	/* add the given header to the response */
@@ -416,29 +420,21 @@ export class HttpRequest extends HttpBase {
 		return type.substring(index, end);
 	}
 
-	/* return the builder, if a child module plans to produce html */
-	public getHtmlBuilder(): libBuilder.HtmlBuilder | null {
-		return this.htmlBuilder || null;
+	/* return the html-queue, if a child module plans to produce html */
+	public getHtmlQueue(): libBuilder.HtmlQueue | null {
+		return this.htmlQueue || null;
 	}
 
 	/* prepare the response to be html, can be built on by parent modules, sent once the client is cleared and the builder is ready */
-	public prepareHtml(status: number = StatusCode.Ok): libBuilder.HtmlBuilder {
+	public prepareHtml(status: number = StatusCode.Ok): libBuilder.HtmlQueue {
 		if (this.state != HttpResponseState.none)
 			throw new Error('Request has already been handled');
-		const builder = new libBuilder.HtmlBuilder();
 
 		this.log(`Responding with HTML content and status [${status}]`);
 		this.state = HttpResponseState.prepared;
 		this.queuedStatus = status;
-		this.htmlBuilder = builder;
-
-		/* register the ready-callback */
-		const that = this;
-		builder.notifyOnReady(function () {
-			if (that.processed)
-				that.finalize();
-		});
-		return builder;
+		this.htmlQueue = new libBuilder.HtmlQueue();
+		return this.htmlQueue;
 	}
 
 	/* prepare the response to be delayed, sent through the returned callback */
@@ -547,7 +543,7 @@ export class HttpRequest extends HttpBase {
 	public tryRespondFile(filePath: string): boolean {
 		try {
 			/* lookup the file in the cache */
-			const cached: libCache.CachedFile | null = libCache.CachedFile.make(filePath);
+			const cached: libCache.CachedFile | null = libCache.Get(filePath);
 			if (cached == null)
 				return false;
 

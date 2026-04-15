@@ -46,8 +46,8 @@ export function Join(a: string, b: string): string {
 		return (a.length == 0 ? b : a);
 	const aSlash = a.endsWith('/'), bSlash = b.startsWith('/');
 	if (aSlash)
-		return (bSlash ? a + b.substring(1) : a + b);
-	return (bSlash ? a + b : `${a}/${b}`);
+		return Sanitize(bSlash ? a + b.substring(1) : a + b);
+	return Sanitize(bSlash ? a + b : `${a}/${b}`);
 }
 
 /* check if the sanitized path is a true sub-path of the sanitized base path (same root is also a sub-directory) */

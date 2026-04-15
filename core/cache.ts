@@ -66,52 +66,7 @@ export class CachedFile {
 		this.mtime = mtime;
 		this.persistent = persistent;
 	}
-
-	static make(path: string, options?: { persistent?: boolean }): CachedFile | null {
-		/* check if the entry is marked as persistent and already in the cache, in which case the file doesn't even need to be checked */
-		if (options?.persistent === true && cacheMap[path]?.persistent === true) {
-			const entry = cacheMap[path];
-			entry.touched = ++nextTouchStamp;
-			return new CachedFile(path, entry.data.byteLength, entry.data, entry.mtime, entry.persistent);
-		}
-
-		/* read the file size */
-		let fileSize: number = 0, mtime: number = 0;
-		try {
-			if (!libFs.existsSync(path))
-				return null;
-			const stats = libFs.lstatSync(path);
-			if (!stats.isFile())
-				return null;
-			fileSize = stats.size;
-			mtime = stats.mtime.getTime();
-		} catch (e: any) {
-			libLog.Error(`Filesystem error while checking [${path}]: ${e.message}`);
-			throw new Error('File operation failed');
-		}
-
-		/* check if the entry is cached */
-		if (path in cacheMap) {
-			const entry = cacheMap[path];
-
-			/* validate that the entry is still up-to-date and return it */
-			if (entry.mtime == mtime && entry.data.length == fileSize) {
-				entry.touched = ++nextTouchStamp;
-				return new CachedFile(path, fileSize, entry.data, mtime, options?.persistent || false);
-			}
-
-			/* remove the entry as it seems to be outdated */
-			CacheDrop(path);
-		}
-		return new CachedFile(path, fileSize, null, mtime, options?.persistent || false);
-	}
-
-	public fileSize(): number {
-		return this.size;
-	}
-
-	/* object must not be used anymore after reading or streaming from it, returns null on filesystem errors (already logged) */
-	public stream(options?: { start?: number, end?: number }): libStream.Readable {
+	private makeStream(options?: { start?: number, end?: number }): libStream.Readable {
 		/* check if the data have already been cached */
 		if (this.data != null)
 			return libStream.Readable.from(this.data.subarray(options?.start, (options?.end == undefined ? undefined : options.end + 1)));
@@ -157,7 +112,55 @@ export class CachedFile {
 		return wrapped;
 	}
 
-	/* object must not be used anymore after reading or streaming from it, returns null on filesystem errors (already logged) */
+	static make(path: string, options?: { persistent?: boolean }): CachedFile | null {
+		/* check if the entry is marked as persistent and already in the cache, in which case the file doesn't even need to be checked */
+		if (options?.persistent === true && cacheMap[path]?.persistent === true) {
+			const entry = cacheMap[path];
+			entry.touched = ++nextTouchStamp;
+			return new CachedFile(path, entry.data.byteLength, entry.data, entry.mtime, entry.persistent);
+		}
+
+		/* read the file size */
+		let fileSize: number = 0, mtime: number = 0;
+		try {
+			if (!libFs.existsSync(path))
+				return null;
+			const stats = libFs.lstatSync(path);
+			if (!stats.isFile())
+				return null;
+			fileSize = stats.size;
+			mtime = stats.mtime.getTime();
+		} catch (e: any) {
+			libLog.Error(`Filesystem error while checking [${path}]: ${e.message}`);
+			throw new Error('File operation failed');
+		}
+
+		/* check if the entry is cached */
+		if (path in cacheMap) {
+			const entry = cacheMap[path];
+
+			/* validate that the entry is still up-to-date and return it */
+			if (entry.mtime == mtime && entry.data.length == fileSize) {
+				entry.touched = ++nextTouchStamp;
+				return new CachedFile(path, fileSize, entry.data, mtime, options?.persistent || false);
+			}
+
+			/* remove the entry as it seems to be outdated */
+			CacheDrop(path);
+		}
+		return new CachedFile(path, fileSize, null, mtime, options?.persistent || false);
+	}
+
+	public fileSize(): number {
+		return this.size;
+	}
+
+	/* object must not be used anymore after reading or streaming from it (on errors, logs them and throws exception) */
+	public stream(options?: { start?: number, end?: number }): libStream.Readable {
+		return this.makeStream(options);
+	}
+
+	/* object must not be used anymore after reading or streaming from it (on errors, logs them and throws exception) */
 	public read(): Buffer {
 		/* check if the data have already been cached */
 		if (this.data != null)
@@ -183,8 +186,36 @@ export class CachedFile {
 			CacheAdd(this.path, this.data, this.mtime, this.persistent);
 		return this.data;
 	}
+
+	/* object must not be used anymore after reading or streaming from it (on errors, logs them and throws exception) */
+	public async(cb: (content: Buffer | null, error: Error | null) => void): void {
+		const stream: libStream.Readable = this.makeStream();
+		const buffers: Buffer[] = [];
+		let failed: boolean = false;
+
+		/* register the handler to collect the data and stream them out */
+		stream.on("data", (chunk) => {
+			if (!failed)
+				buffers.push(chunk);
+		});
+		stream.on("error", (err) => {
+			if (!failed) {
+				failed = true;
+				cb(null, err);
+			}
+		});
+		stream.on("end", () => {
+			if (!failed) {
+				failed = true;
+				cb(Buffer.concat(buffers), null);
+			}
+		});
+	}
 };
 
+export function Get(path: string, options?: { persistent?: boolean }): CachedFile | null {
+	return CachedFile.make(path, options);
+}
 export function SetCacheOptions(options: { cacheSize?: number, largestFile?: number }): void {
 	if (options.cacheSize != undefined && options.cacheSize > 0)
 		totalCacheCapacity = options.cacheSize;

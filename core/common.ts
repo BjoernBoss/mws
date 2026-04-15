@@ -20,6 +20,8 @@ export type CheckHost = (host: string) => boolean;
 
 export type RequestLambda = (client: libClient.HttpRequest) => void;
 export type UpgradeLambda = (client: libClient.HttpUpgrade) => void;
+export type RequestWrap = (client: libClient.HttpRequest, handle: () => void) => void;
+export type UpgradeWrap = (client: libClient.HttpUpgrade, handle: () => void) => void;
 
 /*
 *	Simple module interface implementation, which allows requests to be handled by a lambdas.
@@ -109,7 +111,7 @@ export class UnhandledModule implements ModuleInterface {
 	public name: string = 'unhandler';
 	constructor(handler: ModuleInterface, request?: RequestLambda, upgrade?: UpgradeLambda) {
 		this.handler = handler;
-		libLog.Info(`Wrapping [${handler.name}]`);
+		libLog.Info(`Unhandled wrapper [${handler.name}]`);
 		this.requestLambda = request;
 		this.upgradeLambda = upgrade;
 	}
@@ -126,5 +128,38 @@ export class UnhandledModule implements ModuleInterface {
 		this.handler.upgrade(client);
 		if (!client.handled() && this.upgradeLambda != undefined)
 			this.upgradeLambda(client);
+	}
+};
+
+/*
+*	Simple module interface implementation, which forwards any requests to a lambda.
+*/
+export class WrapModule implements ModuleInterface {
+	private handler: ModuleInterface;
+	private requestWrap?: RequestWrap;
+	private upgradeWrap?: UpgradeWrap;
+
+	public name: string = 'wrap';
+	constructor(handler: ModuleInterface, request?: RequestWrap, upgrade?: UpgradeWrap) {
+		this.handler = handler;
+		libLog.Info(`Wrapping [${handler.name}]`);
+		this.requestWrap = request;
+		this.upgradeWrap = upgrade;
+	}
+
+	public request(client: libClient.HttpRequest): void {
+		client.pushLog(this.handler.name);
+		if (this.requestWrap != undefined)
+			this.requestWrap(client, () => this.handler.request(client));
+		else
+			this.handler.request(client);
+	}
+
+	public upgrade(client: libClient.HttpUpgrade): void {
+		client.pushLog(this.handler.name);
+		if (this.upgradeWrap != undefined)
+			this.upgradeWrap(client, () => this.handler.upgrade(client));
+		else
+			this.handler.upgrade(client);
 	}
 };

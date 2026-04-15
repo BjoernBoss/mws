@@ -1,94 +1,111 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 /* Copyright (c) 2026 Bjoern Boss Henrichsen */
 
-enum BuilderState {
-	none,
-	content,
-	full
-}
-
-export class HtmlBuilder {
-	private state: BuilderState;
-	private header: string;
-	private content: string;
-	private bodyPrefix: string;
-	private bodySuffix: string;
-	private title?: string;
-	private language?: string;
-	private readyNotify: (() => void)[];
+export class HtmlQueue {
+	private page: HtmlPage;
+	private queue: ((page: HtmlPage, done: () => void) => void)[];
+	private completed?: (page: HtmlPage) => void;
 
 	constructor() {
-		this.state = BuilderState.none;
-		this.header = '';
-		this.content = '';
-		this.bodyPrefix = '';
-		this.bodySuffix = '';
-		this.title = '';
-		this.language = '';
-		this.readyNotify = [];
+		this.page = new HtmlPage();
+		this.queue = [];
 	}
 
-	private notifyAllListener(): void {
-		for (const entry of this.readyNotify)
-			entry();
-		this.readyNotify = [];
-	}
-	public notifyOnReady(cb: () => void): void {
-		if (this.state != BuilderState.none)
-			throw new Error('Cannot listen on ready builder');
-		this.readyNotify.push(cb);
-	}
-
-	public addHeader(line: string): void {
-		this.header += `${line}\n\t`;
-	}
-	public setFullDocument(fullDocument: string): void {
-		if (this.state != BuilderState.none)
-			throw new Error('Html document with multiple contents');
-		this.content = fullDocument;
-		this.state = BuilderState.full;
-		this.notifyAllListener();
-	}
-	public isReady(): boolean {
-		return (this.state != BuilderState.none);
+	private handleNext(): void {
+		if (this.queue.length > 0) {
+			const that = this;
+			this.queue[0](this.page, function () {
+				that.queue.splice(0, 1);
+				that.handleNext();
+			});
+		}
+		else if (this.completed != undefined)
+			this.completed(this.page);
 	}
 
-	/* language defaults to 'en' if empty */
-	public setContent(body: string, config: { title?: string, language?: string }): void {
-		if (this.state != BuilderState.none)
-			throw new Error('Html document with multiple contents');
-		this.state = BuilderState.content;
-		this.content = body;
-		this.title = config.title;
-		this.language = (config.language == undefined ? 'en' : config.language);
-		this.notifyAllListener();
+	public modify(cb: (page: HtmlPage, done: () => void) => void): void {
+		if (this.queue.length == 0 && this.completed != undefined)
+			throw new Error('Html queue already closed');
+		this.queue.push(cb);
 	}
-	public wrap(prefix: string, suffix: string): void {
-		if (prefix.length > 0)
-			this.bodyPrefix = `${prefix}\n${this.bodyPrefix}`;
-		if (suffix.length > 0)
-			this.bodySuffix = `${this.bodySuffix}\n${suffix}`;
+	public process(cb: (page: HtmlPage) => void): void {
+		if (this.completed != undefined)
+			throw new Error('Html queue already being processed');
+		this.completed = cb;
+		this.handleNext();
+	}
+};
+
+/*
+*	Automatically configures the page to use utf-8
+*	Defaults the language to be 'en'
+*/
+export class HtmlPage {
+	private head: string;
+	private body: string;
+	private language: string;
+
+	constructor(language: string = 'en') {
+		this.head = '';
+		this.body = '';
+		this.language = language;
+	}
+
+	public setLanguage(language: string): this {
+		this.language = language;
+		return this;
+	}
+	public addHead(content: string): this {
+		this.head += `\n\t${content}`;
+		return this;
+	}
+	public addBody(content: string): this {
+		this.body += `\n\t${content}`;
+		return this;
+	}
+	public wrapBody(wrap: (body: string) => string): this {
+		this.body = wrap(this.body);
+		return this;
 	}
 	public finalize(): string {
-		if (this.state == BuilderState.none)
-			throw new Error('Html document with no content');
-		if (this.state == BuilderState.full)
-			return this.content;
-
-		/* construct the full final document */
 		return `<!DOCTYPE html>
-<html${(this.language ? ` lang="${this.language}"` : '')}>
-
+<html${this.language.length > 0 ? ` lang="${this.language}"` : ''}>
 <head>
-	<meta charset="utf-8">
-	<meta name="viewport" content="width=device-width, initial-scale=1">
-	${this.header}${(this.title ? `<title>${this.title}</title>\n` : '')}</head>
-
-<body>
-${this.bodyPrefix}${this.content}${this.bodySuffix}
+	<meta charset="utf-8">${this.head}
+</head>
+<body>${this.body}
 </body>
-
 </html>
 `;
 	}
 };
+
+export function SingleTag(name: string, attributes: string = ''): string {
+	return `<${name}${attributes.length == 0 ? '' : ` ${attributes}`}>`;
+}
+export function DualTag(name: string, attributes: string, body: string, short: boolean = false): string {
+	if (body.length == 0 || short)
+		return `<${name}${attributes.length == 0 ? '' : ` ${attributes}`}>${body}</${name}>`;
+	return `<${name}${attributes.length == 0 ? '' : ` ${attributes}`}>\n\t${body}\n</${name}>`;
+}
+export function Meta(name: string, content: string): string {
+	return SingleTag('meta', `name = "${name}" "content="${content}"`);
+}
+export function Title(name: string): string {
+	return DualTag('title', '', name, true);
+}
+export function Text(text: string, attributes: string = ''): string {
+	return DualTag('p', attributes, text, true);
+}
+export function StyleSheet(path: string): string {
+	return SingleTag('link', `rel="stylesheet" type="text/css" href="${path}"`);
+}
+export function Script(path: string): string {
+	return DualTag('script', `src="${path}"`, '', true);
+}
+export function Div(attributes: string): (body: string) => string {
+	return (body: string) => DualTag('div', attributes, body);
+}
+export function LoadError(): string {
+	return Text('Failed to load page content', 'style="font-family: monospace; color: red;"');
+}
