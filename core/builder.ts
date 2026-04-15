@@ -90,5 +90,5 @@ export function Div(attributes: string, body: string): string {
 	return DualTag('div', attributes, body);
 }
 export function LoadError(): string {
-	return Text('Failed to load page content', 'style="font-family: monospace; color: red;"');
+	return Text('Failed to load Page Content', 'style="font-family: monospace; color: red; font-weight: bold; text-align: center;"');
 }
