@@ -248,7 +248,7 @@ export function HtmlFromCache(path: string, client: libClient.HttpRequest, page:
 	const cached: Cached | null = Cached.make(path, { persistent });
 	if (cached == null) {
 		client.error(`Failed to find HTML content [${path}]`);
-		page.body += libBuilder.LoadError();
+		page.body += libBuilder.LoadingError();
 		return done();
 	}
 
@@ -256,7 +256,7 @@ export function HtmlFromCache(path: string, client: libClient.HttpRequest, page:
 	cached.async((content: Buffer | null, error: Error | null) => {
 		if (error != null) {
 			client.error(`Failed to retrieve HTML content: ${error.message}`);
-			page.body += libBuilder.LoadError();
+			page.body += libBuilder.LoadingError();
 		}
 		else
 			page.body += `\t${content!.toString('utf-8')}\n`;

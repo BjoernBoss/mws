@@ -80,15 +80,21 @@ export function Title(name: string): string {
 export function Text(text: string, attributes: string = ''): string {
 	return DualTag('p', attributes, text, true);
 }
-export function StyleSheet(path: string): string {
+export function LoadStyle(path: string): string {
 	return SingleTag('link', `rel="stylesheet" type="text/css" href="${path}"`);
 }
-export function Script(path: string): string {
-	return DualTag('script', `src="${path}"`, '', true);
+export function AddStyle(content: string): string {
+	return DualTag('style', '', content, false);
+}
+export function LoadScript(path: string, attributes: string = ''): string {
+	return DualTag('script', `src="${path}"${attributes.length == 0 ? '' : ` ${attributes}`}`, '', true);
+}
+export function AddScript(content: string): string {
+	return DualTag('script', '', content, false);
 }
 export function Div(attributes: string, body: string): string {
 	return DualTag('div', attributes, body);
 }
-export function LoadError(): string {
+export function LoadingError(): string {
 	return Text('Failed to load Page Content', 'style="font-family: monospace; color: red; font-weight: bold; text-align: center;"');
 }
