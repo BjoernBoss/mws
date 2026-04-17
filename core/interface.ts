@@ -4,10 +4,15 @@ import * as libClient from './client.js';
 import * as libLog from "./log.js";
 import * as libLocation from "./location.js";
 
+/*
+*	Module interface
+*	If the returned promise resolves, and the client has not yet been handled,
+*	it is expected to not be handled anymore by the given client.
+*/
 export interface ModuleInterface {
 	name: string;
-	request(client: libClient.HttpRequest): void;
-	upgrade(client: libClient.HttpUpgrade): void;
+	request(client: libClient.HttpRequest): Promise<void>;
+	upgrade(client: libClient.HttpUpgrade): Promise<void>;
 }
 
 /*
@@ -18,10 +23,10 @@ export interface ModuleInterface {
 */
 export type CheckHost = (host: string) => boolean;
 
-export type RequestLambda = (client: libClient.HttpRequest) => void;
-export type UpgradeLambda = (client: libClient.HttpUpgrade) => void;
-export type RequestWrap = (client: libClient.HttpRequest, handle: () => void) => void;
-export type UpgradeWrap = (client: libClient.HttpUpgrade, handle: () => void) => void;
+export type RequestLambda = (client: libClient.HttpRequest) => Promise<void>;
+export type UpgradeLambda = (client: libClient.HttpUpgrade) => Promise<void>;
+export type RequestWrap = (client: libClient.HttpRequest, handle: () => Promise<void>) => Promise<void>;
+export type UpgradeWrap = (client: libClient.HttpUpgrade, handle: () => Promise<void>) => Promise<void>;
 
 /*
 *	Simple module interface implementation, which allows requests to be handled by a lambdas.
@@ -36,14 +41,14 @@ export class LambdaModule implements ModuleInterface {
 		this.upgradeLambda = upgrade;
 	}
 
-	public request(client: libClient.HttpRequest): void {
+	public async request(client: libClient.HttpRequest): Promise<void> {
 		if (this.requestLambda != undefined)
-			this.requestLambda(client);
+			await this.requestLambda(client);
 	}
 
-	public upgrade(client: libClient.HttpUpgrade): void {
+	public async upgrade(client: libClient.HttpUpgrade): Promise<void> {
 		if (this.upgradeLambda != undefined)
-			this.upgradeLambda(client);
+			await this.upgradeLambda(client);
 	}
 };
 
@@ -63,7 +68,7 @@ export class DispatchModule implements ModuleInterface {
 		}
 	}
 
-	private dispatch(client: libClient.HttpBase): ModuleInterface | null {
+	private dispatch(client: libClient.ClientBase): ModuleInterface | null {
 		let bestMatch: string | null = null;
 
 		/* iterate over the mappings and look for the corresponding best handler */
@@ -84,18 +89,18 @@ export class DispatchModule implements ModuleInterface {
 		return null;
 	}
 
-	public request(client: libClient.HttpRequest): void {
+	public async request(client: libClient.HttpRequest): Promise<void> {
 		const module = this.dispatch(client);
 		if (module != null) {
 			client.pushLog(module.name);
-			module.request(client);
+			await module.request(client);
 		}
 	}
-	public upgrade(client: libClient.HttpUpgrade): void {
+	public async upgrade(client: libClient.HttpUpgrade): Promise<void> {
 		const module = this.dispatch(client);
 		if (module != null) {
 			client.pushLog(module.name);
-			module.upgrade(client);
+			await module.upgrade(client);
 		}
 	}
 };
@@ -116,18 +121,18 @@ export class UnhandledModule implements ModuleInterface {
 		this.upgradeLambda = upgrade;
 	}
 
-	public request(client: libClient.HttpRequest): void {
+	public async request(client: libClient.HttpRequest): Promise<void> {
 		client.pushLog(this.handler.name);
-		this.handler.request(client);
+		await this.handler.request(client);
 		if (!client.handled() && this.requestLambda != undefined)
-			this.requestLambda(client);
+			await this.requestLambda(client);
 	}
 
-	public upgrade(client: libClient.HttpUpgrade): void {
+	public async upgrade(client: libClient.HttpUpgrade): Promise<void> {
 		client.pushLog(this.handler.name);
-		this.handler.upgrade(client);
+		await this.handler.upgrade(client);
 		if (!client.handled() && this.upgradeLambda != undefined)
-			this.upgradeLambda(client);
+			await this.upgradeLambda(client);
 	}
 };
 
@@ -147,19 +152,19 @@ export class WrapModule implements ModuleInterface {
 		this.upgradeWrap = upgrade;
 	}
 
-	public request(client: libClient.HttpRequest): void {
+	public async request(client: libClient.HttpRequest): Promise<void> {
 		client.pushLog(this.handler.name);
 		if (this.requestWrap != undefined)
-			this.requestWrap(client, () => this.handler.request(client));
+			await this.requestWrap(client, () => this.handler.request(client));
 		else
-			this.handler.request(client);
+			await this.handler.request(client);
 	}
 
-	public upgrade(client: libClient.HttpUpgrade): void {
+	public async upgrade(client: libClient.HttpUpgrade): Promise<void> {
 		client.pushLog(this.handler.name);
 		if (this.upgradeWrap != undefined)
-			this.upgradeWrap(client, () => this.handler.upgrade(client));
+			await this.upgradeWrap(client, () => this.handler.upgrade(client));
 		else
-			this.handler.upgrade(client);
+			await this.handler.upgrade(client);
 	}
 };

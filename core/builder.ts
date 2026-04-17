@@ -1,40 +1,6 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 /* Copyright (c) 2026 Bjoern Boss Henrichsen */
 
-export class HtmlQueue {
-	private page: HtmlPage;
-	private queue: ((page: HtmlPage, done: () => void) => void)[];
-	private completed?: (page: HtmlPage) => void;
-
-	constructor() {
-		this.page = new HtmlPage();
-		this.queue = [];
-	}
-
-	private handleNext(): void {
-		if (this.queue.length > 0) {
-			this.queue[0](this.page, () => {
-				this.queue.splice(0, 1);
-				this.handleNext();
-			});
-		}
-		else if (this.completed != undefined)
-			this.completed(this.page);
-	}
-
-	public modify(cb: (page: HtmlPage, done: () => void) => void): void {
-		if (this.queue.length == 0 && this.completed != undefined)
-			throw new Error('Html queue already closed');
-		this.queue.push(cb);
-	}
-	public process(cb: (page: HtmlPage) => void): void {
-		if (this.completed != undefined)
-			throw new Error('Html queue already being processed');
-		this.completed = cb;
-		this.handleNext();
-	}
-};
-
 /*
 *	Automatically configures the page to use utf-8
 *	Defaults the language to be 'en'
@@ -44,9 +10,9 @@ export class HtmlPage {
 	public body: string;
 	public language: string;
 
-	constructor(language: string = 'en') {
-		this.head = '';
-		this.body = '';
+	constructor(language: string = 'en', head: string = '', body: string = '') {
+		this.head = head;
+		this.body = body;
 		this.language = language;
 	}
 
@@ -63,6 +29,9 @@ ${this.body}</body>
 	}
 };
 
+export function Embed(content: string): string {
+	return `\t${content}\n`;
+}
 export function SingleTag(name: string, attributes: string = ''): string {
 	return `\t<${name}${attributes.length == 0 ? '' : ` ${attributes}`}>\n`;
 }

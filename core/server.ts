@@ -2,7 +2,7 @@
 /* Copyright (c) 2024-2026 Bjoern Boss Henrichsen */
 import * as libLog from "core/log.js";
 import * as libClient from "core/client.js";
-import * as libCommon from "core/common.js";
+import * as libInterface from "core/interface.js";
 import * as libHttps from "https";
 import * as libHttp from "http";
 import * as libFs from "fs";
@@ -17,11 +17,10 @@ export class Server {
 		this.stopList = [];
 	}
 
-	private respondNotFound(request: libHttp.IncomingMessage, client: libClient.HttpRequest | libClient.HttpUpgrade): void {
+	private respondBadEndpoint(request: libHttp.IncomingMessage, client: libClient.HttpRequest | libClient.HttpUpgrade): void {
 		client.respondNotFound(`No resource found at [${request.headers.host ?? ''}]:[${client.rawpath}]`);
-		client.finalize();
 	}
-	private handleWrapper(wasRequest: boolean, request: libHttp.IncomingMessage, checkHost: libCommon.CheckHost, handler: libCommon.ModuleInterface, port: number, establish: (host: string) => libClient.HttpRequest | libClient.HttpUpgrade): void {
+	private async handleWrapper(wasRequest: boolean, request: libHttp.IncomingMessage, checkHost: libInterface.CheckHost, handler: libInterface.ModuleInterface, port: number, establish: (host: string) => libClient.HttpRequest | libClient.HttpUpgrade): Promise<void> {
 		let client = null;
 		try {
 			/* setup the client object */
@@ -35,7 +34,7 @@ export class Server {
 			if (hostNameRegex != null) {
 				if (parseInt(hostNameRegex[2], 10) != port) {
 					client.error(`Host [${hostName}] port does not match [${port}]`);
-					return this.respondNotFound(request, client);
+					return this.respondBadEndpoint(request, client);
 				}
 				hostName = hostNameRegex[1];
 			}
@@ -43,15 +42,17 @@ export class Server {
 			/* validate the host name */
 			if (!checkHost(hostName)) {
 				client.error(`Host [${hostName}] now allowed for this endpoint [${port}]`);
-				return this.respondNotFound(request, client);
+				return this.respondBadEndpoint(request, client);
 			}
 
 			/* handle the actual client request */
 			if (wasRequest)
-				handler.request(client as libClient.HttpRequest);
+				await handler.request(client as libClient.HttpRequest);
 			else
-				handler.upgrade(client as libClient.HttpUpgrade);
-			client.finalize();
+				await handler.upgrade(client as libClient.HttpUpgrade);
+
+			/* finish the client handling */
+			client.finishIncoming();
 		} catch (err) {
 			/* log the unknown caught exception (internal-server-error) */
 			libLog.Error(`Uncaught exception encountered for client [${client != null ? client.id : null}]: ${err}`)
@@ -60,18 +61,18 @@ export class Server {
 			request.destroy();
 		}
 	}
-	private handleRequest(request: libHttp.IncomingMessage, response: libHttp.ServerResponse, check: libCommon.CheckHost, handler: libCommon.ModuleInterface, port: number): void {
+	private handleRequest(request: libHttp.IncomingMessage, response: libHttp.ServerResponse, check: libInterface.CheckHost, handler: libInterface.ModuleInterface, port: number): void {
 		this.handleWrapper(true, request, check, handler, port, function (host: string): libClient.HttpRequest {
 			return new libClient.HttpRequest(request, response, host);
 		});
 	}
-	private handleUpgrade(request: libHttp.IncomingMessage, socket: libStream.Duplex, head: Buffer, check: libCommon.CheckHost, handler: libCommon.ModuleInterface, port: number): void {
+	private handleUpgrade(request: libHttp.IncomingMessage, socket: libStream.Duplex, head: Buffer, check: libInterface.CheckHost, handler: libInterface.ModuleInterface, port: number): void {
 		this.handleWrapper(false, request, check, handler, port, function (host: string): libClient.HttpUpgrade {
 			return new libClient.HttpUpgrade(request, socket, head, host);
 		});
 	}
 
-	public listenHttp(port: number, handler: libCommon.ModuleInterface, checkHost: libCommon.CheckHost): void {
+	public listenHttp(port: number, handler: libInterface.ModuleInterface, checkHost: libInterface.CheckHost): void {
 		try {
 			/* initialize the server config */
 			const config = {
@@ -95,7 +96,7 @@ export class Server {
 			libLog.Error(`While listening to port ${port} using http: ${err}`);
 		}
 	}
-	public listenHttps(port: number, key: string, cert: string, handler: libCommon.ModuleInterface, checkHost: libCommon.CheckHost): void {
+	public listenHttps(port: number, key: string, cert: string, handler: libInterface.ModuleInterface, checkHost: libInterface.CheckHost): void {
 		try {
 			/* initialize the server config and load the key and certificate */
 			const config = {

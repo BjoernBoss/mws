@@ -170,7 +170,7 @@ export class Cached {
 	}
 
 	/* object must not be used anymore after reading or streaming from it (on errors, logs them and throws exception) */
-	public read(): Buffer {
+	public readSync(): Buffer {
 		/* check if the data have already been cached */
 		if (this.data != null)
 			return this.data;
@@ -197,27 +197,29 @@ export class Cached {
 	}
 
 	/* object must not be used anymore after reading or streaming from it (on errors, logs them and throws exception) */
-	public async(cb: (content: Buffer | null, error: Error | null) => void): void {
-		const stream: libStream.Readable = this.makeStream();
-		const buffers: Buffer[] = [];
-		let failed: boolean = false;
+	public async readAsync(): Promise<Buffer> {
+		return new Promise((resolve, reject) => {
+			const stream: libStream.Readable = this.makeStream();
+			const buffers: Buffer[] = [];
+			let failed: boolean = false;
 
-		/* register the handler to collect the data and stream them out */
-		stream.on("data", (chunk) => {
-			if (!failed)
-				buffers.push(chunk);
-		});
-		stream.on("error", (err) => {
-			if (!failed) {
-				failed = true;
-				cb(null, err);
-			}
-		});
-		stream.on("end", () => {
-			if (!failed) {
-				failed = true;
-				cb(Buffer.concat(buffers), null);
-			}
+			/* register the handler to collect the data and stream them out */
+			stream.on("data", (chunk) => {
+				if (!failed)
+					buffers.push(chunk);
+			});
+			stream.on("error", (err) => {
+				if (!failed) {
+					failed = true;
+					reject(err);
+				}
+			});
+			stream.on("end", () => {
+				if (!failed) {
+					failed = true;
+					resolve(Buffer.concat(buffers));
+				}
+			});
 		});
 	}
 };
@@ -240,26 +242,4 @@ export function SetCacheOptions(options: { cacheSize?: number, largestFile?: num
 /* initialize the default configuration */
 export function Initialize(): void {
 	SetCacheOptions({ cacheSize: 50_000_000, largestFile: 10_000_000 });
-}
-
-/* helper function to retrieve content from cache and appending it to the body of an html page */
-export function HtmlFromCache(path: string, client: libClient.HttpRequest, page: libBuilder.HtmlPage, done: () => void, persistent?: boolean): void {
-	/* try to fetch the object from the cache */
-	const cached: Cached | null = Cached.make(path, { persistent });
-	if (cached == null) {
-		client.error(`Failed to find HTML content [${path}]`);
-		page.body += libBuilder.LoadingError();
-		return done();
-	}
-
-	/* read the actual content and write it to the builder */
-	cached.async((content: Buffer | null, error: Error | null) => {
-		if (error != null) {
-			client.error(`Failed to retrieve HTML content: ${error.message}`);
-			page.body += libBuilder.LoadingError();
-		}
-		else
-			page.body += `\t${content!.toString('utf-8')}\n`;
-		done();
-	});
 }

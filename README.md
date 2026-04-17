@@ -2,10 +2,10 @@
 ![TypeScript](https://img.shields.io/badge/language-TypeScript-blue?style=flat-square)
 [![License](https://img.shields.io/badge/license-BSD--3--Clause-brightgreen?style=flat-square)](LICENSE.txt)
 
-Small custom webserver written in TypeScript/JavaScript, capable to host mutliple separate modules with support for simple http requests and websockets.
+Small custom webserver written in TypeScript/JavaScript, capable to host mutliple separate modules with support for http requests and websockets.
 
-To write a module for the server, simply implement the `ModuleInterface` defined in `core/common.ts`. 
-For this, the workspace `core` provides all functionality to interact with the server and incoming connections.
+To write a module for the server, simply implement the `ModuleInterface` defined in `core/interface.ts`.
+For this, the workspace `core` provides all functionality to interact with the server and incoming connections. The primary interaction with connections is defined via the classes defined in `core/client.ts`.
 
 ## Using the Server
 To setup this server simply clone the project:
