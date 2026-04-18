@@ -379,13 +379,16 @@ export class HttpRequest extends IncomingBase {
 				/* send the response with the size error */
 				const content = libTemplates.ErrorContentTooLarge({ path: this.rawpath, allowedLength: maxLength, providedLength: accumulated });
 				this.respondWithString(StatusCode.ContentTooLarge, 'html', content);
-				this.request.destroy();
 				cb(null, new Error('Request is too large'));
 			}
 
 			/* pass the data to the handler */
-			else if (failed = !cb(data, null))
-				this.request.destroy();
+			else if (failed = !cb(data, null)) {
+				if (this.responseState != RespondedState.responded) {
+					this.error('Connection closed automatically as chunked recipient returne false');
+					this.respondInternalError('Connection closed for unexpected reasons');
+				}
+			}
 		});
 
 		/* register the error and end handler */
@@ -393,7 +396,6 @@ export class HttpRequest extends IncomingBase {
 			if (failed) return;
 			this.error(`Error while receiving data [${e.message}]`);
 			failed = true;
-			this.request.destroy();
 			cb(null, e);
 		});
 		this.request.on('end', () => {

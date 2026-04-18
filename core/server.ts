@@ -58,7 +58,6 @@ export class Server {
 			libLog.Error(`Uncaught exception encountered for client [${client != null ? client.id : null}]: ${err}`)
 			if (client != null)
 				client.respondInternalError('Unknown internal error encountered');
-			request.destroy();
 		}
 	}
 	private handleRequest(request: libHttp.IncomingMessage, response: libHttp.ServerResponse, check: libInterface.CheckHost, handler: libInterface.ModuleInterface, port: number): void {
