@@ -8,7 +8,7 @@
 </head>
 
 <body>
-	<p style="font-family: monospace;">Content of length {#length} too large for [{#path}].</p>
+	<p style="font-family: monospace;">Content of size {#size} too large for [{#path}].</p>
 	<p style="font-family: monospace;">At most [{#allowed}] bytes are allowed.</p>
 </body>
 

@@ -8,7 +8,7 @@
 </head>
 
 <body>
-	<p style="font-family: monospace;">Resource [{#path}] has been temporarily redirected to [{#new}].</p>
+	<p style="font-family: monospace;">Resource [{#path}] temporarily redirects to <a href="{#new}">here</a>.</p>
 </body>
 
 </html>

@@ -2,11 +2,10 @@
 /* Copyright (c) 2024-2026 Bjoern Boss Henrichsen */
 import * as libFs from "fs";
 
-let logListener: LogCallback[] = [ConsoleLogger()];
+let LogListener: LogCallback[] = [ConsoleLogger()];
 function MakeActualLog(level: string, msg: string): void {
 	const date: string = new Date().toUTCString();
-
-	for (const log of logListener)
+	for (const log of LogListener)
 		log(level, date, msg);
 }
 
@@ -115,14 +114,14 @@ export function LineLogger(cb: (line: string) => void): LogCallback {
 
 /* remove all registered loggers (default logger is a single console logger) */
 export function ClearLoggers(): void {
-	for (const log of logListener)
+	for (const log of LogListener)
 		log(null, '', '');
-	logListener = [];
+	LogListener = [];
 }
 
 /* register another logger to receive the logs */
 export function AddLogger(cb: LogCallback): void {
-	logListener.push(cb);
+	LogListener.push(cb);
 }
 
 export function Error(msg: string): void {

@@ -1,0 +1,14 @@
+<!doctype html>
+<html>
+
+<head>
+	<title>Error 303: See Other!</title>
+	<meta name="description" content="See Other!">
+	<meta name="keywords" content="303 redirection">
+</head>
+
+<body>
+	<p style="font-family: monospace;">Continue <a href="{#new}">here</a>.</p>
+</body>
+
+</html>

@@ -62,14 +62,20 @@ export function SuccessOk(payload: { path: string, operation: string }): string 
 }
 
 /* html formatted template message for error */
-export function PermanentlyMoved(payload: { path: string, destination: string }): string {
-	const content: string = LoadRelative('templates/301.template');
-	return ExpandPlaceholders(content, { path: payload.path, new: payload.destination });
+export function SeeOther(payload: { destination: string }): string {
+	const content: string = LoadRelative('templates/303.template');
+	return ExpandPlaceholders(content, { new: payload.destination });
 }
 
 /* html formatted template message for error */
 export function TemporaryRedirect(payload: { path: string, destination: string }): string {
 	const content: string = LoadRelative('templates/307.template');
+	return ExpandPlaceholders(content, { path: payload.path, new: payload.destination });
+}
+
+/* html formatted template message for error */
+export function PermanentRedirect(payload: { path: string, destination: string }): string {
+	const content: string = LoadRelative('templates/308.template');
 	return ExpandPlaceholders(content, { path: payload.path, new: payload.destination });
 }
 
@@ -100,7 +106,7 @@ export function ErrorConflict(payload: { path: string, conflict: string }): stri
 /* html formatted template message for error */
 export function ErrorContentTooLarge(payload: { path: string, allowedLength: number, providedLength: number }): string {
 	const content: string = LoadRelative('templates/413.template');
-	return ExpandPlaceholders(content, { path: payload.path, allowed: payload.allowedLength.toString(), length: payload.providedLength.toString() });
+	return ExpandPlaceholders(content, { path: payload.path, allowed: payload.allowedLength.toString(), size: payload.providedLength.toString() });
 }
 
 /* html formatted template message for error */

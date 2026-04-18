@@ -9,22 +9,31 @@ import * as libCache from "./cache.js";
 import * as libPath from "path";
 import * as libFs from "fs";
 import * as libStream from "stream";
-import * as libURL from "url";
+import * as libUrl from "url";
 import * as libWs from "ws";
 import * as libHttp from "http";
 
-export const StatusCode = {
-	Ok: 200,
-	PartialContent: 206,
-	PermanentlyMoved: 301,
-	TemporaryRedirect: 307,
-	BadRequest: 400,
+export interface ResponseBody {
+	content: string;
+	fileType: string;
+};
+export interface StatusCodeType {
+	code: number;
+	msg: string;
+}
+export const StatusCode: Record<string, StatusCodeType> = {
+	Ok: { code: 200, msg: 'Ok' },
+	PartialContent: { code: 206, msg: 'Partial Content' },
+	SeeOther: { code: 303, msg: 'See Other' },
+	TemporaryRedirect: { code: 307, msg: 'Temporary Redirect' },
+	PermanentRedirect: { code: 308, msg: 'Permanent Redirect' },
+	BadRequest: { code: 400, msg: 'Bad Request' },
 	NotFound: { code: 404, msg: 'Not Found' },
-	MethodNotAllowed: 405,
-	Conflict: 409,
-	ContentTooLarge: 413,
-	UnsupportedMediaType: 415,
-	RangeIssue: 416,
+	MethodNotAllowed: { code: 405, msg: 'Method Not Allowed' },
+	Conflict: { code: 409, msg: 'Conflict' },
+	ContentTooLarge: { code: 413, msg: 'Content Too Large' },
+	UnsupportedMediaType: { code: 415, msg: 'Unsupported Media Type' },
+	RangeIssue: { code: 416, msg: 'Range Not Satisfiable' },
 	InternalError: { code: 500, msg: 'Internal Server Error' }
 };
 
@@ -34,43 +43,58 @@ enum RangeParseState {
 	issue,
 	malformed
 };
-function ParseRangeHeader(range: string | undefined, fileSize: number): { first: number, last?: number, state: RangeParseState } {
+function ParseRangeHeader(range: string | undefined, fileSize: number): { first: number, last: number, state: RangeParseState } {
 	if (range == undefined)
-		return { first: 0, state: RangeParseState.noRange };
+		return { first: 0, last: fileSize - 1, state: RangeParseState.noRange };
 
 	/* check if it requests bytes */
 	if (!range.startsWith('bytes='))
-		return { first: 0, state: RangeParseState.issue };
+		return { first: 0, last: 0, state: RangeParseState.issue };
 	range = range.substring(6);
 
 	/* extract the first number */
-	let firstSize = 0;
-	while (firstSize < range.length && (range[firstSize] >= '0' && range[firstSize] <= '9'))
-		++firstSize;
+	let numberLength: number = 0, firstNumber: string = '', lastNumber: string = '';
+	while (numberLength < range.length && (range[numberLength] >= '0' && range[numberLength] <= '9'))
+		++numberLength;
+	firstNumber = range.substring(0, numberLength);
+	range = range.substring(numberLength);
 
 	/* check if the separator exists */
-	if (firstSize >= range.length || range[firstSize] != '-')
-		return { first: 0, state: RangeParseState.malformed };
+	if (!range.startsWith('-'))
+		return { first: 0, last: 0, state: RangeParseState.malformed };
+	range = range.substring(1);
 
 	/* extract the second number */
-	let secondSize = firstSize + 1;
-	while (secondSize < range.length && (range[secondSize] >= '0' && range[secondSize] <= '9'))
-		++secondSize;
+	numberLength = 0;
+	while (numberLength < range.length && (range[numberLength] >= '0' && range[numberLength] <= '9'))
+		++numberLength;
+	lastNumber = range.substring(0, numberLength);
+	range = range.substring(numberLength).trimStart();
 
 	/* check if a valid end has been found or another range (only the first
 	*	range will be respected) and that at least one number has been given */
-	if (secondSize < range.length && range[secondSize] != ',')
-		return { first: 0, state: RangeParseState.malformed };
-	secondSize -= firstSize + 1;
-	if (firstSize == 0 && secondSize == 0)
-		return { first: 0, state: RangeParseState.malformed };
+	if (range != '' && !range.startsWith(','))
+		return { first: 0, last: 0, state: RangeParseState.malformed };
+	if (firstNumber == '' && lastNumber == '')
+		return { first: 0, last: 0, state: RangeParseState.malformed };
 
-	/* parse the two numbers and validate the range */
-	const first: number = (firstSize == 0 ? 0 : parseInt(range.substring(0, firstSize)));
-	const last: number | undefined = (secondSize == 0 ? undefined : parseInt(range.substring(firstSize + 1, secondSize)));
-	if (first >= fileSize || (last != undefined && (first > last || last >= fileSize)))
-		return { first: 0, state: RangeParseState.issue };
-	return { first, last, state: RangeParseState.valid };
+	/* parse the two numbers */
+	let first: number | null = (firstNumber.length == 0 ? null : parseInt(firstNumber));
+	let last: number | null = (lastNumber.length == 0 ? null : parseInt(lastNumber));
+
+	/* check if the range has an offset and potentially also an end */
+	if (first != null) {
+		if (last == null)
+			last = fileSize - 1;
+		if (first > last || last >= fileSize)
+			return { first: 0, last: 0, state: RangeParseState.issue };
+		return { first, last, state: RangeParseState.valid };
+	}
+
+	/* validate the offset at the end */
+	if (last! > fileSize || last! == 0)
+		return { first: 0, last: 0, state: RangeParseState.issue };
+	return { first: fileSize - last!, last: fileSize - 1, state: RangeParseState.valid };
 }
 
 function MakeContentType(fileType: string): string {
@@ -93,7 +117,7 @@ function MakeContentType(fileType: string): string {
 	return 'application/octet-stream';
 }
 
-var NextClientId: number = 0;
+let NextClientId: number = 0;
 const WebSocketServerInstance: libWs.Server = new libWs.WebSocketServer({ noServer: true });
 
 export class ClientBase {
@@ -160,14 +184,14 @@ export class ClientBase {
 		if (!libLocation.IsSubDirectory(path, this.path))
 			return false;
 
-		this.basepath = libLocation.Join(this.basepath, path);
+		this.basepath = libLocation.JoinSanitized(this.basepath, path);
 		this.path = this.path.substring(path.endsWith('/') ? path.length - 1 : path.length);
 		if (this.path == '')
 			this.path = '/';
 		return true;
 	}
 	public makePath(path: string): string {
-		return libLocation.Join(this.basepath, path);
+		return libLocation.JoinSanitized(this.basepath, path);
 	}
 	public pushLog(name: string) {
 		this.logLayer = `${this.logLayer}::${name}`;
@@ -188,11 +212,11 @@ export abstract class IncomingBase extends ClientBase {
 	protected responded: boolean;
 	protected outputHeaders: Record<string, string>;
 
-	protected abstract setupResponse(status: number, message: string, content: string, fileType: string): void;
+	protected abstract respondWithString(status: StatusCodeType, fileType: string, content: string): void;
 	protected abstract finishSelf(): void;
 
 	constructor(request: libHttp.IncomingMessage, host: string) {
-		super(new libURL.URL(`http://host.server${request.url}`), host, request.headers);
+		super(new libUrl.URL(`http://host.server${request.url}`), host, request.headers);
 		this.request = request;
 		this.responded = false;
 		this.outputHeaders = {};
@@ -215,21 +239,61 @@ export abstract class IncomingBase extends ClientBase {
 	/* respond with [internal-error], if the header has not yet been sent, and otherwise silently discard (only one to not fail, if request was already responded to) */
 	public respondInternalError(msg: string): void {
 		if (!this.responded) {
-			this.log(`Responding with Internal error [${msg}]`);
+			this.log(`Responding with internal error [${msg}]`);
 			this.outputHeaders = {};
-			this.setupResponse(StatusCode.InternalError.code, StatusCode.InternalError.msg, msg, 'txt');
+			this.respondWithString(StatusCode.InternalError, 'txt', msg);
 		}
 	}
 
 	/* respond with [not-found] and either a pre-defined template response or the given msg */
-	public respondNotFound(msg: string | null = null): void {
-		this.log(`Responding with Not-Found`);
-		if (msg != null)
-			this.setupResponse(StatusCode.NotFound.code, StatusCode.NotFound.msg, msg, 'txt');
-		else {
-			const content = libTemplates.ErrorNotFound({ path: this.rawpath });
-			this.setupResponse(StatusCode.NotFound.code, StatusCode.NotFound.msg, content, 'html');
-		}
+	public respondNotFound(body?: ResponseBody): void {
+		this.log(`Responding with [${StatusCode.NotFound.msg}]`);
+		if (body == null)
+			body = { fileType: 'html', content: libTemplates.ErrorNotFound({ path: this.rawpath }) };
+		this.respondWithString(StatusCode.NotFound, body.fileType || 'txt', body.content);
+	}
+
+	/* respond with [bad-request] and either a pre-defined template response or the given msg */
+	public respondBadRequest(reason: string, body?: ResponseBody): void {
+		this.log(`Responding with [${StatusCode.BadRequest.msg}] because of [${reason}]`);
+		if (body == null)
+			body = { fileType: 'html', content: libTemplates.ErrorBadRequest({ path: this.rawpath, reason }) };
+		this.respondWithString(StatusCode.BadRequest, body.fileType || 'txt', body.content);
+	}
+
+	/* respond with [conflict] and either a pre-defined template response or the given msg */
+	public respondConflict(conflict: string, body?: ResponseBody): void {
+		this.log(`Responding with [${StatusCode.Conflict.msg}] of [${conflict}]`);
+		if (body == null)
+			body = { fileType: 'html', content: libTemplates.ErrorConflict({ path: this.rawpath, conflict }) };
+		this.respondWithString(StatusCode.Conflict, body.fileType || 'txt', body.content);
+	}
+
+	/* respond with [see-other] to the given target and either a pre-defined template response or the given msg (forces method GET) */
+	public respondSeeOther(target: string, body?: ResponseBody): void {
+		this.log(`Responding with [${StatusCode.SeeOther.msg}] to [${target}]`);
+		this.outputHeaders['Location'] = target;
+		if (body == null)
+			body = { fileType: 'html', content: libTemplates.SeeOther({ destination: target }) };
+		this.respondWithString(StatusCode.SeeOther, body.fileType || 'txt', body.content);
+	}
+
+	/* respond with [temporary-redirect] to the given target and either a pre-defined template response or the given msg (preserves method) */
+	public respondTemporaryRedirect(target: string, body?: ResponseBody): void {
+		this.log(`Responding with [${StatusCode.TemporaryRedirect.msg}] to [${target}]`);
+		this.outputHeaders['Location'] = target;
+		if (body == null)
+			body = { fileType: 'html', content: libTemplates.TemporaryRedirect({ path: this.rawpath, destination: target }) };
+		this.respondWithString(StatusCode.TemporaryRedirect, body.fileType || 'txt', body.content);
+	}
+
+	/* respond with [permanent-redirect] to the given target and either a pre-defined template response or the given msg (preserves method)  */
+	public respondPermanentRedirect(target: string, body?: ResponseBody): void {
+		this.log(`Responding with [${StatusCode.PermanentRedirect.msg}] to [${target}]`);
+		this.outputHeaders['Location'] = target;
+		if (body == null)
+			body = { fileType: 'html', content: libTemplates.PermanentRedirect({ path: this.rawpath, destination: target }) };
+		this.respondWithString(StatusCode.PermanentRedirect, body.fileType || 'txt', body.content);
 	}
 };
 
@@ -241,7 +305,7 @@ export abstract class IncomingBase extends ClientBase {
 export class HttpRequest extends IncomingBase {
 	private response: libHttp.ServerResponse;
 	private received: boolean;
-	private htmlResponse?: { page: libBuilder.HtmlPage, status: number };
+	private htmlResponse?: { page: libBuilder.HtmlPage, status: StatusCodeType };
 
 	constructor(request: libHttp.IncomingMessage, response: libHttp.ServerResponse, host: string) {
 		super(request, host);
@@ -249,14 +313,15 @@ export class HttpRequest extends IncomingBase {
 		this.received = false;
 	}
 
-	private closeHeader(statusCode: number, fileType: string, length: number | null = null): void {
+	private closeHeader(status: StatusCodeType, fileType: string, contentSize: number | null = null): void {
 		/* check if the header has already been sent */
 		if (this.responded)
 			throw new Error('Request has already been handled');
 		this.responded = true;
 
 		/* setup the response */
-		this.response.statusCode = statusCode;
+		this.response.statusCode = status.code;
+		this.response.statusMessage = status.msg;
 		for (const key in this.outputHeaders)
 			this.response.setHeader(key, this.outputHeaders[key]);
 		this.response.setHeader('Server', libConfig.GetServerName());
@@ -264,13 +329,8 @@ export class HttpRequest extends IncomingBase {
 		this.response.setHeader('Date', new Date().toUTCString());
 		if (!('Accept-Ranges' in this.outputHeaders))
 			this.response.setHeader('Accept-Ranges', 'none');
-		if (length != null)
-			this.response.setHeader('Content-Length', length);
-	}
-	private respondString(code: number, fileType: string, string: string): void {
-		const buffer = Buffer.from(string, 'utf-8');
-		this.closeHeader(code, fileType, buffer.length);
-		this.response.end(buffer);
+		if (contentSize != null)
+			this.response.setHeader('Content-Length', contentSize);
 	}
 	private receiveClientChunks(cb: (data: Buffer | null, error: Error | null) => boolean, maxLength: number | null): void {
 		let failed = false, accumulated = 0;
@@ -282,13 +342,13 @@ export class HttpRequest extends IncomingBase {
 
 		/* check if too many data have been promised */
 		if (maxLength != null && this.headers['content-length'] != undefined) {
-			const length = parseInt(this.headers['content-length']);
+			const contentSize = parseInt(this.headers['content-length']);
 
 			/* check if the length is valid and otherwise mark the state as 'handled' */
-			if (!isFinite(length) || length < 0 || length > maxLength) {
-				this.log(`Request is too large or has no size [${length}]`);
-				const content = libTemplates.ErrorContentTooLarge({ path: this.rawpath, allowedLength: maxLength, providedLength: length });
-				this.respondString(StatusCode.ContentTooLarge, 'html', content);
+			if (!isFinite(contentSize) || contentSize < 0 || contentSize > maxLength) {
+				this.log(`Request is too large or has no size [${contentSize}]`);
+				const content = libTemplates.ErrorContentTooLarge({ path: this.rawpath, allowedLength: maxLength, providedLength: contentSize });
+				this.respondWithString(StatusCode.ContentTooLarge, 'html', content);
 				cb(null, new Error('Request payload is too large'));
 				return;
 			}
@@ -306,8 +366,8 @@ export class HttpRequest extends IncomingBase {
 
 				/* check if the response was already sent and otherwise update to the content size error */
 				if (!this.responded) {
-					const content = libTemplates.ErrorContentTooLarge({ path: this.rawpath, allowedLength: maxLength, providedLength: length });
-					this.respondString(StatusCode.ContentTooLarge, 'html', content);
+					const content = libTemplates.ErrorContentTooLarge({ path: this.rawpath, allowedLength: maxLength, providedLength: accumulated });
+					this.respondWithString(StatusCode.ContentTooLarge, 'html', content);
 				}
 				this.request.destroy();
 				cb(null, new Error('Request is too large'));
@@ -331,14 +391,16 @@ export class HttpRequest extends IncomingBase {
 			cb(null, null);
 		});
 	}
-	protected setupResponse(status: number, message: string, content: string, fileType: string): void {
-		this.respondString(status, fileType, content);
+	protected respondWithString(status: StatusCodeType, fileType: string, content: string): void {
+		let buffer: Buffer = Buffer.from(content, 'utf-8');
+		this.closeHeader(status, fileType, buffer.length);
+		this.response.end(buffer);
 	}
 	protected finishSelf(): void {
 		/* check if html has been queued and respond with it */
 		if (this.htmlResponse != null) {
 			this.responded = false;
-			this.respondString(this.htmlResponse.status, 'html', this.htmlResponse.page.finalize());
+			this.respondWithString(this.htmlResponse.status, 'html', this.htmlResponse.page.finalize());
 		}
 	}
 
@@ -353,26 +415,26 @@ export class HttpRequest extends IncomingBase {
 	public ensureMethod(methods: string[]): string | null {
 		if (methods.indexOf(this.request.method!) >= 0)
 			return this.request.method!;
-		this.log(`Request used unsupported method [${this.request.method}]`);
+		this.log(`Responding with [${StatusCode.MethodNotAllowed.msg}] due to [${this.request.method}]`);
 
 		const content = libTemplates.ErrorInvalidMethod({ path: this.rawpath, method: this.request.method!, allowed: methods });
-		this.respondString(StatusCode.MethodNotAllowed, 'html', content);
+		this.respondWithString(StatusCode.MethodNotAllowed, 'html', content);
 		return null;
 	}
 
 	/* ensure the media-type is one of the list and otherwise return null and auto-respond with [unsupported-media-type] */
 	public ensureMediaType(types: string[]): string | null {
-		const type = this.headers['content-type'];
+		const type = this.headers['content-type']?.toLowerCase();
 		if (type === undefined)
 			return types[0];
 		for (let i = 0; i < types.length; ++i) {
 			if (type === types[i] || type.startsWith(`${types[i]};`))
 				return types[i];
 		}
-		this.log(`Responded with Unsupported Media Type for [${type}]`);
+		this.log(`Responding with [${StatusCode.UnsupportedMediaType.msg}] for [${type}]`);
 
 		const content = libTemplates.ErrorUnsupportedMediaType({ path: this.rawpath, used: type, allowed: types });
-		this.respondString(StatusCode.UnsupportedMediaType, 'html', content);
+		this.respondWithString(StatusCode.UnsupportedMediaType, 'html', content);
 		return null;
 	}
 
@@ -393,7 +455,7 @@ export class HttpRequest extends IncomingBase {
 
 		if (index == end)
 			return defEncoding;
-		return type.substring(index, end);
+		return type.substring(index, end).trim().toLowerCase();
 	}
 
 	/* return the html-page, if a child module plans to produce html */
@@ -402,7 +464,7 @@ export class HttpRequest extends IncomingBase {
 	}
 
 	/* prepare the response to be html, can be built on by parent modules, sent once the client is cleared and the builder is ready */
-	public respondHtml(page: libBuilder.HtmlPage, status: number = StatusCode.Ok): void {
+	public respondHtml(page: libBuilder.HtmlPage, status: StatusCodeType = StatusCode.Ok): void {
 		if (this.responded)
 			throw new Error('Request has already been handled');
 
@@ -412,20 +474,21 @@ export class HttpRequest extends IncomingBase {
 	}
 
 	/* respond with [status] and send data given to callback (callback must at least be called once with 'last' set) */
-	public respondData(status: number = StatusCode.Ok, fileType: string = 'html'): (data: Buffer | null, last: boolean) => Promise<void> {
+	public respondData(fileType: string = 'html', status: StatusCodeType = StatusCode.Ok): (data: Buffer | null, last: boolean) => Promise<void> {
 		if (this.responded)
 			throw new Error('Request has already been handled');
-		this.log(`Responding with data and status [${status}]`);
+		this.log(`Responding with data and status [${status.msg}]`);
 		this.responded = true;
 
 		/* return the send callback */
 		let headerSent = false, completed = false;
 		return (data, last) => new Promise((resolve, reject) => {
 			if (completed)
-				reject(new Error('Responding to closed response'));
+				return reject(new Error('Responding to closed response'));
 
 			/* check if the header needs to be sent */
 			if (!headerSent) {
+				headerSent = true;
 				this.responded = false;
 				this.closeHeader(status, fileType, (last ? (data?.length || 0) : null));
 			}
@@ -443,71 +506,17 @@ export class HttpRequest extends IncomingBase {
 	}
 
 	/* respond with [ok] and either a pre-defined template response or the given msg */
-	public respondOk(operation: string, msg: string | null = null): void {
-		this.log(`Responding with Ok`);
-
-		if (msg != null)
-			this.respondString(StatusCode.Ok, 'txt', msg);
-		else {
-			const content = libTemplates.SuccessOk({ path: this.rawpath, operation: operation });
-			this.respondString(StatusCode.Ok, 'html', content);
-		}
-	}
-
-	/* respond with [conflict] and either a pre-defined template response or the given msg */
-	public respondConflict(conflict: string, msg: string | null = null): void {
-		this.log(`Responding with Conflict of [${conflict}]`);
-
-		if (msg != null)
-			this.respondString(StatusCode.Conflict, 'txt', msg);
-		else {
-			const content = libTemplates.ErrorConflict({ path: this.rawpath, conflict: conflict });
-			this.respondString(StatusCode.Conflict, 'html', content);
-		}
-	}
-
-	/* respond with [permanently-moved] to the given target and either a pre-defined template response or the given msg */
-	public respondMoved(target: string, msg: string | null = null): void {
-		this.log(`Responding with Permanently-Moved to [${target}]`);
-		this.outputHeaders['Location'] = target;
-
-		if (msg != null)
-			this.respondString(StatusCode.PermanentlyMoved, 'txt', msg);
-		else {
-			const content = libTemplates.PermanentlyMoved({ path: this.rawpath, destination: target });
-			this.respondString(StatusCode.PermanentlyMoved, 'html', content);
-		}
-	}
-
-	/* respond with [temporary-redirect] to the given target and either a pre-defined template response or the given msg */
-	public respondRedirect(target: string, msg: string | null = null): void {
-		this.log(`Responding with Redirect to [${target}]`);
-		this.outputHeaders['Location'] = target;
-
-		if (msg != null)
-			this.respondString(StatusCode.TemporaryRedirect, 'txt', msg);
-		else {
-			const content = libTemplates.TemporaryRedirect({ path: this.rawpath, destination: target });
-			this.respondString(StatusCode.TemporaryRedirect, 'html', content);
-		}
-	}
-
-	/* respond with [bad-request] to the given target and either a pre-defined template response or the given msg */
-	public respondBadRequest(reason: string, msg: string | null = null): void {
-		this.log(`Responding with Bad-Request`);
-
-		if (msg != null)
-			this.respondString(StatusCode.BadRequest, 'txt', msg);
-		else {
-			const content = libTemplates.ErrorBadRequest({ path: this.rawpath, reason: reason });
-			this.respondString(StatusCode.BadRequest, 'html', content);
-		}
+	public respondOk(operation: string, body?: ResponseBody): void {
+		this.log(`Responding with [${StatusCode.Ok.msg}] for [${operation}]`);
+		if (body == null)
+			body = { fileType: 'html', content: libTemplates.SuccessOk({ path: this.rawpath, operation: operation }) };
+		this.respondWithString(StatusCode.Ok, body.fileType || 'txt', body.content);
 	}
 
 	/* respond with a textual response of the given media-type and given status code */
-	public respondText(content: string, fsKind: string = 'html', status: number = StatusCode.Ok): void {
-		this.log(`Responding with ${fsKind}: [${content.substring(0, 32).replaceAll('\n', ' ').replaceAll('\r', ' ').replaceAll('\t', ' ')}...]`);
-		this.respondString(status, fsKind, content);
+	public respondText(content: string, fileType: string = 'html', status: StatusCodeType = StatusCode.Ok): void {
+		this.log(`Responding with ${fileType}: [${content.substring(0, 32).replaceAll('\n', ' ').replaceAll('\r', ' ').replaceAll('\t', ' ')}...]`);
+		this.respondWithString(status, fileType, content);
 	}
 
 	/* try to respond with the given file (extracting media-type from the file-path), and return false, if not found (http-range aware) */
@@ -526,14 +535,14 @@ export class HttpRequest extends IncomingBase {
 			if (range.state == RangeParseState.malformed) {
 				this.log(`Malformed range-request encountered [${this.headers.range}]`);
 				const content = libTemplates.ErrorBadRequest({ path: this.rawpath, reason: `Issues while parsing http-header range: [${this.headers.range}]` });
-				this.respondString(StatusCode.BadRequest, 'html', content);
+				this.respondWithString(StatusCode.BadRequest, 'html', content);
 				return true;
 			}
 			else if (range.state == RangeParseState.issue) {
 				this.log(`Unsatisfiable range-request encountered [${this.headers.range}] with file-size [${cached.fileSize()}]`);
 				this.outputHeaders['Content-Range'] = `bytes */${cached.fileSize()}`;
 				const content = libTemplates.ErrorRangeIssue({ path: this.rawpath, range: this.headers.range!, fileSize: cached.fileSize() });
-				this.respondString(StatusCode.RangeIssue, 'html', content);
+				this.respondWithString(StatusCode.RangeIssue, 'html', content);
 				return true;
 			}
 
@@ -549,7 +558,6 @@ export class HttpRequest extends IncomingBase {
 				this.response.end();
 				return true;
 			}
-			range.last = (range.last == undefined ? cached.fileSize() - 1 : range.last);
 
 			/* create the stream for the file */
 			const stream: libStream.Readable = cached.stream({ start: range.first, end: range.last });
@@ -612,7 +620,7 @@ export class HttpRequest extends IncomingBase {
 					this.error(`Failed to decode content with [${encoding}]: ${e.message}`);
 					if (!this.responded) {
 						const content = libTemplates.ErrorBadRequest({ path: this.rawpath, reason: `Unable to decode content` });
-						this.respondString(StatusCode.BadRequest, 'html', content);
+						this.respondWithString(StatusCode.BadRequest, 'html', content);
 					}
 					reject(e);
 				}
@@ -725,32 +733,28 @@ export class HttpUpgrade extends IncomingBase {
 		this.head = head;
 	}
 
-	private respondString(status: string, fileType: string, text: string, badRequest: boolean): void {
-		const buffer = Buffer.from(text, 'utf-8');
+	protected respondWithString(status: StatusCodeType, fileType: string, content: string): void {
+		const buffer = Buffer.from(content, 'utf-8');
 
 		/* check if the header has already been sent (always set to finalized, as it is closed) */
 		if (this.responded)
 			throw new Error('Request has already been handled');
 		this.responded = true;
 
-		let header = `HTTP/1.1 ${status}\r\n`;
+		let header = `HTTP/1.1 ${status.code} ${status.msg}\r\n`;
 		header += `Date: ${new Date().toUTCString()}\r\n`;
 		header += `Server: ${libConfig.GetServerName()}\r\n`;
 		header += `Content-Type: ${MakeContentType(fileType)}\r\n`;
 		header += `Content-Length: ${buffer.length}\r\n`;
 		header += `Accept-Ranges: none\r\n`;
-		if (!badRequest && (this.request.headers.connection || "").toLowerCase() != "close" && this.request.httpVersionMajor < 2) {
+		if (status.code < 400 && (this.request.headers.connection || "").toLowerCase() != "close" && this.request.httpVersionMajor < 2) {
 			header += 'Connection: keep-alive\r\n';
 			header += 'Keep-Alive: timeout=5\r\n';
 		}
 		header += '\r\n';
 
 		this.socket.write(header, 'utf-8');
-		this.socket.write(buffer);
-		this.socket.destroy();
-	}
-	protected setupResponse(status: number, message: string, content: string, fileType: string): void {
-		this.respondString(`${status} ${message}`, fileType, content, (status >= 400));
+		this.socket.end(buffer);
 	}
 	protected finishSelf(): void { }
 
@@ -804,8 +808,8 @@ export class ClientSocket extends ClientBase {
 	public ping(): void {
 		this.ws.ping();
 	}
-	public send(buffer: any): void {
-		this.ws.send(buffer);
+	public send(data: string | Buffer): void {
+		this.ws.send(data);
 	}
 	public close(): void {
 		this.ws.close();
