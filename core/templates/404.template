@@ -8,7 +8,7 @@
 </head>
 
 <body>
-	<p style="font-family: monospace;">Path [{path}] could not be found.</p>
+	<p style="font-family: monospace;">Path [{#path}] could not be found.</p>
 </body>
 
 </html>

@@ -8,7 +8,7 @@
 </head>
 
 <body>
-	<p style="font-family: monospace;">Range [{range}] cannot be satisfied for [{path}] of size [{size}].</p>
+	<p style="font-family: monospace;">Range [{#range}] cannot be satisfied for [{#path}] of size [{#size}].</p>
 </body>
 
 </html>

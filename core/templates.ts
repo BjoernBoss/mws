@@ -17,60 +17,43 @@ function LoadRelative(path: string): string {
 	return '<!doctype html><html><body><p style="font-family: monospace;">Response message not found.</p></body></html>';
 }
 function ExpandPlaceholders(content: string, map: Record<string, string>): string {
-	var out = '', name = '';
+	let out = '', name = '', placeholder = false;
 
 	/* construct the new output content */
-	var inName = false;
-	for (var i = 0; i < content.length; ++i) {
-		/* check if this is the start/end of a placeholder */
-		if (content[i] != '{' && content[i] != '}') {
-			if (inName)
+	for (let i = 0; i < content.length; ++i) {
+		/* check if this is not the start/end of a placeholder, in which case it can just be added to the current set */
+		if (!content.startsWith(placeholder ? '}' : '{#', i)) {
+			if (placeholder)
 				name += content[i];
 			else
 				out += content[i];
 			continue;
 		}
 
-		/* check if the curly bracket is escaped */
-		if (i + 1 < content.length && content[i] == content[i + 1]) {
-			if (inName)
-				name += content[i];
+		/* check if a name is being started and if its potentially just an escape sequence */
+		if (!placeholder) {
+			if (content.startsWith('{##', i))
+				out += '{#', i += 2;
 			else
-				out += content[i];
-			++i;
+				name = '', placeholder = true, ++i;
 			continue;
 		}
 
-		/* check if a name is being started */
-		if (content[i] == '{') {
-			if (!inName)
-				name = '';
-			else
-				libLog.Warning('Unescaped opening curly bracket encountered');
-			inName = true;
-			continue;
-		}
-
-		/* check if a name has been completed */
-		if (!inName)
-			libLog.Warning('Unescaped closing curly bracket encountered');
-		else if (!(name in map))
-			libLog.Warning(`Undefined placeholder [${name}] encountered`);
+		/* validate the completed name */
 		else {
-			var value = map[name];
-			if (typeof (value) != 'string')
-				libLog.Warning(`Placeholder [${name}] is not a string`);
+			placeholder = false;
+			if (!(name in map))
+				libLog.Warning(`Undefined placeholder [${name}] encountered`);
 			else
-				out += value;
+				out += map[name];
 		}
-		inName = false;
 	}
 
 	/* check if a last name was not closed properly */
-	if (inName)
+	if (placeholder)
 		libLog.Warning('Content ends with an incomplete placeholder');
 	return out;
-};
+}
 
 /* html formatted template message for error */
 export function SuccessOk(payload: { path: string, operation: string }): string {
@@ -132,7 +115,21 @@ export function ErrorRangeIssue(payload: { path: string, range: string, fileSize
 	return ExpandPlaceholders(content, { path: payload.path, range: payload.range, size: payload.fileSize.toString() });
 }
 
-/* expand the placeholders in the content (format: {name}, with '{' being escaped as '{{') */
-export function Expand(content: string, args: Record<string, string>) {
+/* expand the placeholders in the content (format: {#name}, with '{#' being escaped as '{##') */
+export function Expand(content: string, args: Record<string, string>): string {
 	return ExpandPlaceholders(content, args);
-};
+}
+
+/* create the escaped content */
+export function Escape(content: string): string {
+	let out = '';
+
+	/* construct the new escaped output content */
+	for (let i = 0; i < content.length; ++i) {
+		if (!content.startsWith('{#', i))
+			out += content[i];
+		else
+			out += '{##', ++i;
+	}
+	return out;
+}

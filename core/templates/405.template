@@ -8,8 +8,8 @@
 </head>
 
 <body>
-	<p style="font-family: monospace;">Method {method} not allowed for [{path}].</p>
-	<p style="font-family: monospace;">Only the methods [{allowed}] are allowed.</p>
+	<p style="font-family: monospace;">Method {#method} not allowed for [{#path}].</p>
+	<p style="font-family: monospace;">Only the methods [{#allowed}] are allowed.</p>
 </body>
 
 </html>

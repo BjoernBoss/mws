@@ -8,7 +8,7 @@
 </head>
 
 <body>
-	<p style="font-family: monospace;">Conflict [{conflict}] for resource [{path}].</p>
+	<p style="font-family: monospace;">Conflict [{#conflict}] for resource [{#path}].</p>
 </body>
 
 </html>

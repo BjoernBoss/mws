@@ -10,7 +10,7 @@ import * as libStream from "stream";
 import * as libNet from "net";
 
 export class Server {
-	private stopList: (() => void)[];
+	private stopList: (() => Promise<void>)[];
 
 	constructor() {
 		libLog.Info(`Server object created`);
@@ -26,7 +26,7 @@ export class Server {
 			/* setup the client object */
 			const rawHostName = (request.headers.host ?? '').toLowerCase();
 			client = establish(rawHostName);
-			client.log(`${wasRequest ? 'Request' : 'Upgrade'}:${port} from [${request.socket.remoteAddress}]:${request.socket.remotePort} to [${request.headers.host}]:[${request.url}] (user-agent: [${request.headers['user-agent']}])`);
+			client.log(`${wasRequest ? 'Request' : 'Upgrade'}:${port} from [${request.socket.remoteAddress}]:${request.socket.remotePort} to [${request.headers.host}]:[${request.url}] (user-agent: [${request.headers['user-agent'] || ''}])`);
 
 			/* extract the host to be used and validate its port */
 			const hostNameRegex = rawHostName.match(/^(.*):(\d+)$/);
@@ -41,7 +41,7 @@ export class Server {
 
 			/* validate the host name */
 			if (!checkHost(hostName)) {
-				client.error(`Host [${hostName}] now allowed for this endpoint [${port}]`);
+				client.error(`Host [${hostName}] not allowed for this endpoint [${port}]`);
 				return this.respondBadEndpoint(request, client);
 			}
 
@@ -87,7 +87,7 @@ export class Server {
 				return;
 
 			/* register the stop-function */
-			this.stopList.push(() => server.close());
+			this.stopList.push(() => new Promise((resolve) => server.close(() => resolve())));
 
 			/* log the established listener */
 			const address = server.address() as libNet.AddressInfo;
@@ -113,7 +113,7 @@ export class Server {
 				return;
 
 			/* register the stop-function */
-			this.stopList.push(() => server.close());
+			this.stopList.push(() => new Promise((resolve) => server.close(() => resolve())));
 
 			/* log the established listener */
 			const address = server.address() as libNet.AddressInfo;
@@ -122,8 +122,8 @@ export class Server {
 			libLog.Error(`While listening to port ${port} using https: ${err}`);
 		}
 	}
-	public stop(): void {
+	public async stop(): Promise<void> {
 		for (const cb of this.stopList)
-			cb();
+			await cb();
 	}
 };

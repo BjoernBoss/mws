@@ -1,8 +1,6 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 /* Copyright (c) 2026 Bjoern Boss Henrichsen */
 import * as libLog from "./log.js";
-import * as libBuilder from "./builder.js";
-import * as libClient from "./client.js";
 import * as libFs from "fs";
 import * as libStream from "stream";
 

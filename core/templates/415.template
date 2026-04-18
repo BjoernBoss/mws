@@ -8,8 +8,8 @@
 </head>
 
 <body>
-	<p style="font-family: monospace;">Media type {used} not allowed for [{path}].</p>
-	<p style="font-family: monospace;">Only the media types [{allowed}] are allowed.</p>
+	<p style="font-family: monospace;">Media type {#used} not allowed for [{#path}].</p>
+	<p style="font-family: monospace;">Only the media types [{#allowed}] are allowed.</p>
 </body>
 
 </html>
