@@ -50,7 +50,7 @@ export class LambdaModule implements ModuleInterface {
 		if (this.upgradeLambda != undefined)
 			await this.upgradeLambda(client);
 	}
-};
+}
 
 /*
 *	Simple module interface implementation, which dispatches requests to different children.
@@ -103,7 +103,7 @@ export class DispatchModule implements ModuleInterface {
 			await module.upgrade(client);
 		}
 	}
-};
+}
 
 /*
 *	Simple module interface implementation, which forwards unhandled requests to a lambda.
@@ -134,7 +134,7 @@ export class UnhandledModule implements ModuleInterface {
 		if (!client.handled() && this.upgradeLambda != undefined)
 			await this.upgradeLambda(client);
 	}
-};
+}
 
 /*
 *	Simple module interface implementation, which forwards any requests to a lambda.
@@ -167,4 +167,4 @@ export class WrapModule implements ModuleInterface {
 		else
 			await this.handler.upgrade(client);
 	}
-};
+}

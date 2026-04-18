@@ -257,6 +257,11 @@ export abstract class IncomingBase extends ClientBase {
 		}
 	}
 
+	/* perform a responds with [internal-error] and message 'Filesystem operation failed' */
+	public respondFileSystemError(): void {
+		this.respondInternalError('Filesystem operation failed');
+	}
+
 	/* respond with [not-found] and either a pre-defined template response or the given msg */
 	public respondNotFound(body?: ResponseBody): void {
 		this.log(`Responding with [${StatusCode.NotFound.msg}]`);
@@ -307,7 +312,7 @@ export abstract class IncomingBase extends ClientBase {
 			body = { fileType: 'html', content: libTemplates.PermanentRedirect({ path: this.rawpath, destination: target }) };
 		this.respondWithString(StatusCode.PermanentRedirect, body.fileType || 'txt', body.content);
 	}
-};
+}
 
 /*
 *	Unhandled exceptions thrown by a request handler will result in [internal-server-errors]
@@ -385,8 +390,8 @@ export class HttpRequest extends IncomingBase {
 			/* pass the data to the handler */
 			else if (failed = !cb(data, null)) {
 				if (this.responseState != RespondedState.responded) {
-					this.error('Connection closed automatically as chunked recipient returne false');
-					this.respondInternalError('Connection closed for unexpected reasons');
+					this.error('Connection closed automatically as chunked recipient returned false');
+					this.respondInternalError('Unknown internal error encountered');
 				}
 			}
 		});
@@ -595,7 +600,7 @@ export class HttpRequest extends IncomingBase {
 				this.log(err == undefined ? `All content has been sent` : `Error while sending content: [${err}]`);
 			});
 		} catch (_) {
-			this.respondInternalError('File operation failed');
+			this.respondFileSystemError();
 		}
 		return true;
 	}
@@ -668,7 +673,7 @@ export class HttpRequest extends IncomingBase {
 				/* send the failure response */
 				if (fileException) {
 					this.error(`Failed to collect data into file: ${cbResult.message}`);
-					this.respondInternalError('File operation failed');
+					this.respondFileSystemError();
 				}
 				return reject(cbResult);
 			};
@@ -745,7 +750,7 @@ export class HttpRequest extends IncomingBase {
 			}, maxLength);
 		});
 	}
-};
+}
 
 export class HttpUpgrade extends IncomingBase {
 	private socket: libStream.Duplex;
@@ -805,7 +810,7 @@ export class HttpUpgrade extends IncomingBase {
 		});
 		return true;
 	}
-};
+}
 
 export class ClientSocket extends ClientBase {
 	private ws: libWs.WebSocket;
@@ -842,4 +847,4 @@ export class ClientSocket extends ClientBase {
 	public close(): void {
 		this.ws.close();
 	}
-};
+}
