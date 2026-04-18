@@ -2,16 +2,16 @@
 	"type": "module",
 	"private": true,
 	"dependencies": {
-		"ws": "^8.18.0"
+		"ws": "^8.18.1"
 	},
 	"workspaces": [
 		"core",
 		"modules/*"
 	],
 	"devDependencies": {
-		"@types/node": "^24.9.2",
+		"@types/node": "^25.6.0",
 		"@types/ws": "^8.18.1",
-		"typescript": "^5.5.3"
+		"typescript": "^6.0.3"
 	},
 	"scripts": {
 		"start": "npm run build && node ./main.js",
