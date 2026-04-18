@@ -126,4 +126,4 @@ export class Server {
 		for (const cb of this.stopList)
 			await cb();
 	}
-};
+}

@@ -129,7 +129,7 @@ export class Cached {
 	}
 
 	/* [persistent]: if cached, dont check if the underlying file has changed since caching */
-	static make(path: string, options?: { persistent?: boolean }): Cached | null {
+	public static make(path: string, options?: { persistent?: boolean }): Cached | null {
 		/* check if the entry is marked as persistent and already in the cache, in which case the file doesn't even need to be checked */
 		if (options?.persistent === true && cacheMap[path]?.persistent === true) {
 			const entry = cacheMap[path];
@@ -220,7 +220,7 @@ export class Cached {
 			});
 		});
 	}
-};
+}
 
 export function Get(path: string, options?: { persistent?: boolean }): Cached | null {
 	return Cached.make(path, options);

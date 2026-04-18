@@ -27,7 +27,7 @@ ${this.body}</body>
 </html>
 `;
 	}
-};
+}
 
 export function Embed(content: string): string {
 	return `\t${content}\n`;

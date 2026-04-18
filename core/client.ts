@@ -16,7 +16,7 @@ import * as libHttp from "http";
 export interface ResponseBody {
 	content: string;
 	fileType: string;
-};
+}
 export interface StatusCodeType {
 	code: number;
 	msg: string;
@@ -35,14 +35,14 @@ export const StatusCode: Record<string, StatusCodeType> = {
 	UnsupportedMediaType: { code: 415, msg: 'Unsupported Media Type' },
 	RangeIssue: { code: 416, msg: 'Range Not Satisfiable' },
 	InternalError: { code: 500, msg: 'Internal Server Error' }
-};
+}
 
 enum RangeParseState {
 	noRange,
 	valid,
 	issue,
 	malformed
-};
+}
 function ParseRangeHeader(range: string | undefined, fileSize: number): { first: number, last: number, state: RangeParseState } {
 	if (range == undefined)
 		return { first: 0, last: fileSize - 1, state: RangeParseState.noRange };
@@ -96,6 +96,11 @@ function ParseRangeHeader(range: string | undefined, fileSize: number): { first:
 		return { first: 0, last: 0, state: RangeParseState.issue };
 	return { first: fileSize - last!, last: fileSize - 1, state: RangeParseState.valid };
 }
+enum RespondedState {
+	none,
+	prepared,
+	responded
+}
 
 function MakeContentType(fileType: string): string {
 	const typeMap: Record<string, string> = {
@@ -145,14 +150,19 @@ export class ClientBase {
 	/* unique id to identify client in logs */
 	readonly id: number;
 
-	protected constructor(url: libURL.URL, host: string, headers: libHttp.IncomingHttpHeaders);
+	protected constructor(url: libUrl.URL, host: string, headers: libHttp.IncomingHttpHeaders);
 	protected constructor(client: ClientBase);
-	protected constructor(arg: libURL.URL | ClientBase, host?: string, headers?: libHttp.IncomingHttpHeaders) {
-		if (arg instanceof libURL.URL) {
+	protected constructor(arg: libUrl.URL | ClientBase, host?: string, headers?: libHttp.IncomingHttpHeaders) {
+		if (arg instanceof libUrl.URL) {
+			/* decode the string and re-encode it to ensure '/' and '\' are preserved as URI encoding, but the rest is decoded */
+			const cleanPath: string = arg.pathname.split('/').map((segment) => {
+				return decodeURIComponent(segment).replace(/[/\\]/g, (c) => (c === '/' ? '%2F' : '%5C'));
+			}).join('/');
+
 			this.logLayer = '';
 			this.context = {};
 			this.id = ++NextClientId;
-			this.path = libLocation.Sanitize(decodeURIComponent(arg.pathname));
+			this.path = libLocation.Sanitize(cleanPath, false);
 			this.rawpath = arg.pathname;
 			this.fullpath = this.path;
 			this.basepath = '/';
@@ -202,14 +212,15 @@ export class ClientBase {
 	public error(msg: string) {
 		libLog.Error(`Client[${this.id}]${this.logLayer}: ${msg}`);
 	}
-};
+}
 
 /*
 *	Request is considered acknowledged, as soon as a payload receiver is registered, a response has been triggered, or a preparation started.
+*	Paths are URI decoded, except for nested '/' and '\'
 */
 export abstract class IncomingBase extends ClientBase {
 	protected request: libHttp.IncomingMessage;
-	protected responded: boolean;
+	protected responseState: RespondedState;
 	protected outputHeaders: Record<string, string>;
 
 	protected abstract respondWithString(status: StatusCodeType, fileType: string, content: string): void;
@@ -218,12 +229,12 @@ export abstract class IncomingBase extends ClientBase {
 	constructor(request: libHttp.IncomingMessage, host: string) {
 		super(new libUrl.URL(`http://host.server${request.url}`), host, request.headers);
 		this.request = request;
-		this.responded = false;
+		this.responseState = RespondedState.none;
 		this.outputHeaders = {};
 	}
 
 	public handled(): boolean {
-		return this.responded;
+		return (this.responseState != RespondedState.none);
 	}
 	public method(): string {
 		return this.request.method || '';
@@ -232,15 +243,16 @@ export abstract class IncomingBase extends ClientBase {
 	/* called by framework to finish this incoming object (either by sending queued content or by sending a not-found, if not handled) */
 	public finishIncoming(): void {
 		this.finishSelf();
-		if (!this.responded)
+		if (this.responseState == RespondedState.none)
 			this.respondNotFound();
 	}
 
 	/* respond with [internal-error], if the header has not yet been sent, and otherwise silently discard (only one to not fail, if request was already responded to) */
 	public respondInternalError(msg: string): void {
-		if (!this.responded) {
+		if (this.responseState == RespondedState.none || this.responseState == RespondedState.prepared) {
 			this.log(`Responding with internal error [${msg}]`);
 			this.outputHeaders = {};
+			this.responseState = RespondedState.none;
 			this.respondWithString(StatusCode.InternalError, 'txt', msg);
 		}
 	}
@@ -315,9 +327,9 @@ export class HttpRequest extends IncomingBase {
 
 	private closeHeader(status: StatusCodeType, fileType: string, contentSize: number | null = null): void {
 		/* check if the header has already been sent */
-		if (this.responded)
+		if (this.responseState != RespondedState.none)
 			throw new Error('Request has already been handled');
-		this.responded = true;
+		this.responseState = RespondedState.responded;
 
 		/* setup the response */
 		this.response.statusCode = status.code;
@@ -364,11 +376,9 @@ export class HttpRequest extends IncomingBase {
 				this.log(`Request payload is too large [${accumulated} > ${maxLength}]`);
 				failed = true;
 
-				/* check if the response was already sent and otherwise update to the content size error */
-				if (!this.responded) {
-					const content = libTemplates.ErrorContentTooLarge({ path: this.rawpath, allowedLength: maxLength, providedLength: accumulated });
-					this.respondWithString(StatusCode.ContentTooLarge, 'html', content);
-				}
+				/* send the response with the size error */
+				const content = libTemplates.ErrorContentTooLarge({ path: this.rawpath, allowedLength: maxLength, providedLength: accumulated });
+				this.respondWithString(StatusCode.ContentTooLarge, 'html', content);
 				this.request.destroy();
 				cb(null, new Error('Request is too large'));
 			}
@@ -398,15 +408,15 @@ export class HttpRequest extends IncomingBase {
 	}
 	protected finishSelf(): void {
 		/* check if html has been queued and respond with it */
-		if (this.htmlResponse != null) {
-			this.responded = false;
+		if (this.htmlResponse != null && this.responseState == RespondedState.prepared) {
+			this.responseState = RespondedState.none;
 			this.respondWithString(this.htmlResponse.status, 'html', this.htmlResponse.page.finalize());
 		}
 	}
 
 	/* add the given header to the response (Should be title cased) */
 	public addHeader(key: string, value: string): void {
-		if (this.responded)
+		if (this.responseState == RespondedState.responded)
 			throw new Error('Cannot modify headers of sent response');
 		this.outputHeaders[key] = value;
 	}
@@ -465,32 +475,36 @@ export class HttpRequest extends IncomingBase {
 
 	/* prepare the response to be html, can be built on by parent modules, sent once the client is cleared and the builder is ready */
 	public respondHtml(page: libBuilder.HtmlPage, status: StatusCodeType = StatusCode.Ok): void {
-		if (this.responded)
+		if (this.responseState != RespondedState.none)
 			throw new Error('Request has already been handled');
 
 		this.log(`Responding with HTML content and status [${status}]`);
-		this.responded = true;
+		this.responseState = RespondedState.prepared;
 		this.htmlResponse = { page, status };
 	}
 
 	/* respond with [status] and send data given to callback (callback must at least be called once with 'last' set) */
 	public respondData(fileType: string = 'html', status: StatusCodeType = StatusCode.Ok): (data: Buffer | null, last: boolean) => Promise<void> {
-		if (this.responded)
+		if (this.responseState != RespondedState.none)
 			throw new Error('Request has already been handled');
 		this.log(`Responding with data and status [${status.msg}]`);
-		this.responded = true;
+		this.responseState = RespondedState.prepared;
 
 		/* return the send callback */
-		let headerSent = false, completed = false;
+		let completed = false, headerSent = false;
 		return (data, last) => new Promise((resolve, reject) => {
 			if (completed)
 				return reject(new Error('Responding to closed response'));
 
 			/* check if the header needs to be sent */
-			if (!headerSent) {
-				headerSent = true;
-				this.responded = false;
+			if (this.responseState == RespondedState.prepared) {
+				this.responseState = RespondedState.none;
 				this.closeHeader(status, fileType, (last ? (data?.length || 0) : null));
+				headerSent = true;
+			}
+			else if (!headerSent) {
+				completed = true;
+				return reject(new Error('Connection has failed'));
 			}
 
 			/* check if the last package is being sent */
@@ -501,7 +515,13 @@ export class HttpRequest extends IncomingBase {
 			}
 
 			/* send the next message */
-			this.response.write(data, (e) => (e == undefined ? resolve() : reject(e)));
+			this.response.write(data, (e) => {
+				if (e == undefined)
+					return resolve();
+				completed = true;
+				this.error(`Connection has failed: ${e.message}`);
+				reject(e);
+			});
 		});
 	}
 
@@ -579,13 +599,15 @@ export class HttpRequest extends IncomingBase {
 	}
 
 	/* receive the payload of given max length in chunks until the end has been reached (null, null) an error occurred, or the callback returned false
-	*	(logs all errors and automatically responds with [content-too-large] if the payload is too large) */
+	*	- logs all errors and automatically responds with [content-too-large] if the payload is too large
+	*	- if errors occur, and the connection is being responded to, the callback must return false */
 	public receiveChunks(cb: (data: Buffer | null, error: Error | null) => boolean, maxLength: number | null): void {
 		return this.receiveClientChunks(cb, maxLength);
 	}
 
 	/* receive the payload of given max length as a single complete buffer
-	*	(logs all errors and automatically responds with [content-too-large] if the payload is too large) */
+	*	- logs all errors and automatically responds with [content-too-large] if the payload is too large
+	*	- if errors occur, and the connection is being responded to, the callback must return false */
 	public receiveAllBuffer(maxLength: number | null): Promise<Buffer> {
 		return new Promise((resolve, reject) => {
 			const body: Buffer[] = [];
@@ -602,7 +624,8 @@ export class HttpRequest extends IncomingBase {
 	}
 
 	/* receive the payload of given max length as a single complete decoded string
-	*	(logs all errors and automatically responds with [content-too-large] if the payload is too large, or with bad-request on invalid encoding) */
+	*	- logs all errors and automatically responds with [content-too-large] if the payload is too large, or with [bad-request] on invalid encoding
+	*	- if errors occur, and the connection is being responded to, the callback must return false */
 	public receiveAllText(encoding: string, maxLength: number | null): Promise<string> {
 		return new Promise((resolve, reject) => {
 			const body: Buffer[] = [];
@@ -618,10 +641,8 @@ export class HttpRequest extends IncomingBase {
 					resolve(Buffer.concat(body).toString(encoding as BufferEncoding));
 				} catch (e: any) {
 					this.error(`Failed to decode content with [${encoding}]: ${e.message}`);
-					if (!this.responded) {
-						const content = libTemplates.ErrorBadRequest({ path: this.rawpath, reason: `Unable to decode content` });
-						this.respondWithString(StatusCode.BadRequest, 'html', content);
-					}
+					const content = libTemplates.ErrorBadRequest({ path: this.rawpath, reason: `Unable to decode content` });
+					this.respondWithString(StatusCode.BadRequest, 'html', content);
 					reject(e);
 				}
 				return true;
@@ -630,27 +651,28 @@ export class HttpRequest extends IncomingBase {
 	}
 
 	/* receive the payload of given max length and write it directly to a file; will fail if the file already exists and delete the file, if it could not be received in full
-	*	(logs all errors and automatically responds with [content-too-large] if the payload is too large, or with internal-error on file operation failure) */
+	*	- logs all errors and automatically responds with [content-too-large] if the payload is too large, or with internal-error on file operation failure
+	*	- if errors occur, and the connection is being responded to, the callback must return false */
 	public receiveToFile(path: string, maxLength: number | null): Promise<void> {
 		this.log(`Collecting data from [${this.rawpath}] to: [${path}]`);
 		return new Promise((resolve, reject) => {
 			/* initialize busy until the file has been opened */
-			let queue: Buffer[] = [], fd: number | null = null, cbResult: Error | null = null;
+			let queue: Buffer[] = [], fd: number | null = null, cbResult: Error | null = null, fileException: boolean = false;
 			let fdBusy = true, fdClose = false;
 			const finishReceive = () => {
 				if (cbResult == null)
 					return resolve();
 
 				/* send the failure response */
-				if (!this.responded) {
+				if (fileException) {
 					this.error(`Failed to collect data into file: ${cbResult.message}`);
 					this.respondInternalError('File operation failed');
 				}
 				return reject(cbResult);
 			};
-			const failure = function (e: Error): void {
+			const failure = function (e: Error, fileError: boolean): void {
 				if (cbResult == null)
-					cbResult = e;
+					cbResult = e, fileException = fileError;
 				fdClose = true;
 				queue = [];
 			};
@@ -667,7 +689,7 @@ export class HttpRequest extends IncomingBase {
 
 						/* check if the write failed and otherwise consume the written data */
 						if (e)
-							failure(e);
+							failure(e, true);
 						else if (written >= queue[0].length)
 							queue = queue.splice(1);
 						else
@@ -702,7 +724,7 @@ export class HttpRequest extends IncomingBase {
 			libFs.open(path, 'wx', function (e, f) {
 				fdBusy = false;
 				if (e)
-					failure(e);
+					failure(e, true);
 				else
 					fd = f;
 				process();
@@ -711,7 +733,7 @@ export class HttpRequest extends IncomingBase {
 			/* setup the chunk receivers */
 			this.receiveClientChunks(function (buf, err): boolean {
 				if (err != null)
-					failure(err);
+					failure(err, false);
 				else if (buf == null)
 					fdClose = true;
 				else if (!fdClose)
@@ -737,9 +759,9 @@ export class HttpUpgrade extends IncomingBase {
 		const buffer = Buffer.from(content, 'utf-8');
 
 		/* check if the header has already been sent (always set to finalized, as it is closed) */
-		if (this.responded)
+		if (this.responseState != RespondedState.none)
 			throw new Error('Request has already been handled');
-		this.responded = true;
+		this.responseState = RespondedState.responded;
 
 		let header = `HTTP/1.1 ${status.code} ${status.msg}\r\n`;
 		header += `Date: ${new Date().toUTCString()}\r\n`;
@@ -747,7 +769,7 @@ export class HttpUpgrade extends IncomingBase {
 		header += `Content-Type: ${MakeContentType(fileType)}\r\n`;
 		header += `Content-Length: ${buffer.length}\r\n`;
 		header += `Accept-Ranges: none\r\n`;
-		if (status.code < 400 && (this.request.headers.connection || "").toLowerCase() != "close" && this.request.httpVersionMajor < 2) {
+		if ((this.request.headers.connection || "").toLowerCase() != "close" && this.request.httpVersionMajor < 2) {
 			header += 'Connection: keep-alive\r\n';
 			header += 'Keep-Alive: timeout=5\r\n';
 		}
@@ -760,17 +782,21 @@ export class HttpUpgrade extends IncomingBase {
 
 	/* marks the object as having been handled (returns false, if connection is not a valid websocket upgrade request) */
 	public tryAcceptWebSocket(cb: (ws: ClientSocket) => void): boolean {
+		/* ensure the connection can be accepted */
+		if (this.responseState != RespondedState.none)
+			throw new Error('Request has already been handled');
+
+		/* check if the connection is a valid upgrade request */
 		let connection = this.headers?.connection?.toLowerCase().split(',').map((v) => v.trim());
 		if (connection == undefined || connection.indexOf('upgrade') == -1)
 			return false;
 		if (this.headers?.upgrade?.toLowerCase() != 'websocket' || this.request.method != 'GET')
 			return false;
 
-		/* ensure the connection can be accepted */
-		if (this.responded)
-			throw new Error('Request has already been handled');
-		this.responded = true;
+		/* mark the request as handled */
+		this.responseState = RespondedState.responded;
 
+		/* try to accept the request */
 		WebSocketServerInstance.handleUpgrade(this.request, this.socket, this.head, (ws, request) => {
 			WebSocketServerInstance.emit('connection', ws, request);
 			cb(new ClientSocket(ws, this));
