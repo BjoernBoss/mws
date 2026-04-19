@@ -25,9 +25,9 @@ export function ConsoleLogger(): LogCallback {
 	};
 }
 
-const DefFileFlushingDelay: number = 1_500;
-const DefFileBufMaximumLines = 1_500;
-const DefFileSizeSwapFile = 10_000_000;
+const DEFAULT_FILE_FLUSHING_DELAY: number = 1_500;
+const DEFAULT_FILE_BUF_MAXIMUM_LINES = 1_500;
+const DEFAULT_FILE_SIZE_SWAP_FILE = 10_000_000;
 
 /* implementation of a file logger, which logs into the file-path and preserves into filePath + '.old' */
 export function FileLogger(filePath: string, options?: { flushingDelayMs?: number, bufMaxLineCount?: number, sizeSwapFile?: number }): LogCallback {
@@ -38,8 +38,11 @@ export function FileLogger(filePath: string, options?: { flushingDelayMs?: numbe
 	/* setup the logging state (ignore any errors, as they cannot be logged) */
 	let fileHandle: number | null = null;
 	let logFileSize: number = 0;
-	try { fileHandle = libFs.openSync(logFilePath, 'a'); } catch (err) { }
-	try { logFileSize = libFs.fstatSync(fileHandle as number).size; } catch (err) { }
+	try {
+		fileHandle = libFs.openSync(logFilePath, 'a');
+		logFileSize = libFs.fstatSync(fileHandle).size;
+	}
+	catch (_) { }
 
 	/* setup the file-flushing helper function */
 	let logBuffer: string[] = [];
@@ -48,7 +51,7 @@ export function FileLogger(filePath: string, options?: { flushingDelayMs?: numbe
 		/* write the buffer to the file */
 		if (logBuffer.length > 0 && fileHandle != null) {
 			const content = Buffer.from(logBuffer.join(""), 'utf-8');
-			try { libFs.writeFileSync(fileHandle, content); } catch (err) { }
+			try { libFs.writeFileSync(fileHandle, content); } catch (_) { }
 			logFileSize += content.length;
 		}
 		logBuffer = [];
@@ -59,9 +62,9 @@ export function FileLogger(filePath: string, options?: { flushingDelayMs?: numbe
 			flushId = null;
 		}
 	};
-	const flushingDelayMs: number = (options?.flushingDelayMs == undefined ? DefFileFlushingDelay : options.flushingDelayMs);
-	const bufMaxLineCount: number = (options?.bufMaxLineCount == undefined ? DefFileBufMaximumLines : options.bufMaxLineCount);
-	const sizeSwapFile: number = (options?.sizeSwapFile == undefined ? DefFileSizeSwapFile : options.sizeSwapFile);
+	const flushingDelayMs: number = (options?.flushingDelayMs == null ? DEFAULT_FILE_FLUSHING_DELAY : options.flushingDelayMs);
+	const bufMaxLineCount: number = (options?.bufMaxLineCount == null ? DEFAULT_FILE_BUF_MAXIMUM_LINES : options.bufMaxLineCount);
+	const sizeSwapFile: number = (options?.sizeSwapFile == null ? DEFAULT_FILE_SIZE_SWAP_FILE : options.sizeSwapFile);
 
 	/* setup the actual closure handler */
 	return (level: string | null, date: string, msg: string) => {
@@ -69,7 +72,7 @@ export function FileLogger(filePath: string, options?: { flushingDelayMs?: numbe
 		if (level == null) {
 			flushToFile();
 			if (fileHandle != null)
-				try { libFs.closeSync(fileHandle); } catch (err) { }
+				try { libFs.closeSync(fileHandle); } catch (_) { }
 			fileHandle = null;
 			return;
 		}
@@ -93,13 +96,13 @@ export function FileLogger(filePath: string, options?: { flushingDelayMs?: numbe
 
 		/* close the current file */
 		if (fileHandle != null) {
-			try { libFs.closeSync(fileHandle); } catch (err) { }
+			try { libFs.closeSync(fileHandle); } catch (_) { }
 			fileHandle = null;
 		}
 
 		/* move it to the old-slot and open the new file */
-		try { libFs.renameSync(logFilePath, oldFilePath); } catch (err) { }
-		try { fileHandle = libFs.openSync(logFilePath, 'w'); } catch (err) { }
+		try { libFs.renameSync(logFilePath, oldFilePath); } catch (_) { }
+		try { fileHandle = libFs.openSync(logFilePath, 'w'); } catch (_) { }
 		logFileSize = 0;
 	};
 }

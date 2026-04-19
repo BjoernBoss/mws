@@ -69,19 +69,19 @@ export class Cached {
 	private makeStream(options?: { start?: number, end?: number }): libStream.Readable {
 		/* check if the data have already been cached */
 		if (this.data != null)
-			return libStream.Readable.from(this.data.subarray(options?.start, (options?.end == undefined ? undefined : options.end + 1)));
+			return libStream.Readable.from(this.data.subarray(options?.start, (options?.end == null ? undefined : options.end + 1)));
 
 		/* create the data stream */
 		let stream: libFs.ReadStream | null = null;
 		try {
 			stream = libFs.createReadStream(this.path, { flags: 'r', start: options?.start, end: options?.end });
-		} catch (e: any) {
-			libLog.Error(`Filesystem error while streaming [${this.path}]: ${e.message}`);
+		} catch (err: any) {
+			libLog.Error(`Filesystem error while streaming [${this.path}]: ${err.message}`);
 			throw new Error('File operation failed');
 		}
 
 		/* check if only a partial file is being read, or it is too large, in which case it will not be added to the cache */
-		if (this.size > maxLargestSize || this.size > totalCacheCapacity || (options?.start != undefined && options.start != 0) || (options?.end != undefined && options.end + 1 != this.size))
+		if (this.size > maxLargestSize || this.size > totalCacheCapacity || (options?.start != null && options.start != 0) || (options?.end != null && options.end + 1 != this.size))
 			return stream;
 
 		/* create the transformer stream to cache the data */
@@ -122,8 +122,8 @@ export class Cached {
 
 			/* extract the file size and modified time */
 			return [stats.size, stats.mtime.getTime()];
-		} catch (e: any) {
-			libLog.Error(`Filesystem error while checking [${path}]: ${e.message}`);
+		} catch (err: any) {
+			libLog.Error(`Filesystem error while checking [${path}]: ${err.message}`);
 			throw new Error('File operation failed');
 		}
 	}
@@ -149,13 +149,13 @@ export class Cached {
 			/* validate that the entry is still up-to-date and return it */
 			if (entry.mtime == mtime && entry.data.length == fileSize) {
 				entry.touched = ++nextTouchStamp;
-				return new Cached(path, fileSize, entry.data, mtime, options?.persistent || false);
+				return new Cached(path, fileSize, entry.data, mtime, options?.persistent ?? false);
 			}
 
 			/* remove the entry as it seems to be outdated */
 			CacheDrop(path);
 		}
-		return new Cached(path, fileSize, null, mtime, options?.persistent || false);
+		return new Cached(path, fileSize, null, mtime, options?.persistent ?? false);
 	}
 
 	public fileSize(): number {
@@ -176,8 +176,8 @@ export class Cached {
 		/* read the data into memory */
 		try {
 			this.data = libFs.readFileSync(this.path);
-		} catch (e: any) {
-			libLog.Error(`Filesystem error while reading [${this.path}]: ${e.message}`);
+		} catch (err: any) {
+			libLog.Error(`Filesystem error while reading [${this.path}]: ${err.message}`);
 			throw new Error('File operation failed');
 		}
 
@@ -226,9 +226,9 @@ export function Get(path: string, options?: { persistent?: boolean }): Cached | 
 	return Cached.make(path, options);
 }
 export function SetCacheOptions(options: { cacheSize?: number, largestFile?: number }): void {
-	if (options.cacheSize != undefined && options.cacheSize > 0)
+	if (options.cacheSize != null && options.cacheSize > 0)
 		totalCacheCapacity = options.cacheSize;
-	if (options.largestFile != undefined && options.largestFile > 0)
+	if (options.largestFile != null && options.largestFile > 0)
 		maxLargestSize = options.largestFile;
 	libLog.Info(`Cache capacity set to: ${totalCacheCapacity} with largest objects: ${maxLargestSize}`);
 

@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 /* Copyright (c) 2025-2026 Bjoern Boss Henrichsen */
-import * as libUrl from 'url';
+import * as libUrl from "url";
 import * as libPath from "path";
 
 /* sanitize path and remove relative path components and convert it to an absolute path */

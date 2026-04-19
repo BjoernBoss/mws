@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 /* Copyright (c) 2025-2026 Bjoern Boss Henrichsen */
-import * as libClient from './client.js';
+import * as libClient from "./client.js";
 import * as libLog from "./log.js";
 import * as libLocation from "./location.js";
 
@@ -29,7 +29,7 @@ export type RequestWrap = (client: libClient.HttpRequest, handle: () => Promise<
 export type UpgradeWrap = (client: libClient.HttpUpgrade, handle: () => Promise<void>) => Promise<void>;
 
 /*
-*	Simple module interface implementation, which allows requests to be handled by a lambdas.
+*	Simple module interface implementation, which allows requests to be handled by lambdas.
 */
 export class LambdaModule implements ModuleInterface {
 	private requestLambda?: RequestLambda;
@@ -42,12 +42,12 @@ export class LambdaModule implements ModuleInterface {
 	}
 
 	public async request(client: libClient.HttpRequest): Promise<void> {
-		if (this.requestLambda != undefined)
+		if (this.requestLambda != null)
 			await this.requestLambda(client);
 	}
 
 	public async upgrade(client: libClient.HttpUpgrade): Promise<void> {
-		if (this.upgradeLambda != undefined)
+		if (this.upgradeLambda != null)
 			await this.upgradeLambda(client);
 	}
 }
@@ -124,14 +124,14 @@ export class UnhandledModule implements ModuleInterface {
 	public async request(client: libClient.HttpRequest): Promise<void> {
 		client.pushLog(this.handler.name);
 		await this.handler.request(client);
-		if (!client.handled() && this.requestLambda != undefined)
+		if (!client.handled() && this.requestLambda != null)
 			await this.requestLambda(client);
 	}
 
 	public async upgrade(client: libClient.HttpUpgrade): Promise<void> {
 		client.pushLog(this.handler.name);
 		await this.handler.upgrade(client);
-		if (!client.handled() && this.upgradeLambda != undefined)
+		if (!client.handled() && this.upgradeLambda != null)
 			await this.upgradeLambda(client);
 	}
 }
@@ -154,7 +154,7 @@ export class WrapModule implements ModuleInterface {
 
 	public async request(client: libClient.HttpRequest): Promise<void> {
 		client.pushLog(this.handler.name);
-		if (this.requestWrap != undefined)
+		if (this.requestWrap != null)
 			await this.requestWrap(client, () => this.handler.request(client));
 		else
 			await this.handler.request(client);
@@ -162,7 +162,7 @@ export class WrapModule implements ModuleInterface {
 
 	public async upgrade(client: libClient.HttpUpgrade): Promise<void> {
 		client.pushLog(this.handler.name);
-		if (this.upgradeWrap != undefined)
+		if (this.upgradeWrap != null)
 			await this.upgradeWrap(client, () => this.handler.upgrade(client));
 		else
 			await this.handler.upgrade(client);

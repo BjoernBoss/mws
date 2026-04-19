@@ -2,7 +2,6 @@
 /* Copyright (c) 2024-2026 Bjoern Boss Henrichsen */
 import * as libServer from "core/server.js";
 import * as libLog from "core/log.js";
-import * as libConfig from "core/config.js";
 import * as libCache from "core/cache.js";
 
 async function Setup(setupModule) {
@@ -24,7 +23,7 @@ async function Setup(setupModule) {
 }
 
 /* initialize the default configuration (before loading the local module!) */
-libConfig.Initialize();
+libServer.Initialize();
 libCache.Initialize();
 
 /* try to load the local configuration and otherwise perform the default-setup */

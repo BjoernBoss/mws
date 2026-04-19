@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 /* Copyright (c) 2024-2026 Bjoern Boss Henrichsen */
-import * as libConfig from "./config.js";
+import * as libServer from "./server.js";
 import * as libTemplates from "./templates.js";
 import * as libLog from "./log.js";
 import * as libLocation from "./location.js";
@@ -21,7 +21,7 @@ export interface StatusCodeType {
 	code: number;
 	msg: string;
 }
-export const StatusCode: Record<string, StatusCodeType> = {
+export const StatusCode = {
 	Ok: { code: 200, msg: 'Ok' },
 	PartialContent: { code: 206, msg: 'Partial Content' },
 	SeeOther: { code: 303, msg: 'See Other' },
@@ -43,8 +43,8 @@ enum RangeParseState {
 	issue,
 	malformed
 }
-function ParseRangeHeader(range: string | undefined, fileSize: number): { first: number, last: number, state: RangeParseState } {
-	if (range == undefined)
+function ParseRangeHeader(range: string | null, fileSize: number): { first: number, last: number, state: RangeParseState } {
+	if (range == null)
 		return { first: 0, last: fileSize - 1, state: RangeParseState.noRange };
 
 	/* check if it requests bytes */
@@ -250,7 +250,7 @@ export abstract class IncomingBase extends ClientBase {
 	/* respond with [internal-error], if the header has not yet been sent, and otherwise silently discard (only one to not fail, if request was already responded to) */
 	public respondInternalError(msg: string): void {
 		if (this.responseState == RespondedState.none || this.responseState == RespondedState.prepared) {
-			this.log(`Responding with internal error [${msg}]`);
+			this.log(`Responding with [${StatusCode.InternalError.msg}] due to [${msg}]`);
 			this.outputHeaders = {};
 			this.responseState = RespondedState.none;
 			this.respondWithString(StatusCode.InternalError, 'txt', msg);
@@ -341,7 +341,7 @@ export class HttpRequest extends IncomingBase {
 		this.response.statusMessage = status.msg;
 		for (const key in this.outputHeaders)
 			this.response.setHeader(key, this.outputHeaders[key]);
-		this.response.setHeader('Server', libConfig.GetServerName());
+		this.response.setHeader('Server', libServer.GetServerName());
 		this.response.setHeader('Content-Type', MakeContentType(fileType));
 		this.response.setHeader('Date', new Date().toUTCString());
 		if (!('Accept-Ranges' in this.outputHeaders))
@@ -442,7 +442,7 @@ export class HttpRequest extends IncomingBase {
 	/* ensure the media-type is one of the list and otherwise return null and auto-respond with [unsupported-media-type] */
 	public ensureMediaType(types: string[]): string | null {
 		const type = this.headers['content-type']?.toLowerCase();
-		if (type === undefined)
+		if (type == null)
 			return types[0];
 		for (let i = 0; i < types.length; ++i) {
 			if (type === types[i] || type.startsWith(`${types[i]};`))
@@ -458,7 +458,7 @@ export class HttpRequest extends IncomingBase {
 	/* check the content-type for a media-type and otherwise return the default type */
 	public getMediaTypeCharset(defEncoding: string): string {
 		const type = this.headers['content-type'];
-		if (type === undefined)
+		if (type == null)
 			return defEncoding;
 
 		let index = type.indexOf('charset=');
@@ -485,7 +485,7 @@ export class HttpRequest extends IncomingBase {
 		if (this.responseState != RespondedState.none)
 			throw new Error('Request has already been handled');
 
-		this.log(`Responding with HTML content and status [${status}]`);
+		this.log(`Responding with HTML content and status [${status.code}]`);
 		this.responseState = RespondedState.prepared;
 		this.htmlResponse = { page, status };
 	}
@@ -523,7 +523,7 @@ export class HttpRequest extends IncomingBase {
 
 			/* send the next message */
 			this.response.write(data, (e) => {
-				if (e == undefined)
+				if (e == null)
 					return resolve();
 				completed = true;
 				this.error(`Connection has failed: ${e.message}`);
@@ -646,11 +646,11 @@ export class HttpRequest extends IncomingBase {
 				/* convert the buffers to a string */
 				else try {
 					resolve(Buffer.concat(body).toString(encoding as BufferEncoding));
-				} catch (e: any) {
-					this.error(`Failed to decode content with [${encoding}]: ${e.message}`);
+				} catch (err: any) {
+					this.error(`Failed to decode content with [${encoding}]: ${err.message}`);
 					const content = libTemplates.ErrorBadRequest({ path: this.rawpath, reason: `Unable to decode content` });
 					this.respondWithString(StatusCode.BadRequest, 'html', content);
-					reject(e);
+					reject(err);
 				}
 				return true;
 			}, maxLength);
@@ -772,7 +772,7 @@ export class HttpUpgrade extends IncomingBase {
 
 		let header = `HTTP/1.1 ${status.code} ${status.msg}\r\n`;
 		header += `Date: ${new Date().toUTCString()}\r\n`;
-		header += `Server: ${libConfig.GetServerName()}\r\n`;
+		header += `Server: ${libServer.GetServerName()}\r\n`;
 		header += `Content-Type: ${MakeContentType(fileType)}\r\n`;
 		header += `Content-Length: ${buffer.length}\r\n`;
 		header += `Accept-Ranges: none\r\n`;
@@ -795,7 +795,7 @@ export class HttpUpgrade extends IncomingBase {
 
 		/* check if the connection is a valid upgrade request */
 		let connection = this.headers?.connection?.toLowerCase().split(',').map((v) => v.trim());
-		if (connection == undefined || connection.indexOf('upgrade') == -1)
+		if (connection == null || connection.indexOf('upgrade') == -1)
 			return false;
 		if (this.headers?.upgrade?.toLowerCase() != 'websocket' || this.request.method != 'GET')
 			return false;
