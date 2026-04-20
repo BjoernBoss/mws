@@ -38,7 +38,7 @@ export class Server {
 			/* setup the client object */
 			const rawHostName = (request.headers.host ?? '').toLowerCase();
 			client = establish(rawHostName);
-			client.log(`${wasRequest ? 'Request' : 'Upgrade'}:${port} from [${request.socket.remoteAddress}]:${request.socket.remotePort} to [${request.headers.host}]:[${request.url}] (user-agent: [${request.headers['user-agent'] || ''}])`);
+			client.log(`${wasRequest ? 'Request' : 'Upgrade'}:${port} from [${request.socket.remoteAddress}]:${request.socket.remotePort} to [${request.headers.host}]:[${request.url}] (user-agent: [${request.headers['user-agent'] ?? ''}])`);
 
 			/* extract the host to be used and validate its port */
 			const hostNameRegex = rawHostName.match(/^(.*):(\d+)$/);

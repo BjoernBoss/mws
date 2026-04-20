@@ -55,25 +55,25 @@ function ExpandPlaceholders(content: string, map: Record<string, string>): strin
 	return out;
 }
 
-/* html formatted template message for error */
+/* html formatted template message for success */
 export function SuccessOk(payload: { path: string, operation: string }): string {
 	const content: string = LoadRelative('200.template');
 	return ExpandPlaceholders(content, { path: payload.path, op: payload.operation });
 }
 
-/* html formatted template message for error */
+/* html formatted template message for redirect */
 export function SeeOther(payload: { destination: string }): string {
 	const content: string = LoadRelative('303.template');
 	return ExpandPlaceholders(content, { new: payload.destination });
 }
 
-/* html formatted template message for error */
+/* html formatted template message for redirect */
 export function TemporaryRedirect(payload: { path: string, destination: string }): string {
 	const content: string = LoadRelative('307.template');
 	return ExpandPlaceholders(content, { path: payload.path, new: payload.destination });
 }
 
-/* html formatted template message for error */
+/* html formatted template message for redirect */
 export function PermanentRedirect(payload: { path: string, destination: string }): string {
 	const content: string = LoadRelative('308.template');
 	return ExpandPlaceholders(content, { path: payload.path, new: payload.destination });

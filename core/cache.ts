@@ -11,7 +11,7 @@ interface CacheEntry {
 	persistent: boolean;
 }
 const cacheMap: Record<string, CacheEntry> = {};
-let nextTouchStamp: number = 0, totalCacheSize: number = 0, totalCacheCapacity: number = 0, maxLargestSize: number = 0;
+let nextTouchStamp: number = 0, totalCacheAllocated: number = 0, totalCacheCapacity: number = 0, maxLargestSize: number = 0;
 
 function CacheAdd(path: string, data: Buffer, mtime: number, persistent: boolean): void {
 	if (data.byteLength > totalCacheCapacity || data.byteLength > maxLargestSize)
@@ -26,19 +26,20 @@ function CacheAdd(path: string, data: Buffer, mtime: number, persistent: boolean
 	}
 
 	/* check if space needs to be reserved */
-	if (totalCacheSize + data.byteLength > totalCacheCapacity)
-		CacheReduce(totalCacheSize + data.byteLength - totalCacheCapacity);
+	if (totalCacheAllocated + data.byteLength > totalCacheCapacity)
+		CacheReduce(totalCacheAllocated + data.byteLength - totalCacheCapacity);
 
 	/* add the entry to the cache */
 	libLog.Log(`Added [${path}] to the cache`);
-	totalCacheSize += data.byteLength;
+	totalCacheAllocated += data.byteLength;
 	cacheMap[path] = { data: data, mtime: mtime, touched: ++nextTouchStamp, persistent };
 }
 function CacheReduce(capacity: number): void {
 	/* create the list of all cached objects sorted by the touched count */
 	const paths: string[] = Object.keys(cacheMap).sort((a, b) => cacheMap[a].touched - cacheMap[b].touched);
 
-	/* drop the first half of the entries or more, if the size has not yet been freed */
+	/* drop the first half of the entries or more, if the size has not yet been freed (valid as callers guarantee
+	*	capacity <= totalCacheAllocated, thus the capacity will reach <= 0 before i overflows the paths) */
 	for (let i = 0; i < (paths.length + 1) / 2 || capacity > 0; ++i) {
 		capacity -= cacheMap[paths[i]].data.byteLength;
 		CacheDrop(paths[i]);
@@ -48,7 +49,7 @@ function CacheDrop(path: string): void {
 	if (!(path in cacheMap))
 		return;
 	libLog.Log(`Dropped [${path}] from the cache`);
-	totalCacheSize -= cacheMap[path].data.byteLength;
+	totalCacheAllocated -= cacheMap[path].data.byteLength;
 	delete cacheMap[path];
 }
 
@@ -233,8 +234,8 @@ export function SetCacheOptions(options: { cacheSize?: number, largestFile?: num
 	libLog.Info(`Cache capacity set to: ${totalCacheCapacity} with largest objects: ${maxLargestSize}`);
 
 	/* check if the cache needs to be reduced */
-	if (totalCacheSize > totalCacheCapacity)
-		CacheReduce(totalCacheSize - totalCacheCapacity);
+	if (totalCacheAllocated > totalCacheCapacity)
+		CacheReduce(totalCacheAllocated - totalCacheCapacity);
 }
 
 /* initialize the default configuration */
