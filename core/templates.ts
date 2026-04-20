@@ -92,9 +92,9 @@ export function ErrorNotFound(payload: { path: string }): string {
 }
 
 /* html formatted template message for error */
-export function ErrorInvalidMethod(payload: { path: string, method: string, allowed: string[] }): string {
+export function ErrorInvalidMethod(payload: { path: string, method: string, allowed: string }): string {
 	const content: string = LoadRelative('405.template');
-	return ExpandPlaceholders(content, { path: payload.path, method: payload.method, allowed: payload.allowed.join(",") });
+	return ExpandPlaceholders(content, { path: payload.path, method: payload.method, allowed: payload.allowed });
 }
 
 /* html formatted template message for error */
@@ -110,15 +110,21 @@ export function ErrorContentTooLarge(payload: { path: string, allowedLength: num
 }
 
 /* html formatted template message for error */
-export function ErrorUnsupportedMediaType(payload: { path: string, allowed: string[], used: string }): string {
+export function ErrorUnsupportedMediaType(payload: { path: string, allowed: string, used: string }): string {
 	const content: string = LoadRelative('415.template');
-	return ExpandPlaceholders(content, { path: payload.path, used: payload.used, allowed: payload.allowed.join(",") });
+	return ExpandPlaceholders(content, { path: payload.path, used: payload.used, allowed: payload.allowed });
 }
 
 /* html formatted template message for error */
-export function ErrorRangeIssue(payload: { path: string, range: string, fileSize: number }): string {
+export function ErrorRangeIssue(payload: { path: string, range: string, size: number }): string {
 	const content: string = LoadRelative('416.template');
-	return ExpandPlaceholders(content, { path: payload.path, range: payload.range, size: payload.fileSize.toString() });
+	return ExpandPlaceholders(content, { path: payload.path, range: payload.range, size: payload.size.toString() });
+}
+
+/* html formatted template message for error */
+export function ErrorInternalServerError(payload: { path: string, what: string }): string {
+	const content: string = LoadRelative('500.template');
+	return ExpandPlaceholders(content, { path: payload.path, what: payload.what });
 }
 
 /* expand the placeholders in the content (format: {#name}, with '{#' being escaped as '{##') */

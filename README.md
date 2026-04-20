@@ -42,12 +42,13 @@ Each module lives in `modules/<name>/` with its own `package.json` (private, typ
 ```TypeScript
 import * as libInterface from "core/interface.js";
 import * as libClient from "core/client.js";
+import * as libRequest from "core/request.js";
 
 export class MyModule implements libInterface.ModuleInterface {
     public name: string = 'my-module';
 
     public async request(client: libClient.HttpRequest): Promise<void> {
-        client.respondText('Hello from my module!', 'txt');
+        client.respondText('Hello from my module!', libRequest.Media.Text);
     }
 
     public async upgrade(client: libClient.HttpUpgrade): Promise<void> {
@@ -78,9 +79,9 @@ The `core` workspace provides all server functionality:
 |---|---|
 | `interface.ts` | `ModuleInterface` interface, and additional helper: `DispatchModule`, `LambdaModule`, `UnhandledModule`, `WrapModule` |
 | `client.ts` | `HttpRequest` (response helpers, body parsing, file serving), `HttpUpgrade` and `ClientSocket` (WebSocket) |
+| `request.ts` | HTTP status codes, media types, range parsing, and encoding negotiation (gzip, deflate, brotli, zstd) |
 | `server.ts` | `Server` class managing HTTP/HTTPS listeners with host-header validation and server name configuration |
 | `cache.ts` | File cache with LRU eviction, sync/async read, and streaming |
-| `compress.ts` | Gzip/deflate negotiation for response compression and request decompression |
 | `templates.ts` | Template loading and placeholder expansion |
 | `builder.ts` | Programmatic HTML page construction |
 | `location.ts` | Path sanitization, joining, and sub-directory checks |

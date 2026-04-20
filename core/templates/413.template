@@ -3,12 +3,12 @@
 
 <head>
 	<title>Error 413: Content Too Large!</title>
-	<meta name="description" content="Content too large!">
+	<meta name="description" content="Content too large">
 	<meta name="keywords" content="413 error">
 </head>
 
 <body>
-	<p style="font-family: monospace;">Content of size {#size} too large for [{#path}].</p>
+	<p style="font-family: monospace;">Content of at least size {#size} too large for [{#path}].</p>
 	<p style="font-family: monospace;">At most [{#allowed}] bytes are allowed.</p>
 </body>
 

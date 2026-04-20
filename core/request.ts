@@ -3,11 +3,11 @@
 import * as libZlib from "zlib";
 import * as libStream from "stream";
 
-export interface StatusCodeType {
+export interface StatusType {
 	code: number;
 	msg: string;
 }
-export const StatusCode = {
+export const Status = {
 	Ok: { code: 200, msg: 'Ok' },
 	PartialContent: { code: 206, msg: 'Partial Content' },
 	SeeOther: { code: 303, msg: 'See Other' },
@@ -21,7 +21,67 @@ export const StatusCode = {
 	UnsupportedMediaType: { code: 415, msg: 'Unsupported Media Type' },
 	RangeIssue: { code: 416, msg: 'Range Not Satisfiable' },
 	InternalError: { code: 500, msg: 'Internal Server Error' }
+} as const satisfies Record<string, StatusType>
+
+export interface MediaType {
+	fileEnding: string[];
+	mediaType: string;
+	encoding: string;
+	compressible: boolean;
 }
+export const Media = {
+	Html: { fileEnding: ['html'], mediaType: 'text/html', encoding: 'charset=utf-8', compressible: true },
+	Css: { fileEnding: ['css'], mediaType: 'text/css', encoding: 'charset=utf-8', compressible: true },
+	JavaScript: { fileEnding: ['js'], mediaType: 'text/javascript', encoding: 'charset=utf-8', compressible: true },
+	Text: { fileEnding: ['txt', 'text'], mediaType: 'text/plain', encoding: 'charset=utf-8', compressible: true },
+	Json: { fileEnding: ['json'], mediaType: 'application/json', encoding: 'charset=utf-8', compressible: true },
+	Mp4: { fileEnding: ['mp4'], mediaType: 'video/mp4', encoding: '', compressible: false },
+	Png: { fileEnding: ['png'], mediaType: 'image/png', encoding: '', compressible: false },
+	Gif: { fileEnding: ['gif'], mediaType: 'image/gif', encoding: '', compressible: false },
+	Jpg: { fileEnding: ['jpg', 'jpeg'], mediaType: 'image/jpeg', encoding: '', compressible: false },
+	Svg: { fileEnding: ['svg'], mediaType: 'image/svg+xml', encoding: '', compressible: true },
+	Unknown: { fileEnding: [], mediaType: 'application/octet-stream', encoding: '', compressible: false }
+} as const satisfies Record<string, MediaType>
+
+export interface EncodingType {
+	name: string;
+	makeDecode(): libStream.Transform;
+	makeEncode(): libStream.Transform;
+	encodeBuffer(buffer: Buffer): Buffer;
+}
+export const Encoding = {
+	Br: {
+		name: 'br',
+		makeDecode: () => libZlib.createBrotliDecompress(),
+		makeEncode: () => libZlib.createBrotliCompress(),
+		encodeBuffer: (buffer: Buffer) => libZlib.brotliCompressSync(buffer)
+	},
+	Zstd: {
+		name: 'zstd',
+		makeDecode: () => libZlib.createZstdDecompress(),
+		makeEncode: () => libZlib.createZstdCompress(),
+		encodeBuffer: (buffer: Buffer) => libZlib.zstdCompressSync(buffer)
+	},
+	Gzip: {
+		name: 'gzip',
+		makeDecode: () => libZlib.createGunzip(),
+		makeEncode: () => libZlib.createGzip(),
+		encodeBuffer: (buffer: Buffer) => libZlib.gzipSync(buffer)
+	},
+	Deflate: {
+		name: 'deflate',
+		makeDecode: () => libZlib.createInflate(),
+		makeEncode: () => libZlib.createDeflate(),
+		encodeBuffer: (buffer: Buffer) => libZlib.deflateSync(buffer)
+	},
+	Identity: {
+		name: 'identity',
+		makeDecode: () => new libStream.PassThrough(),
+		makeEncode: () => new libStream.PassThrough(),
+		encodeBuffer: (buffer: Buffer) => buffer
+	}
+} as const satisfies Record<string, EncodingType>
+
 
 export enum RangeState {
 	noRange,
@@ -83,129 +143,56 @@ export function ParseRangeHeader(range: string | null, fileSize: number): { firs
 	return { first: fileSize - last!, last: fileSize - 1, state: RangeState.valid };
 }
 
-const RegisteredMediaTypes: Record<string, MediaType> = {
-	'html': {
-		fileEnding: 'html',
-		mediaType: 'text/html; charset=utf-8',
-		compressed: false
-	},
-	'css': {
-		fileEnding: 'css',
-		mediaType: 'text/css; charset=utf-8',
-		compressed: false
-	},
-	'js': {
-		fileEnding: 'js',
-		mediaType: 'text/javascript; charset=utf-8',
-		compressed: false
-	},
-	'txt': {
-		fileEnding: 'txt',
-		mediaType: 'text/plain; charset=utf-8',
-		compressed: false
-	},
-	'json': {
-		fileEnding: 'json',
-		mediaType: 'application/json; charset=utf-8',
-		compressed: false
-	},
-	'mp4': {
-		fileEnding: 'mp4',
-		mediaType: 'video/mp4',
-		compressed: true
-	},
-	'png': {
-		fileEnding: 'png',
-		mediaType: 'image/png',
-		compressed: true
-	},
-	'gif': {
-		fileEnding: 'gif',
-		mediaType: 'image/gif',
-		compressed: true
-	},
-	'jpg': {
-		fileEnding: 'jpg',
-		mediaType: 'image/jpeg',
-		compressed: true
-	},
-	'jpeg': {
-		fileEnding: 'jpeg',
-		mediaType: 'image/jpeg',
-		compressed: true
-	},
-	'svg': {
-		fileEnding: 'svg',
-		mediaType: 'image/svg+xml',
-		compressed: false
-	},
-}
-export interface MediaType {
-	fileEnding: string;
-	mediaType: string;
-	compressed: boolean;
-}
-export function LookupMediaType(fileEnding: string): MediaType {
-	if (fileEnding in RegisteredMediaTypes)
-		return RegisteredMediaTypes[fileEnding];
-	return { fileEnding, mediaType: 'application/octet-stream', compressed: true };
-}
-export const HtmlType: MediaType = RegisteredMediaTypes['html'];
-export const TextType: MediaType = RegisteredMediaTypes['txt'];
-export const JsonType: MediaType = RegisteredMediaTypes['json'];
+/* setup the reverse list of file-endings to media types and encoding-names to encoding types */
+const FileEndingToMediaTypeMapping: Record<string, MediaType> = {}
+Object.entries(Media).forEach(([_, value]) => {
+	for (const fileEnding of value.fileEnding)
+		FileEndingToMediaTypeMapping[fileEnding] = value;
+});
+const EncodingNameToEncodingTypeMapping: Record<string, EncodingType> = {}
+Object.entries(Encoding).forEach(([_, value]) => {
+	EncodingNameToEncodingTypeMapping[value.name] = value;
+});
 
-const RegisteredEncodings: Record<string, EncodingInterface> = {
-	'br': {
-		name: 'br',
-		makeDecode: () => libZlib.createBrotliDecompress(),
-		makeEncode: () => libZlib.createBrotliCompress(),
-		encodeBuffer: (buffer: Buffer) => libZlib.brotliCompressSync(buffer)
-	},
-	'zstd': {
-		name: 'zstd',
-		makeDecode: () => libZlib.createZstdDecompress(),
-		makeEncode: () => libZlib.createZstdCompress(),
-		encodeBuffer: (buffer: Buffer) => libZlib.zstdCompressSync(buffer)
-	},
-	'gzip': {
-		name: 'gzip',
-		makeDecode: () => libZlib.createGunzip(),
-		makeEncode: () => libZlib.createGzip(),
-		encodeBuffer: (buffer: Buffer) => libZlib.gzipSync(buffer)
-	},
-	'deflate': {
-		name: 'deflate',
-		makeDecode: () => libZlib.createInflate(),
-		makeEncode: () => libZlib.createDeflate(),
-		encodeBuffer: (buffer: Buffer) => libZlib.deflateSync(buffer)
-	},
-	'identity': {
-		name: 'identity',
-		makeDecode: () => new libStream.PassThrough(),
-		makeEncode: () => new libStream.PassThrough(),
-		encodeBuffer: (buffer: Buffer) => buffer
+/* map extension of file-path/file-name to media type (defaults to Unknown) */
+export function LookupMediaTypeFromFile(filePath: string): MediaType {
+	/* extract the file-ending */
+	for (let i = filePath.length; i >= 0; --i) {
+		if (filePath[i] == '/' || filePath[i] == '\\')
+			break;
+		if (filePath[i] != '.')
+			continue;
+		if (filePath[i - 1] == '/' || filePath[i - 1] == '\\')
+			break;
+
+		/* extract the file-ending, sanitize it, and return the media type */
+		const fileEnding: string = filePath.substring(i + 1).toLowerCase();
+		if (fileEnding in FileEndingToMediaTypeMapping)
+			return FileEndingToMediaTypeMapping[fileEnding];
+		break;
 	}
+	return Media.Unknown;
 }
+export function BuildMediaTypeIdentifier(media: MediaType): string {
+	if (media.encoding == '')
+		return media.mediaType;
+	return `${media.mediaType}; ${media.encoding}`;
+}
+
 export const MIN_ENCODING_SIZE: number = 1_000;
-export interface EncodingInterface {
-	name: string;
-	makeDecode(): libStream.Transform;
-	makeEncode(): libStream.Transform;
-	encodeBuffer(buffer: Buffer): Buffer;
-}
-export function EncodingOption(accept: string | null, atLeastSize: number, mediaType: MediaType): EncodingInterface | null {
+export function EncodingOption(accept: string | null, atLeastSize: number, mediaType: MediaType): EncodingType | null {
 	/* check if any accepted encodings can be found or if the type/size does not make sense */
-	if (accept == null || atLeastSize < MIN_ENCODING_SIZE || mediaType.compressed)
+	if (accept == null || atLeastSize < MIN_ENCODING_SIZE || !mediaType.compressible)
 		return null;
 
 	/* parse the encoding types and look for a match */
-	let bestMatch: EncodingInterface | null = null, bestScore: number = 0;
+	let bestMatch: EncodingType | null = null, bestScore: number = 0;
 	for (const part of accept.split(',')) {
 		const segments = part.split(';');
 
 		/* check if its an supported encoding */
 		const name = segments[0].trim().toLowerCase();
-		if (!(name in RegisteredEncodings))
+		if (!(name in EncodingNameToEncodingTypeMapping))
 			continue;
 
 		/* check if the encoding has been explicitly excluded via q=0 */
@@ -222,16 +209,13 @@ export function EncodingOption(accept: string | null, atLeastSize: number, media
 
 		/* check if this is a better match to the request */
 		if (bestMatch == null || score > bestScore)
-			bestMatch = RegisteredEncodings[name], bestScore = score;
+			bestMatch = EncodingNameToEncodingTypeMapping[name], bestScore = score;
 	}
 	return bestMatch;
 }
-export function LookupEncoding(name: string): EncodingInterface | null {
-	return RegisteredEncodings[name.trim().toLowerCase()] ?? null;
+export function LookupEncoding(name: string): EncodingType | null {
+	return EncodingNameToEncodingTypeMapping[name.trim().toLowerCase()] ?? null;
 }
 export function SupportedEncodingNames(): string[] {
-	const out = [];
-	for (const name in RegisteredEncodings)
-		out.push(name);
-	return out;
+	return Object.keys(EncodingNameToEncodingTypeMapping);
 }
