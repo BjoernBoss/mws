@@ -810,14 +810,28 @@ export class ClientSocket extends ClientBase {
 		});
 		this.ws.on('error', (err: any) => {
 			this.error(`WebSocket error: ${err.message}`);
+			if (this.ws.readyState != libWs.WebSocket.CLOSED)
+				this.ws.close();
 		});
 	}
 
 	public ping(): void {
-		this.ws.ping();
+		try {
+			this.ws.ping();
+		} catch (err: any) {
+			this.error(`WebSocket error while pinging: ${err.message}`);
+			if (this.ws.readyState != libWs.WebSocket.CLOSED)
+				this.ws.close();
+		}
 	}
 	public send(data: string | Buffer): void {
-		this.ws.send(data);
+		try {
+			this.ws.send(data);
+		} catch (err: any) {
+			this.error(`WebSocket error while sending data: ${err.message}`);
+			if (this.ws.readyState != libWs.WebSocket.CLOSED)
+				this.ws.close();
+		}
 	}
 	public close(): void {
 		this.ws.close();
