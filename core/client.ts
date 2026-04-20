@@ -95,10 +95,13 @@ export class ClientBase {
 		this.logLayer = `${this.logLayer}::${name}`;
 	}
 	public log(msg: string) {
-		libLog.Log(`Client[${this.id}]${this.logLayer}: ${msg}`);
+		libLog.Log(`{Client[${this.id}]${this.logLayer}} ${msg}`);
+	}
+	public info(msg: string) {
+		libLog.Info(`{Client[${this.id}]${this.logLayer}} ${msg}`);
 	}
 	public error(msg: string) {
-		libLog.Error(`Client[${this.id}]${this.logLayer}: ${msg}`);
+		libLog.Error(`{Client[${this.id}]${this.logLayer}} ${msg}`);
 	}
 }
 

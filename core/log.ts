@@ -2,26 +2,48 @@
 /* Copyright (c) 2024-2026 Bjoern Boss Henrichsen */
 import * as libFs from "fs";
 
+export type LogLevel = 'error' | 'info' | 'warning' | 'log' | 'trace';
+
 let LogListener: LogCallback[] = [ConsoleLogger()];
-function MakeActualLog(level: string, msg: string): void {
+function MakeActualLog(level: LogLevel, msg: string): void {
 	const date: string = new Date().toUTCString();
 	for (const log of LogListener)
 		log(level, date, msg);
 }
 
 /* if [level] is null: is not a log, but the callback is being unregistered */
-export type LogCallback = (level: string | null, date: string, msg: string) => void;
+export type LogCallback = (level: LogLevel | null, date: string, msg: string) => void;
 
 /* format the parameter into a well known style */
-export function FormatLine(level: string, date: string, msg: string): string {
-	return `[${date}] ${level}: ${msg}`;
+export function FormatLine(level: LogLevel, date: string, msg: string, lineBreak: boolean): string {
+	let printLevel: string = '';
+	switch (level) {
+		case 'log':
+			printLevel = 'Log  ';
+			break;
+		case 'trace':
+			printLevel = 'Trace';
+			break;
+		case 'error':
+			printLevel = 'Error';
+			break;
+		case 'info':
+			printLevel = 'Info ';
+			break;
+		case 'warning':
+			printLevel = 'Warn ';
+			break;
+	}
+	if (lineBreak)
+		return `[${date}] ${printLevel}: ${msg}\n`;
+	return `[${date}] ${printLevel}: ${msg}`;
 }
 
 /* implementation of a console logger */
 export function ConsoleLogger(): LogCallback {
-	return (level: string | null, date: string, msg: string) => {
+	return (level: LogLevel | null, date: string, msg: string) => {
 		if (level != null)
-			console.log(FormatLine(level, date, msg));
+			console.log(FormatLine(level, date, msg, false));
 	};
 }
 
@@ -67,7 +89,7 @@ export function FileLogger(filePath: string, options?: { flushingDelayMs?: numbe
 	const sizeSwapFile: number = (options?.sizeSwapFile == null ? DEFAULT_FILE_SIZE_SWAP_FILE : options.sizeSwapFile);
 
 	/* setup the actual closure handler */
-	return (level: string | null, date: string, msg: string) => {
+	return (level: LogLevel | null, date: string, msg: string) => {
 		/* check if the logger is being disabled and clear  */
 		if (level == null) {
 			flushToFile();
@@ -78,7 +100,7 @@ export function FileLogger(filePath: string, options?: { flushingDelayMs?: numbe
 		}
 
 		/* write the log to the buffer and check if the data need to be flushed inplace, or if the flushing can be delayed */
-		logBuffer.push(`${FormatLine(level, date, msg)}\n`);
+		logBuffer.push(`${FormatLine(level, date, msg, true)}\n`);
 		if (logBuffer.length >= bufMaxLineCount)
 			flushToFile();
 		else {
@@ -109,9 +131,9 @@ export function FileLogger(filePath: string, options?: { flushingDelayMs?: numbe
 
 /* implementation of a logger which receives a well formatted line */
 export function LineLogger(cb: (line: string) => void): LogCallback {
-	return (level: string | null, date: string, msg: string) => {
+	return (level: LogLevel | null, date: string, msg: string) => {
 		if (level != null)
-			cb(FormatLine(level, date, msg));
+			cb(FormatLine(level, date, msg, false));
 	};
 }
 
@@ -128,14 +150,42 @@ export function AddLogger(cb: LogCallback): void {
 }
 
 export function Error(msg: string): void {
-	MakeActualLog('Error', msg);
+	MakeActualLog('error', msg);
 }
 export function Info(msg: string): void {
-	MakeActualLog('Info', msg);
+	MakeActualLog('info', msg);
 }
 export function Warning(msg: string): void {
-	MakeActualLog('Warning', msg);
+	MakeActualLog('warning', msg);
 }
 export function Log(msg: string): void {
-	MakeActualLog('Log', msg);
+	MakeActualLog('log', msg);
+}
+export function Trace(msg: string): void {
+	MakeActualLog('trace', msg);
+}
+
+/* wrapper to offset all logs */
+export class LogModule {
+	private identity: string;
+
+	constructor(identity: string) {
+		this.identity = identity;
+	}
+
+	public Error(msg: string): void {
+		Error(`{${this.identity}} ${msg}`);
+	}
+	public Info(msg: string): void {
+		Error(`{${this.identity}} ${msg}`);
+	}
+	public Warning(msg: string): void {
+		Error(`{${this.identity}} ${msg}`);
+	}
+	public Log(msg: string): void {
+		Error(`{${this.identity}} ${msg}`);
+	}
+	public Trace(msg: string): void {
+		Trace(`{${this.identity}} ${msg}`);
+	}
 }
