@@ -31,13 +31,14 @@ export class Server {
 	}
 
 	private respondBadEndpoint(request: libHttp.IncomingMessage, client: libClient.HttpRequest | libClient.HttpUpgrade): void {
-		client.respondAnyText(`No resource found at [${request.headers.host ?? ''}]:[${client.rawpath}]`, { status: libRequest.Status.NotFound, media: libRequest.Media.Text });
+		client.respondAnyText(`No resource found at [${request.headers.host ?? ''}]:[${client.url.pathname}]`, { status: libRequest.Status.NotFound, media: libRequest.Media.Text });
+		request.resume();
 	}
 	private async handleWrapper(wasRequest: boolean, request: libHttp.IncomingMessage, checkHost: libInterface.CheckHost, handler: libInterface.ModuleInterface, port: number, establish: (host: string) => libClient.HttpRequest | libClient.HttpUpgrade): Promise<void> {
 		let client = null;
 		try {
 			/* setup the client object */
-			const rawHostName = (request.headers.host ?? '').toLowerCase();
+			const rawHostName = (request.headers.host ?? '_').toLowerCase();
 			client = establish(rawHostName);
 			client.info(`${wasRequest ? 'Request' : 'Upgrade'}:${port} from [${request.socket.remoteAddress}]:${request.socket.remotePort} to [${request.headers.host}]:[${request.url}] (user-agent: [${request.headers['user-agent'] ?? ''}])`);
 
@@ -73,7 +74,8 @@ export class Server {
 		/* finish the client handling and consume all remaining data in the pipline */
 		if (client != null)
 			client.finishIncoming();
-		request.resume();
+		else
+			request.resume();
 	}
 	private handleRequest(request: libHttp.IncomingMessage, response: libHttp.ServerResponse, check: libInterface.CheckHost, handler: libInterface.ModuleInterface, port: number): void {
 		this.handleWrapper(true, request, check, handler, port, function (host: string): libClient.HttpRequest {

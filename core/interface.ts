@@ -124,14 +124,14 @@ export class UnhandledModule implements ModuleInterface {
 	public async request(client: libClient.HttpRequest): Promise<void> {
 		client.pushLog(this.handler.name);
 		await this.handler.request(client);
-		if (!client.handled() && this.requestLambda != null)
+		if (!client.handled && this.requestLambda != null)
 			await this.requestLambda(client);
 	}
 
 	public async upgrade(client: libClient.HttpUpgrade): Promise<void> {
 		client.pushLog(this.handler.name);
 		await this.handler.upgrade(client);
-		if (!client.handled() && this.upgradeLambda != null)
+		if (!client.handled && this.upgradeLambda != null)
 			await this.upgradeLambda(client);
 	}
 }
