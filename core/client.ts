@@ -118,7 +118,7 @@ export abstract class IncomingBase extends ClientBase {
 	protected outputHeaders: Record<string, string>;
 
 	protected abstract finalizeTextHeader(status: libRequest.StatusType, media: libRequest.MediaType, content: string): void;
-	protected abstract finishSelf(): void;
+	protected abstract finishSelf(): Promise<void>;
 	protected abstract destroySelfIfIncomplete(): void;
 
 	constructor(request: libHttp.IncomingMessage, host: string) {
@@ -154,7 +154,7 @@ export abstract class IncomingBase extends ClientBase {
 		return this.request.method ?? '';
 	}
 
-	/* add the given header to the response (Should be title cased) */
+	/* add the given header to the response (should be title cased) */
 	public addHeader(key: string, value: string): void {
 		if (this.state != ResponseState.none && this.state != ResponseState.acknowledged)
 			throw new Error('Cannot modify headers of sent response');
@@ -162,8 +162,8 @@ export abstract class IncomingBase extends ClientBase {
 	}
 
 	/* called by framework to finish this incoming object (sends queued content, not-found if unhandled, or internal-error if incomplete/failed) */
-	public finishIncoming(): void {
-		this.finishSelf();
+	public async finishIncoming(): Promise<void> {
+		await this.finishSelf();
 		if (this.state == ResponseState.none)
 			this.respondNotFound();
 		else if (this.state == ResponseState.acknowledged)
@@ -279,16 +279,18 @@ export abstract class IncomingBase extends ClientBase {
 */
 export class HttpRequest extends IncomingBase {
 	private response: libHttp.ServerResponse;
-	private received: boolean;
+	private receiving: boolean;
+	private responding: Promise<void> | null;
 	private htmlResponse?: { page: libBuilder.HtmlPage, status: libRequest.StatusType };
 
 	constructor(request: libHttp.IncomingMessage, response: libHttp.ServerResponse, host: string) {
 		super(request, host);
 		this.response = response;
-		this.received = false;
+		this.receiving = false;
+		this.responding = null;
 	}
 
-	protected finalizeTextHeader(status: libRequest.StatusType, media: libRequest.MediaType, content: string): void {
+	protected override finalizeTextHeader(status: libRequest.StatusType, media: libRequest.MediaType, content: string): void {
 		let buffer: Buffer = Buffer.from(content, 'utf-8');
 
 		/* check if the data should be encoded */
@@ -304,26 +306,29 @@ export class HttpRequest extends IncomingBase {
 		this.closeHeader(status, media, buffer.length, false);
 		this.response.end(buffer);
 	}
-	protected destroySelfIfIncomplete(): void {
+	protected override destroySelfIfIncomplete(): void {
 		if (!this.response.writableEnded && !this.response.destroyed)
 			this.response.destroy();
 	}
-	protected finishSelf(): void {
-		/* check if html has been queued and respond with it */
-		if (this.htmlResponse != null && this.state == ResponseState.acknowledged) {
+	protected override async finishSelf(): Promise<void> {
+		if (!this.receiving)
+			this.request.resume();
+		if (this.state != ResponseState.acknowledged)
+			return;
+
+		/* check if html has been queued and respond with it or await for the response header to be sent */
+		if (this.htmlResponse != null) {
 			this.finalizeTextHeader(this.htmlResponse.status, libRequest.Media.Html, this.htmlResponse.page.finalize());
 			this.state = ResponseState.responded;
 		}
-
-		/* check if the request needs to be drained */
-		if (!this.received)
-			this.request.resume();
+		else if (this.responding != null)
+			await this.responding;
 	}
 	private closeHeader(status: libRequest.StatusType, media: libRequest.MediaType, contentSize: number | null, updateState: boolean): void {
 		if (updateState)
 			this.state = ResponseState.responded;
 
-		/* setup the response */
+		/* setup the response status and headers */
 		this.response.statusCode = status.code;
 		this.response.statusMessage = status.msg;
 		for (const key in this.outputHeaders)
@@ -338,9 +343,9 @@ export class HttpRequest extends IncomingBase {
 	}
 	private receiveClientData(maxLength: number | null): libStream.Readable {
 		/* check if the object is ready for receiving */
-		if (this.received)
+		if (this.receiving)
 			throw new Error('Payload has already been handled');
-		this.received = true;
+		this.receiving = true;
 		if (this.request.destroyed || this.state == ResponseState.broken)
 			throw new Error('Connection is broken');
 
@@ -418,14 +423,18 @@ export class HttpRequest extends IncomingBase {
 		/* create the plumbing between stream and output (errors are already handled) */
 		return stream.pipe(output);
 	}
-	private sendClientData(media: libRequest.MediaType, status: libRequest.StatusType, options: { encoded?: string, contentSize?: number }): libStream.Writable {
+	private sendClientData(media: libRequest.MediaType, status: libRequest.StatusType, options: { encoded?: string, contentSize?: number, noEncode?: boolean }): libStream.Writable {
 		/* check if the object is already responded */
 		if (this.state != ResponseState.none)
 			throw new Error('Request has already been handled');
 		this.log(`Responding with data and status [${status.msg}]`);
 		if (this.response.destroyed)
 			throw new Error('Connection is broken');
+
+		/* setup the respond promise to notify the cleanup of when the header has been sent */
 		this.state = ResponseState.acknowledged;
+		let resolver: (() => void) | null = null;
+		this.responding = new Promise((resolve) => resolver = resolve);
 
 		/* setup the output stream to be written out */
 		const output = new libStream.Writable({
@@ -437,7 +446,6 @@ export class HttpRequest extends IncomingBase {
 			}
 		});
 
-		/* data processor */
 		let stream: libStream.Writable = this.response, headerSent = false;
 		let dataCache: Buffer | null = null, totalSent = 0, closed = false;
 		const handleData = (chunk: Buffer | null, cb: (err: any) => void) => {
@@ -466,36 +474,47 @@ export class HttpRequest extends IncomingBase {
 					return cb(null);
 				}
 
-				/* lookup the encoding being used and add the encoding headers */
-				const fullContentSize = (options.contentSize ?? (last ? chunk?.byteLength ?? 0 : null));
-				const encoding = ((options.encoded != null || fullContentSize == 0) ? null : libRequest.EncodingOption(this.headers['accept-encoding'] ?? null, fullContentSize ?? chunk!.byteLength, media));
-				if (options.encoded != null || encoding != null) {
-					this.outputHeaders['Content-Encoding'] = options.encoded ?? encoding!.name;
+				/* check if the content is already encoded */
+				let fullContentSize = (options.contentSize ?? (last ? (chunk?.byteLength ?? 0) : null)), encoder = 'identity';
+				if (options.encoded != null) {
+					this.outputHeaders['Content-Encoding'] = options.encoded;
 					this.outputHeaders['Vary'] = 'Accept-Encoding';
 				}
 
-				/* check if the stream needs to be wrapped or in-place encoded */
-				if (encoding != null) {
-					this.outputHeaders['Accept-Ranges'] = 'none';
-					if (last)
-						chunk = encoding.encodeBuffer(chunk!);
-					else {
-						stream = encoding.makeEncode();
-						stream.pipe(this.response);
+				/* check if an encoding can be applied and setup the header and stream accordingly */
+				else if (options.noEncode !== true && fullContentSize !== 0) {
+					const encoding = libRequest.EncodingOption(this.headers['accept-encoding'] ?? null, fullContentSize ?? chunk!.byteLength, media);
+					if (encoding != null) {
+						encoder = encoding.name;
+						this.outputHeaders['Content-Encoding'] = encoding.name;
+						this.outputHeaders['Vary'] = 'Accept-Encoding';
+						this.outputHeaders['Accept-Ranges'] = 'none';
 
-						/* register the encoding error handler */
-						stream.on('error', (err: any) => {
-							if (output.destroyed) return;
-							this.respondInternalError('Data encoding error encountered');
-							output.destroy(err);
-						});
+						/* check if the header can be encoded inplace (update the content size, as it is now exact but differs due to being encoded) */
+						if (last) {
+							chunk = encoding.encodeBuffer(chunk!);
+							options.contentSize = chunk.byteLength;
+							fullContentSize = chunk.byteLength;
+						} else {
+							fullContentSize = null;
+							stream = encoding.makeEncode();
+							stream.pipe(this.response);
+
+							/* register the encoding error handler */
+							stream.on('error', (err: any) => {
+								if (output.destroyed) return;
+								this.respondInternalError('Data encoding error encountered');
+								output.destroy(err);
+							});
+						}
 					}
 				}
 
 				/* send the final header away and write the content to the stream */
-				this.log(`Sending content [${media.mediaType}] of size [${fullContentSize ?? 'unknown'}] encoded using [${encoding?.name ?? 'identity'}]`);
-				this.closeHeader(status, media, (encoding == null ? fullContentSize : null), true);
+				this.log(`Sending content [${media.mediaType}] of size [${fullContentSize ?? 'unknown'}] encoded using [${encoder}]`);
+				this.closeHeader(status, media, fullContentSize, true);
 				headerSent = true;
+				resolver!();
 			}
 
 			/* update the total-sent counter and check if the upper-bound is broken */
@@ -522,7 +541,6 @@ export class HttpRequest extends IncomingBase {
 			return stream.end(() => cb(null));
 		};
 
-		/* stream failure handler */
 		const handleFailure = () => {
 			/* check if the entire message has already been sent, in which case this will just be ignored */
 			if (closed)
@@ -596,7 +614,7 @@ export class HttpRequest extends IncomingBase {
 		return this.htmlResponse?.page ?? null;
 	}
 
-	/* repond with html, can be built on by parent modules, sent once the client is cleared and the builder is ready */
+	/* respond with html, can be built on by parent modules, sent once the client is cleared and the builder is ready */
 	public respondHtml(page: libBuilder.HtmlPage, status: libRequest.StatusType = libRequest.Status.Ok): void {
 		if (this.state != ResponseState.none)
 			throw new Error('Request has already been handled');
@@ -668,7 +686,7 @@ export class HttpRequest extends IncomingBase {
 		try {
 			/* create the write stream for the content */
 			const status = (range.state == libRequest.RangeState.noRange ? libRequest.Status.Ok : libRequest.Status.PartialContent);
-			stream = this.sendClientData(media, status, { encoded: options?.encoded, contentSize: cached.fileSize() });
+			stream = this.sendClientData(media, status, { encoded: options?.encoded, contentSize: range.last - range.first + 1, noEncode: range.state != libRequest.RangeState.noRange });
 			this.log(`Sending content [${range.first} - ${range.last}/${cached.fileSize()}] from [${filePath}]`);
 		}
 		catch (err: any) {
@@ -683,6 +701,7 @@ export class HttpRequest extends IncomingBase {
 			if (closed) return; closed = true;
 			this.respondFileSystemError();
 			this.error(`Error while sending file [${filePath}]: [${err.message}]`);
+			stream.destroy(err);
 		});
 		stream.on('error', (err: any) => {
 			if (closed) return; closed = true;
@@ -701,7 +720,6 @@ export class HttpRequest extends IncomingBase {
 	*	automatically responds with given exceptions if the payload cannot be received properly */
 	public receiveAllBuffer(maxLength: number | null): Promise<Buffer> {
 		return new Promise((resolve, reject) => {
-			/* create the stream */
 			let stream: libStream.Readable | null = null;
 			try {
 				stream = this.receiveClientData(maxLength);
@@ -709,7 +727,6 @@ export class HttpRequest extends IncomingBase {
 				return reject(err);
 			}
 
-			/* collect all of the data into a buffer */
 			const buffers: Buffer[] = [];
 			stream.on('data', (chunk: Buffer) => buffers.push(chunk));
 			stream.on('end', () => resolve(Buffer.concat(buffers)));
@@ -723,7 +740,6 @@ export class HttpRequest extends IncomingBase {
 		/* wait for the buffer (let all errors propagate out) */
 		const buffer: Buffer = await this.receiveAllBuffer(maxLength);
 
-		/* decode the buffer to a string */
 		try {
 			return buffer.toString(encoding as BufferEncoding);
 		} catch (err: any) {
@@ -738,7 +754,6 @@ export class HttpRequest extends IncomingBase {
 	public receiveToFile(path: string, maxLength: number | null): Promise<void> {
 		this.log(`Collecting data from [${this.url.pathname}] to: [${path}]`);
 		return new Promise((resolve, reject) => {
-			/* create the stream for the data to be read */
 			let source: libStream.Readable | null = null;
 			try {
 				source = this.receiveClientData(maxLength);
@@ -747,10 +762,8 @@ export class HttpRequest extends IncomingBase {
 				return reject(err);
 			}
 
-			/* create the stream to the file to be written */
+			/* create the stream to the file to be written and setup the blumbing */
 			const destination = libFs.createWriteStream(path, { flags: 'wx' });
-
-			/* setup the piping and plumbing */
 			let fileFailed = false, sourceFailed = false, opened = false;
 			source.on('error', (err: any) => {
 				sourceFailed = true;
@@ -803,10 +816,9 @@ export class HttpUpgrade extends IncomingBase {
 		this.head = head;
 	}
 
-	protected finalizeTextHeader(status: libRequest.StatusType, media: libRequest.MediaType, content: string): void {
+	protected override finalizeTextHeader(status: libRequest.StatusType, media: libRequest.MediaType, content: string): void {
 		const buffer = Buffer.from(content, 'utf-8');
 
-		/* write out the headers for the response */
 		this.outputHeaders['Date'] = new Date().toUTCString();
 		this.outputHeaders['Server'] = libServer.GetServerName();
 		this.outputHeaders['Content-Type'] = libRequest.BuildMediaTypeIdentifier(media);
@@ -825,17 +837,16 @@ export class HttpUpgrade extends IncomingBase {
 		this.socket.write(header, 'utf-8');
 		this.socket.write(buffer);
 	}
-	protected finishSelf(): void {
+	protected override async finishSelf(): Promise<void> {
 		this.request.resume();
 	}
-	protected destroySelfIfIncomplete(): void {
+	protected override destroySelfIfIncomplete(): void {
 		if (!this.socket.destroyed)
 			this.socket.destroy();
 	}
 
 	/* marks the object as having been handled (returns false, if connection is not a valid websocket upgrade request) */
 	public tryAcceptWebSocket(cb: (ws: ClientSocket) => void): boolean {
-		/* ensure the connection can be accepted */
 		if (this.state != ResponseState.none)
 			throw new Error('Request has already been handled');
 
@@ -846,10 +857,8 @@ export class HttpUpgrade extends IncomingBase {
 		if (this.headers?.upgrade?.toLowerCase() != 'websocket' || this.request.method != 'GET')
 			return false;
 
-		/* mark the request as handled and consumed */
 		this.state = ResponseState.responded;
 
-		/* try to accept the request */
 		WebSocketServerInstance.handleUpgrade(this.request, this.socket, this.head, (ws, request) => {
 			WebSocketServerInstance.emit('connection', ws, request);
 			cb(new ClientSocket(ws, this));
@@ -869,7 +878,6 @@ export class ClientSocket extends ClientBase {
 		super(base);
 		this.ws = ws;
 
-		/* register the callbacks */
 		this.ws.on('message', (data, isBinary) => {
 			if (this.ondata != null)
 				this.ondata(data, isBinary);

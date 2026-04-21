@@ -53,7 +53,6 @@ export class Server {
 				hostName = hostNameRegex[1];
 			}
 
-			/* validate the host name */
 			if (!checkHost(hostName)) {
 				client.error(`Host [${hostName}] not allowed for this endpoint [${port}]`);
 				return this.respondBadEndpoint(request, client);
@@ -65,13 +64,12 @@ export class Server {
 			else
 				await handler.upgrade(client as libClient.HttpUpgrade);
 		} catch (err: any) {
-			/* log the unknown caught exception (internal-server-error) */
 			libLog.Error(`Uncaught exception encountered for client [${client != null ? client.id : null}]: ${err}`)
 			if (client != null)
 				client.respondInternalError('Unknown internal error encountered');
 		}
 
-		/* finish the client handling and consume all remaining data in the pipline */
+		/* finish the client handling or consume all remaining data in the pipline */
 		if (client != null)
 			client.finishIncoming();
 		else
