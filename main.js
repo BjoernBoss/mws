@@ -4,12 +4,14 @@ import * as libServer from "core/server.js";
 import * as libLog from "core/log.js";
 import * as libCache from "core/cache.js";
 
+const logger = libLog.Logger('main');
+
 async function Setup(setupModule) {
 	if (setupModule == null || setupModule.Run === undefined) {
-		libLog.Error('Unable to load local module [module/setup.js:Run]');
+		logger.error('Unable to load local module [module/setup.js:Run]');
 		return;
 	}
-	libLog.Info('Local module loaded');
+	logger.info('Local module loaded');
 
 	/* load the server and configure it */
 	const server = new libServer.Server();
@@ -17,7 +19,7 @@ async function Setup(setupModule) {
 		await setupModule.Run(server);
 	}
 	catch (e) {
-		libLog.Error(`Failed to setup the application: ${e.message}`);
+		logger.error(`Failed to setup the application: ${e.message}`);
 		server.stop();
 	}
 }

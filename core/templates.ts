@@ -4,6 +4,8 @@ import * as libLog from "./log.js";
 import * as libLocation from "./location.js";
 import * as libCache from "./cache.js";
 
+const logger = libLog.Logger('template');
+
 const TemplateDirectory = libLocation.MakeSelfPath(import.meta.url, 'templates');
 function LoadRelative(name: string): string {
 	try {
@@ -13,7 +15,7 @@ function LoadRelative(name: string): string {
 	} catch (_) { }
 
 	/* return the default place-holder */
-	libLog.Error(`Unable to load template [${name}] properly`);
+	logger.error(`Unable to load template [${name}] properly`);
 	return '<!doctype html><html><body><p style="font-family: monospace;">Response message not found.</p></body></html>';
 }
 function ExpandPlaceholders(content: string, map: Record<string, string>): string {
@@ -43,7 +45,7 @@ function ExpandPlaceholders(content: string, map: Record<string, string>): strin
 		else {
 			placeholder = false;
 			if (!(name in map))
-				libLog.Warning(`Undefined placeholder [${name}] encountered`);
+				logger.warning(`Undefined placeholder [${name}] encountered`);
 			else
 				out += map[name];
 		}
@@ -51,7 +53,7 @@ function ExpandPlaceholders(content: string, map: Record<string, string>): strin
 
 	/* check if a last name was not closed properly */
 	if (placeholder)
-		libLog.Warning('Content ends with an incomplete placeholder');
+		logger.warning('Content ends with an incomplete placeholder');
 	return out;
 }
 

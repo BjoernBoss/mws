@@ -13,18 +13,29 @@ import * as libUrl from "url";
 import * as libWs from "ws";
 import * as libHttp from "http";
 
-export class ClientBase {
-	protected logLayer: string;
+export class ClientShiftState {
+	public logIdentity: string;
+	public basePath: string;
+	public path: string;
+
+	constructor(logIdentity: string, basePath: string, path: string) {
+		this.logIdentity = logIdentity;
+		this.basePath = basePath;
+		this.path = path;
+	}
+}
+
+export class ClientBase extends libLog.LogIdentity {
 	protected context: Record<string, unknown>;
 
 	/* path relative to current module base-path */
 	public path: string;
 
 	/* absolute path on web-server */
-	public fullpath: string;
+	public fullPath: string;
 
 	/* base path between the fullpath and path */
-	public basepath: string;
+	public basePath: string;
 
 	/* raw request origin (no host will result in '_') */
 	public url: libUrl.URL;
@@ -36,25 +47,27 @@ export class ClientBase {
 	protected constructor(client: ClientBase);
 	protected constructor(arg: libUrl.URL | ClientBase) {
 		if (arg instanceof libUrl.URL) {
+			const thisClientId = ++NextClientId;
+			super(`client!${thisClientId}`);
+
 			/* decode the string and re-encode it to ensure '/' and '\' are preserved as URI encoding, but the rest is decoded */
 			const cleanPath: string = arg.pathname.split('/').map((segment) => {
 				return decodeURIComponent(segment).replace(/[/\\]/g, (c) => (c === '/' ? '%2F' : '%5C'));
 			}).join('/');
 
-			this.logLayer = '';
 			this.context = {};
-			this.id = ++NextClientId;
+			this.id = thisClientId;
 			this.path = libLocation.Sanitize(cleanPath, false);
 			this.url = arg;
-			this.fullpath = this.path;
-			this.basepath = '/';
+			this.fullPath = this.path;
+			this.basePath = '/';
 		}
 		else {
-			this.logLayer = arg.logLayer;
+			super(arg.logIdentity);
 			this.context = arg.context;
 			this.path = arg.path;
-			this.fullpath = arg.fullpath;
-			this.basepath = arg.basepath;
+			this.fullPath = arg.fullPath;
+			this.basePath = arg.basePath;
 			this.url = arg.url;
 			this.id = arg.id;
 		}
@@ -68,30 +81,38 @@ export class ClientBase {
 	public setContext(name: string, value: unknown): void {
 		this.context[name] = value;
 	}
-	public tryTranslate(path: string): boolean {
-		if (!libLocation.IsSubDirectory(path, this.path))
-			return false;
+	public makePath(path: string): string {
+		return libLocation.JoinSanitized(this.basePath, path);
+	}
 
-		this.basepath = libLocation.JoinSanitized(this.basepath, path);
+	/* check if path is a substring of the current path, and if so, shift the path and identity and
+	*	return the cached shift (to be able to recover the old state), otherwise it returns null */
+	public translate(path: string, identity: string): ClientShiftState | null {
+		if (!libLocation.IsSubDirectory(path, this.path))
+			return null;
+		const shift = new ClientShiftState(this.logIdentity, this.basePath, this.path);
+
+		/* shift the paths and the log identity */
+		this.basePath = libLocation.JoinSanitized(this.basePath, path);
 		this.path = this.path.substring(path.endsWith('/') ? path.length - 1 : path.length);
 		if (this.path == '')
 			this.path = '/';
-		return true;
+		this.logIdentity = `${this.logIdentity}.${identity}`;
+		return shift;
 	}
-	public makePath(path: string): string {
-		return libLocation.JoinSanitized(this.basepath, path);
+
+	/* only shift onto the logging identity */
+	public shiftLog(identity: string): ClientShiftState {
+		const shift = new ClientShiftState(this.logIdentity, this.basePath, this.path);
+		this.logIdentity = `${this.logIdentity}.${identity}`;
+		return shift;
 	}
-	public pushLog(name: string) {
-		this.logLayer = `${this.logLayer}::${name}`;
-	}
-	public log(msg: string) {
-		libLog.Log(`{Client[${this.id}]${this.logLayer}} ${msg}`);
-	}
-	public info(msg: string) {
-		libLog.Info(`{Client[${this.id}]${this.logLayer}} ${msg}`);
-	}
-	public error(msg: string) {
-		libLog.Error(`{Client[${this.id}]${this.logLayer}} ${msg}`);
+
+	/* restore a shifting operation */
+	public unshift(cache: ClientShiftState): void {
+		this.logIdentity = cache.logIdentity;
+		this.basePath = cache.basePath;
+		this.path = cache.path;
 	}
 }
 
@@ -791,7 +812,7 @@ export class HttpRequest extends IncomingBase {
 					return reject(err);
 				libFs.unlink(path, (err2: any) => {
 					if (err2 != null)
-						libLog.Error(`Failed to remove temporary file [${path}]: ${err2.message}`);
+						this.error(`Failed to remove temporary file [${path}]: ${err2.message}`);
 					reject(err);
 				});
 			});

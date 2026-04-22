@@ -10,10 +10,12 @@ import * as libFs from "fs";
 import * as libStream from "stream";
 import * as libNet from "net";
 
+const logger = libLog.Logger('server');
+
 let serverName = '';
 export function SetServerName(name: string): void {
 	serverName = name;
-	libLog.Info(`Server name configured as: [${serverName}]`);
+	logger.info(`Server name configured as: [${serverName}]`);
 }
 export function GetServerName(): string {
 	return serverName;
@@ -26,7 +28,7 @@ export class Server {
 	private stopList: (() => Promise<void>)[];
 
 	constructor() {
-		libLog.Info(`Server object created`);
+		logger.info(`Server object created`);
 		this.stopList = [];
 	}
 
@@ -64,7 +66,7 @@ export class Server {
 			else
 				await handler.upgrade(client as libClient.HttpUpgrade);
 		} catch (err: any) {
-			libLog.Error(`Uncaught exception encountered for client [${client != null ? client.id : null}]: ${err}`)
+			logger.error(`Uncaught exception encountered for client [${client != null ? client.id : null}]: ${err}`)
 			if (client != null)
 				client.respondInternalError('Unknown internal error encountered');
 		}
@@ -95,7 +97,7 @@ export class Server {
 
 			/* start the actual server */
 			const server = libHttp.createServer(config, (req, resp) => this.handleRequest(req, resp, checkHost, handler, port, false)).listen(port);
-			server.on('error', (err) => libLog.Error(`While listening to port ${port} using http: ${err}`));
+			server.on('error', (err) => logger.error(`While listening to port ${port} using http: ${err}`));
 			server.on('upgrade', (req, sock, head) => this.handleUpgrade(req, sock, head, checkHost, handler, port, false));
 			if (!server.listening)
 				return;
@@ -105,9 +107,9 @@ export class Server {
 
 			/* log the established listener */
 			const address = server.address() as libNet.AddressInfo;
-			libLog.Info(`Http-server started successfully on [${address.address}]:${address.port} [family: ${address.family}] with handler [${handler.name}]`);
+			logger.info(`Http-server started successfully on [${address.address}]:${address.port} [family: ${address.family}] with handler [${handler.name}]`);
 		} catch (err: any) {
-			libLog.Error(`While listening to port ${port} using http: ${err}`);
+			logger.error(`While listening to port ${port} using http: ${err}`);
 		}
 	}
 	public listenHttps(port: number, key: string, cert: string, handler: libInterface.ModuleInterface, checkHost: libInterface.CheckHost): void {
@@ -121,7 +123,7 @@ export class Server {
 
 			/* start the actual server */
 			const server = libHttps.createServer(config, (req, resp) => this.handleRequest(req, resp, checkHost, handler, port, true)).listen(port);
-			server.on('error', (err) => libLog.Error(`While listening to port ${port} using https: ${err}`));
+			server.on('error', (err) => logger.error(`While listening to port ${port} using https: ${err}`));
 			server.on('upgrade', (req, sock, head) => this.handleUpgrade(req, sock, head, checkHost, handler, port, true));
 			if (!server.listening)
 				return;
@@ -131,9 +133,9 @@ export class Server {
 
 			/* log the established listener */
 			const address = server.address() as libNet.AddressInfo;
-			libLog.Info(`Https-server started successfully on [${address.address}]:${address.port} [family: ${address.family}] with handler [${handler.name}]`);
+			logger.info(`Https-server started successfully on [${address.address}]:${address.port} [family: ${address.family}] with handler [${handler.name}]`);
 		} catch (err: any) {
-			libLog.Error(`While listening to port ${port} using https: ${err}`);
+			logger.error(`While listening to port ${port} using https: ${err}`);
 		}
 	}
 	public async stop(): Promise<void> {

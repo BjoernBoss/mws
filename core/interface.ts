@@ -60,15 +60,17 @@ export class DispatchModule implements ModuleInterface {
 
 	public name: string = 'dispatch';
 	constructor(map: Record<string, ModuleInterface>) {
+		const logger = libLog.Logger(this.name);
+
 		this.mapping = {};
 		for (const key in map) {
 			const handler = map[key];
-			libLog.Info(`Mapping [${handler.name}] to [${key}]`);
+			logger.info(`Binding [${key}] to child [${handler.name}]`);
 			this.mapping[key] = handler;
 		}
 	}
 
-	private dispatch(client: libClient.ClientBase): ModuleInterface | null {
+	private dispatch(client: libClient.ClientBase): [ModuleInterface, string] | null {
 		let bestMatch: string | null = null;
 
 		/* iterate over the mappings and look for the corresponding best handler */
@@ -79,29 +81,31 @@ export class DispatchModule implements ModuleInterface {
 				bestMatch = path;
 		}
 
-		/* check if a handler has been found and translate the path accordingly */
 		if (bestMatch != null) {
-			client.log(`Client dispatched to handler [${this.mapping[bestMatch].name}] at [${bestMatch}]`);
-			client.tryTranslate(bestMatch);
-			return this.mapping[bestMatch];
+			client.trace(`Client dispatched to handler [${this.mapping[bestMatch].name}] at [${bestMatch}]`);
+			return [this.mapping[bestMatch], bestMatch];
 		}
-		client.log(`Request cannot be dispatched`);
+		client.trace(`Request cannot be dispatched`);
 		return null;
 	}
 
 	public async request(client: libClient.HttpRequest): Promise<void> {
-		const module = this.dispatch(client);
-		if (module != null) {
-			client.pushLog(module.name);
-			await module.request(client);
-		}
+		const match = this.dispatch(client);
+		if (match == null)
+			return;
+
+		const cached = client.translate(match[1], match[0].name)!;
+		await match[0].request(client);
+		client.unshift(cached);
 	}
 	public async upgrade(client: libClient.HttpUpgrade): Promise<void> {
-		const module = this.dispatch(client);
-		if (module != null) {
-			client.pushLog(module.name);
-			await module.upgrade(client);
-		}
+		const match = this.dispatch(client);
+		if (match == null)
+			return;
+
+		const cached = client.translate(match[1], match[0].name)!;
+		await match[0].upgrade(client);
+		client.unshift(cached);
 	}
 }
 
@@ -116,23 +120,29 @@ export class UnhandledModule implements ModuleInterface {
 	public name: string = 'unhandler';
 	constructor(handler: ModuleInterface, request?: RequestLambda, upgrade?: UpgradeLambda) {
 		this.handler = handler;
-		libLog.Info(`Unhandled wrapper [${handler.name}]`);
+		libLog.Logger(this.name).info(`Binding [/] to child [${handler.name}]`);
 		this.requestLambda = request;
 		this.upgradeLambda = upgrade;
 	}
 
 	public async request(client: libClient.HttpRequest): Promise<void> {
-		client.pushLog(this.handler.name);
+		const cached = client.shiftLog(this.handler.name);
+
 		await this.handler.request(client);
 		if (!client.handled && this.requestLambda != null)
 			await this.requestLambda(client);
+
+		client.unshift(cached);
 	}
 
 	public async upgrade(client: libClient.HttpUpgrade): Promise<void> {
-		client.pushLog(this.handler.name);
+		const cached = client.shiftLog(this.handler.name);
+
 		await this.handler.upgrade(client);
 		if (!client.handled && this.upgradeLambda != null)
 			await this.upgradeLambda(client);
+
+		client.unshift(cached);
 	}
 }
 
@@ -147,24 +157,30 @@ export class WrapModule implements ModuleInterface {
 	public name: string = 'wrap';
 	constructor(handler: ModuleInterface, request?: RequestWrap, upgrade?: UpgradeWrap) {
 		this.handler = handler;
-		libLog.Info(`Wrapping [${handler.name}]`);
+		libLog.Logger(this.name).info(`Binding [/] to child [${handler.name}]`);
 		this.requestWrap = request;
 		this.upgradeWrap = upgrade;
 	}
 
 	public async request(client: libClient.HttpRequest): Promise<void> {
-		client.pushLog(this.handler.name);
+		const cached = client.shiftLog(this.handler.name);
+
 		if (this.requestWrap != null)
 			await this.requestWrap(client, () => this.handler.request(client));
 		else
 			await this.handler.request(client);
+
+		client.unshift(cached);
 	}
 
 	public async upgrade(client: libClient.HttpUpgrade): Promise<void> {
-		client.pushLog(this.handler.name);
+		const cached = client.shiftLog(this.handler.name);
+
 		if (this.upgradeWrap != null)
 			await this.upgradeWrap(client, () => this.handler.upgrade(client));
 		else
 			await this.handler.upgrade(client);
+
+		client.unshift(cached);
 	}
 }

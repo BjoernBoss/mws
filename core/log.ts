@@ -5,17 +5,17 @@ import * as libFs from "fs";
 export type LogLevel = 'error' | 'info' | 'warning' | 'log' | 'trace';
 
 let LogListener: LogCallback[] = [ConsoleLogger()];
-function MakeActualLog(level: LogLevel, msg: string): void {
+function MakeActualLog(level: LogLevel, identity: string, msg: string): void {
 	const date: string = new Date().toUTCString();
 	for (const log of LogListener)
-		log(level, date, msg);
+		log(level, date, identity, msg);
 }
 
 /* if [level] is null: is not a log, but the callback is being unregistered */
-export type LogCallback = (level: LogLevel | null, date: string, msg: string) => void;
+export type LogCallback = (level: LogLevel | null, date: string, identity: string, msg: string) => void;
 
 /* format the parameter into a well known style */
-export function FormatLine(level: LogLevel, date: string, msg: string, lineBreak: boolean): string {
+export function FormatLine(level: LogLevel, date: string, identity: string, msg: string, lineBreak: boolean): string {
 	let printLevel: string = '';
 	switch (level) {
 		case 'log':
@@ -35,15 +35,15 @@ export function FormatLine(level: LogLevel, date: string, msg: string, lineBreak
 			break;
 	}
 	if (lineBreak)
-		return `[${date}] ${printLevel}: ${msg}\n`;
-	return `[${date}] ${printLevel}: ${msg}`;
+		return `[${date}] ${printLevel}: [${identity}] ${msg}\n`;
+	return `[${date}] ${printLevel}: [${identity}] ${msg}`;
 }
 
 /* implementation of a console logger */
 export function ConsoleLogger(): LogCallback {
-	return (level: LogLevel | null, date: string, msg: string) => {
+	return (level: LogLevel | null, date: string, identity: string, msg: string) => {
 		if (level != null)
-			console.log(FormatLine(level, date, msg, false));
+			console.log(FormatLine(level, date, identity, msg, false));
 	};
 }
 
@@ -89,7 +89,7 @@ export function FileLogger(filePath: string, options?: { flushingDelayMs?: numbe
 	const sizeSwapFile: number = (options?.sizeSwapFile == null ? DEFAULT_FILE_SIZE_SWAP_FILE : options.sizeSwapFile);
 
 	/* setup the actual closure handler */
-	return (level: LogLevel | null, date: string, msg: string) => {
+	return (level: LogLevel | null, date: string, identity: string, msg: string) => {
 		/* check if the logger is being disabled and clear  */
 		if (level == null) {
 			flushToFile();
@@ -100,7 +100,7 @@ export function FileLogger(filePath: string, options?: { flushingDelayMs?: numbe
 		}
 
 		/* write the log to the buffer and check if the data need to be flushed inplace, or if the flushing can be delayed */
-		logBuffer.push(`${FormatLine(level, date, msg, true)}\n`);
+		logBuffer.push(`${FormatLine(level, date, identity, msg, true)}\n`);
 		if (logBuffer.length >= bufMaxLineCount)
 			flushToFile();
 		else {
@@ -131,16 +131,16 @@ export function FileLogger(filePath: string, options?: { flushingDelayMs?: numbe
 
 /* implementation of a logger which receives a well formatted line */
 export function LineLogger(cb: (line: string) => void): LogCallback {
-	return (level: LogLevel | null, date: string, msg: string) => {
+	return (level: LogLevel | null, date: string, identity: string, msg: string) => {
 		if (level != null)
-			cb(FormatLine(level, date, msg, false));
+			cb(FormatLine(level, date, identity, msg, false));
 	};
 }
 
 /* remove all registered loggers (default logger is a single console logger) */
 export function ClearLoggers(): void {
 	for (const log of LogListener)
-		log(null, '', '');
+		log(null, '', '', '');
 	LogListener = [];
 }
 
@@ -149,43 +149,30 @@ export function AddLogger(cb: LogCallback): void {
 	LogListener.push(cb);
 }
 
-export function Error(msg: string): void {
-	MakeActualLog('error', msg);
-}
-export function Info(msg: string): void {
-	MakeActualLog('info', msg);
-}
-export function Warning(msg: string): void {
-	MakeActualLog('warning', msg);
-}
-export function Log(msg: string): void {
-	MakeActualLog('log', msg);
-}
-export function Trace(msg: string): void {
-	MakeActualLog('trace', msg);
-}
-
-/* wrapper to offset all logs */
-export class LogModule {
-	private identity: string;
+export class LogIdentity {
+	protected logIdentity: string;
 
 	constructor(identity: string) {
-		this.identity = identity;
+		this.logIdentity = identity;
 	}
 
-	public Error(msg: string): void {
-		Error(`{${this.identity}} ${msg}`);
+	public error(msg: string): void {
+		MakeActualLog('error', this.logIdentity, msg);
 	}
-	public Info(msg: string): void {
-		Error(`{${this.identity}} ${msg}`);
+	public info(msg: string): void {
+		MakeActualLog('info', this.logIdentity, msg);
 	}
-	public Warning(msg: string): void {
-		Error(`{${this.identity}} ${msg}`);
+	public warning(msg: string): void {
+		MakeActualLog('warning', this.logIdentity, msg);
 	}
-	public Log(msg: string): void {
-		Error(`{${this.identity}} ${msg}`);
+	public log(msg: string): void {
+		MakeActualLog('log', this.logIdentity, msg);
 	}
-	public Trace(msg: string): void {
-		Trace(`{${this.identity}} ${msg}`);
+	public trace(msg: string): void {
+		MakeActualLog('trace', this.logIdentity, msg);
 	}
+}
+
+export function Logger(identity: string): LogIdentity {
+	return new LogIdentity(identity);
 }

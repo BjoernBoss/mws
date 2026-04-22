@@ -4,6 +4,8 @@ import * as libLog from "./log.js";
 import * as libFs from "fs";
 import * as libStream from "stream";
 
+const logger = libLog.Logger('cache');
+
 interface CacheEntry {
 	data: Buffer;
 	mtime: number;
@@ -30,7 +32,7 @@ function CacheAdd(path: string, data: Buffer, mtime: number, persistent: boolean
 		CacheReduce(totalCacheAllocated + data.byteLength - totalCacheCapacity);
 
 	/* add the entry to the cache */
-	libLog.Log(`Added [${path}] to the cache`);
+	logger.log(`Added [${path}] to the cache`);
 	totalCacheAllocated += data.byteLength;
 	cacheMap[path] = { data: data, mtime: mtime, touched: ++nextTouchStamp, persistent };
 }
@@ -48,7 +50,7 @@ function CacheReduce(capacity: number): void {
 function CacheDrop(path: string): void {
 	if (!(path in cacheMap))
 		return;
-	libLog.Log(`Dropped [${path}] from the cache`);
+	logger.log(`Dropped [${path}] from the cache`);
 	totalCacheAllocated -= cacheMap[path].data.byteLength;
 	delete cacheMap[path];
 }
@@ -77,7 +79,7 @@ export class Cached {
 		try {
 			stream = libFs.createReadStream(this.path, { flags: 'r', start: options?.start, end: options?.end });
 		} catch (err: any) {
-			libLog.Error(`Filesystem error while streaming [${this.path}]: ${err.message}`);
+			logger.error(`Filesystem error while streaming [${this.path}]: ${err.message}`);
 			throw new Error('File operation failed');
 		}
 
@@ -105,7 +107,7 @@ export class Cached {
 		/* setup the file exceptions to be propagated to the stream */
 		let wrapped = stream.pipe(transformer);
 		stream.on('error', (e: Error) => {
-			libLog.Error(`Filesystem error while streaming [${this.path}]: ${e.message}`);
+			logger.error(`Filesystem error while streaming [${this.path}]: ${e.message}`);
 			failed = true;
 			wrapped.destroy(new Error('File operation failed'));
 		});
@@ -124,7 +126,7 @@ export class Cached {
 			/* extract the file size and modified time */
 			return [stats.size, stats.mtime.getTime()];
 		} catch (err: any) {
-			libLog.Error(`Filesystem error while checking [${path}]: ${err.message}`);
+			logger.error(`Filesystem error while checking [${path}]: ${err.message}`);
 			throw new Error('File operation failed');
 		}
 	}
@@ -178,13 +180,13 @@ export class Cached {
 		try {
 			this.data = libFs.readFileSync(this.path);
 		} catch (err: any) {
-			libLog.Error(`Filesystem error while reading [${this.path}]: ${err.message}`);
+			logger.error(`Filesystem error while reading [${this.path}]: ${err.message}`);
 			throw new Error('File operation failed');
 		}
 
 		/* check if the file-size changed mid operation */
 		if (this.data.byteLength != this.size) {
-			libLog.Error(`File size changed mid operation [${this.path}]: [${this.data.byteLength}] != [${this.size}]`);
+			logger.error(`File size changed mid operation [${this.path}]: [${this.data.byteLength}] != [${this.size}]`);
 			throw new Error('File operation failed');
 		}
 
@@ -231,7 +233,7 @@ export function SetCacheOptions(options: { cacheSize?: number, largestFile?: num
 		totalCacheCapacity = options.cacheSize;
 	if (options.largestFile != null && options.largestFile > 0)
 		maxLargestSize = options.largestFile;
-	libLog.Info(`Cache capacity set to: ${totalCacheCapacity} with largest objects: ${maxLargestSize}`);
+	logger.info(`Cache capacity set to: ${totalCacheCapacity} with largest objects: ${maxLargestSize}`);
 
 	/* check if the cache needs to be reduced */
 	if (totalCacheAllocated > totalCacheCapacity)
