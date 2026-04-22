@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 /* Copyright (c) 2024-2026 Bjoern Boss Henrichsen */
-import * as libServer from "./server.js";
+import { Config as libConfig } from "./config.js";
 import * as libTemplates from "./templates.js";
 import * as libLog from "./log.js";
 import * as libLocation from "./location.js";
@@ -119,7 +119,8 @@ export class ClientBase extends libLog.LogIdentity {
 enum ResponseState {
 	none,
 	acknowledged,
-	responded,
+	headerSent,
+	completed,
 	broken
 }
 
@@ -138,9 +139,11 @@ export abstract class IncomingBase extends ClientBase {
 	protected state: ResponseState;
 	protected outputHeaders: Record<string, string>;
 
+	/* write the given header and content out (no need to update state) */
 	protected abstract finalizeTextHeader(status: libRequest.StatusType, media: libRequest.MediaType, content: string): void;
-	protected abstract finishSelf(): Promise<void>;
-	protected abstract destroySelfIfIncomplete(): void;
+
+	/* finish handling the request (if ends on 'broken', must close the connection) */
+	protected abstract finishSelfHandling(): Promise<void>;
 
 	constructor(request: libHttp.IncomingMessage, host: string, protocol: string) {
 		super(new libUrl.URL(`${protocol}//${host == '' ? '_' : host}${request.url}`));
@@ -152,11 +155,15 @@ export abstract class IncomingBase extends ClientBase {
 		if (this.state == ResponseState.none || (exception && this.state == ResponseState.acknowledged)) {
 			this.log(`Responding with [${status.msg}]${logReason}`);
 			this.finalizeTextHeader(status, media, content);
-			this.state = ResponseState.responded;
+			this.state = ResponseState.completed;
 		}
 		else if (exception) {
-			this.error(`Broken with [${status.msg}]${logReason}`);
-			this.state = ResponseState.broken;
+			if (this.state == ResponseState.headerSent) {
+				this.error(`Broken with [${status.msg}]${logReason}`);
+				this.state = ResponseState.broken;
+			}
+			else
+				this.error(`Silently dropping exception [${status.msg}]${logReason}`);
 		}
 		else
 			throw new Error('Request has already been handled');
@@ -165,8 +172,11 @@ export abstract class IncomingBase extends ClientBase {
 	public get headers(): libHttp.IncomingHttpHeaders {
 		return this.request.headers;
 	}
-	public get handled(): boolean {
-		return (this.state != ResponseState.none);
+	public get unhandled(): boolean {
+		return (this.state == ResponseState.none);
+	}
+	public get completed(): boolean {
+		return (this.state == ResponseState.completed);
 	}
 	public get broken(): boolean {
 		return (this.state == ResponseState.broken);
@@ -182,15 +192,11 @@ export abstract class IncomingBase extends ClientBase {
 		this.outputHeaders[key] = value;
 	}
 
-	/* called by framework to finish this incoming object (sends queued content, not-found if unhandled, or internal-error if incomplete/failed) */
+	/* called by framework to finish this incoming object (sends queued content, not-found if unhandled, or internal-error if incomplete/broken) */
 	public async finishIncoming(): Promise<void> {
-		await this.finishSelf();
 		if (this.state == ResponseState.none)
-			this.respondNotFound();
-		else if (this.state == ResponseState.acknowledged)
-			this.respondInternalError('Request processing failed');
-		if (this.state == ResponseState.broken)
-			this.destroySelfIfIncomplete();
+			return this.respondNotFound();
+		await this.finishSelfHandling();
 	}
 
 	/* respond with [internal-error] and a pre-defined html template response (always considered an exception, clears any other header fields) */
@@ -227,6 +233,7 @@ export abstract class IncomingBase extends ClientBase {
 
 	/* respond with [range-not-satisfiable] and a pre-defined html template response */
 	public respondRangeIssue(range: string, size: number, options?: { exception?: boolean }): void {
+		this.outputHeaders['Content-Range'] = `bytes */${size}`;
 		const content = libTemplates.ErrorRangeIssue({ path: this.url.pathname, range, size });
 		const logReason = `because [${range}] cannot be satisfied for size [${size}]`;
 		this.constructTextResponse(libRequest.Status.RangeIssue, libRequest.Media.Html, content, logReason, options?.exception ?? false);
@@ -253,6 +260,7 @@ export abstract class IncomingBase extends ClientBase {
 
 	/* respond with [invalid-method] and a pre-defined html template response */
 	public respondMethodNotAllowed(method: string, allowed: string, options?: { exception?: boolean }): void {
+		this.outputHeaders['Allow'] = allowed;
 		const content = libTemplates.ErrorInvalidMethod({ path: this.url.pathname, method: method, allowed });
 		const logReason = ` because [${method}] was used and only [${allowed}] supported`;
 		this.constructTextResponse(libRequest.Status.MethodNotAllowed, libRequest.Media.Html, content, logReason, options?.exception ?? false);
@@ -266,22 +274,22 @@ export abstract class IncomingBase extends ClientBase {
 
 	/* respond with [see-other] to the given target and a pre-defined html template response (forces method GET) */
 	public respondSeeOther(target: string, options?: { exception?: boolean }): void {
-		const content = libTemplates.SeeOther({ destination: target });
 		this.outputHeaders['Location'] = target;
+		const content = libTemplates.SeeOther({ destination: target });
 		this.constructTextResponse(libRequest.Status.SeeOther, libRequest.Media.Html, content, ` to [${target}]`, options?.exception ?? false);
 	}
 
 	/* respond with [temporary-redirect] to the given target and a pre-defined html template response (preserves method) */
 	public respondTemporaryRedirect(target: string, options?: { exception?: boolean }): void {
-		const content = libTemplates.TemporaryRedirect({ path: this.url.pathname, destination: target });
 		this.outputHeaders['Location'] = target;
+		const content = libTemplates.TemporaryRedirect({ path: this.url.pathname, destination: target });
 		this.constructTextResponse(libRequest.Status.TemporaryRedirect, libRequest.Media.Html, content, ` to [${target}]`, options?.exception ?? false);
 	}
 
 	/* respond with [permanent-redirect] to the given target and a pre-defined html template response (preserves method)  */
 	public respondPermanentRedirect(target: string, options?: { exception?: boolean }): void {
-		const content = libTemplates.PermanentRedirect({ path: this.url.pathname, destination: target });
 		this.outputHeaders['Location'] = target;
+		const content = libTemplates.PermanentRedirect({ path: this.url.pathname, destination: target });
 		this.constructTextResponse(libRequest.Status.PermanentRedirect, libRequest.Media.Html, content, ` to [${target}]`, options?.exception ?? false);
 	}
 }
@@ -290,25 +298,24 @@ export abstract class IncomingBase extends ClientBase {
 *	Html response is sent once its content has been set and the modules have completed the processing
 *
 *	Receiving data: Will automatically decode the stream and ensure a given maximum is not passed
-*		=> Will drain upload if it is not being received or the request enters a failure state
+*		=> Will drain upload if it is not being received or the request enters a broken state
 *		=> Destroying receive reader will drain the remaining data
-*		=> Any errors while receiving will either auto-respond or send the connection into the failed state, and fail the receive reader (stream user does not need to respond)
+*		=> Any errors while receiving will either auto-respond or send the connection into the broken state, and fail the receive reader (stream user does not need to respond)
 *	Responding data: Will automatically encode the stream and send the header accordingly
 *		=> Will automatically determine if encoding is to be used
 *		=> Checks if promised number of bytes is provided
-*		=> Will automatically error, if the failed state is detected, and will auto-respond or send the connection into the failed state (stream user does not need to respond)
+*		=> Will automatically error, if the broken state is detected, and will auto-respond or send the connection into the broken state (stream user does not need to respond)
+*	Cleanup: request detects incomplete responses (headers committed but body never finished) and will auto-respond or send the connection into the broken state
 */
 export class HttpRequest extends IncomingBase {
 	private response: libHttp.ServerResponse;
 	private receiving: boolean;
-	private responding: Promise<void> | null;
 	private htmlResponse?: { page: libBuilder.HtmlPage, status: libRequest.StatusType };
 
 	constructor(request: libHttp.IncomingMessage, response: libHttp.ServerResponse, host: string, protocol: string) {
 		super(request, host, protocol);
 		this.response = response;
 		this.receiving = false;
-		this.responding = null;
 	}
 
 	protected override finalizeTextHeader(status: libRequest.StatusType, media: libRequest.MediaType, content: string): void {
@@ -323,38 +330,42 @@ export class HttpRequest extends IncomingBase {
 			this.outputHeaders['Vary'] = 'Accept-Encoding';
 		}
 
-		/* send the encoded data */
 		this.closeHeader(status, media, buffer.length, false);
 		this.response.end(buffer);
 	}
-	protected override destroySelfIfIncomplete(): void {
-		if (!this.response.writableEnded && !this.response.destroyed)
-			this.response.destroy();
-	}
-	protected override async finishSelf(): Promise<void> {
+	protected override async finishSelfHandling(): Promise<void> {
 		if (!this.receiving)
 			this.request.resume();
-		if (this.state != ResponseState.acknowledged)
-			return;
 
-		/* check if html has been queued and respond with it or await for the response header to be sent */
-		if (this.htmlResponse != null) {
+		/* check if html has been queued and respond with it */
+		if (this.state == ResponseState.acknowledged && this.htmlResponse != null) {
 			this.finalizeTextHeader(this.htmlResponse.status, libRequest.Media.Html, this.htmlResponse.page.finalize());
-			this.state = ResponseState.responded;
+			this.state = ResponseState.completed;
 		}
-		else if (this.responding != null)
-			await this.responding;
+
+		/* check if data were started but not completed or if data were promised but not provided */
+		if (this.state == ResponseState.headerSent)
+			this.respondInternalError('Response started but not completed');
+		if (this.state == ResponseState.acknowledged)
+			this.respondInternalError('Request processing failed');
+
+		/* check if the connection is considered broken, in which case the
+		*	data on it are not reliable anymore and it must be destroyed */
+		if (this.state != ResponseState.broken)
+			return;
+		this.request.destroy();
+		this.response.destroy();
 	}
 	private closeHeader(status: libRequest.StatusType, media: libRequest.MediaType, contentSize: number | null, updateState: boolean): void {
 		if (updateState)
-			this.state = ResponseState.responded;
+			this.state = ResponseState.headerSent;
 
 		/* setup the response status and headers */
 		this.response.statusCode = status.code;
 		this.response.statusMessage = status.msg;
 		for (const key in this.outputHeaders)
 			this.response.setHeader(key, this.outputHeaders[key]);
-		this.response.setHeader('Server', libServer.Config.serverName);
+		this.response.setHeader('Server', libConfig.serverName);
 		this.response.setHeader('Content-Type', libRequest.BuildMediaTypeIdentifier(media));
 		this.response.setHeader('Date', new Date().toUTCString());
 		if (!('Accept-Ranges' in this.outputHeaders))
@@ -451,10 +462,7 @@ export class HttpRequest extends IncomingBase {
 		if (this.response.destroyed)
 			throw new Error('Connection is broken');
 
-		/* setup the respond promise to notify the cleanup of when the header has been sent */
 		this.state = ResponseState.acknowledged;
-		let resolver: (() => void) | null = null;
-		this.responding = new Promise((resolve) => resolver = resolve);
 
 		/* setup the output stream to be written out */
 		const output = new libStream.Writable({
@@ -466,23 +474,20 @@ export class HttpRequest extends IncomingBase {
 			}
 		});
 
-		let stream: libStream.Writable = this.response, headerSent = false;
-		let dataCache: Buffer | null = null, totalSent = 0, closed = false;
+		let stream: libStream.Writable = this.response;
+		let dataCache: Buffer | null = null, totalSent = 0;
 		const handleData = (chunk: Buffer | null, cb: (err: any) => void) => {
 			if (output.destroyed) return cb(new Error('Already failed'));
 
 			/* check if the connection has been marked as failed or completed */
-			if (closed)
-				return cb(new Error('Responding to closed response'));
+			if (this.state == ResponseState.completed)
+				return cb(new Error('Responding to completed response'));
 			if (this.state == ResponseState.broken)
 				return cb(new Error('Connection is broken'));
 			const last = (chunk == null), cached = (dataCache != null);
 
 			/* check if the header still needs to be sent */
-			if (!headerSent) {
-				if (this.state != ResponseState.acknowledged)
-					return cb(new Error('Connection already responded to'));
-
+			if (this.state != ResponseState.headerSent) {
 				/* check if previous data were cached and combine them */
 				if (cached)
 					chunk = (chunk == null ? dataCache : Buffer.concat([dataCache!, chunk]));
@@ -533,8 +538,6 @@ export class HttpRequest extends IncomingBase {
 				/* send the final header away and write the content to the stream */
 				this.trace(`Sending content [${media.mediaType}] of size [${fullContentSize ?? 'unknown'}] encoded using [${encoder}]`);
 				this.closeHeader(status, media, fullContentSize, true);
-				headerSent = true;
-				resolver!();
 			}
 
 			/* update the total-sent counter and check if the upper-bound is broken */
@@ -549,34 +552,27 @@ export class HttpRequest extends IncomingBase {
 			/* check if this is an intermediate write, and write the data out */
 			if (!last)
 				return stream.write(chunk!, () => cb(null));
-			closed = true;
 
 			/* send the last package */
 			if (options.contentSize != null && totalSent < options.contentSize) {
 				this.respondInternalError('Response handling issue encountered');
 				return cb(new Error('Responded with too few data'));
 			}
+			this.state = ResponseState.completed;
 			if (chunk != null)
 				return stream.end(chunk, () => cb(null));
 			return stream.end(() => cb(null));
 		};
 
 		const handleFailure = () => {
-			/* check if the entire message has already been sent, in which case this will just be ignored */
-			if (closed)
+			if (this.state == ResponseState.completed)
 				return;
 
-			/* check if the output stream was an encoder, in which case it still needs to be destroyed */
+			/* check if the output stream was an encoder, in which case it still needs to
+			*	be destroyed (only if an error occurred and the response was not completed) */
 			if (stream !== this.response)
 				stream.destroy();
-
-			/* check if the response has not yet been sent */
-			if (this.state == ResponseState.acknowledged)
-				return this.respondInternalError('Response handling issue encountered');
-
-			/* check if data are still missing/the connection was not properly closed (will ensure the connection will be closed) */
-			if (this.state == ResponseState.responded && headerSent)
-				return this.respondInternalError('Response handling issue encountered');
+			this.respondInternalError('Response handling issue encountered');
 		};
 
 		/* register the network error handler to properly forward exceptions (no need to respond on network errors) */
@@ -647,7 +643,7 @@ export class HttpRequest extends IncomingBase {
 	/* send data with [media type] and [status] and return a writable stream (default status is ok)
 	*	if a content size is provided, stream expects exactly this amount of bytes
 	*	the encoding can be configured, if the data is pre-encoded (warning: no checks against accepted encodings performed!) */
-	public sendData(media: libRequest.MediaType = libRequest.Media.Unknown, options?: { status?: libRequest.StatusType, encoded?: string, contentSize?: number }): libStream.Writable {
+	public respondData(media: libRequest.MediaType = libRequest.Media.Unknown, options?: { status?: libRequest.StatusType, encoded?: string, contentSize?: number }): libStream.Writable {
 		const status: libRequest.StatusType = options?.status ?? libRequest.Status.Ok;
 		this.log(`Responding with data and status [${status.msg}]`);
 		return this.sendClientData(media, status, { encoded: options?.encoded, contentSize: options?.contentSize });
@@ -657,14 +653,12 @@ export class HttpRequest extends IncomingBase {
 	*	the media type can be overwritten (defaults to extracting media-type from the file-path)
 	*	the encoding can be configured, if the file is pre-encoded (warning: no checks against accepted encodings performed!)
 	*	status will be [Ok] or [partial-content] */
-	public tryRespondFile(filePath: string, options?: { encoded?: string, media?: libRequest.MediaType }): boolean {
+	public async tryRespondFile(filePath: string, options?: { encoded?: string, media?: libRequest.MediaType }): Promise<boolean> {
 		if (this.state != ResponseState.none)
 			throw new Error('Request has already been handled');
 
-		/* look for the file */
 		let cached: libCache.Cached | null = null;
 		try {
-			/* lookup the file in the cache */
 			cached = libCache.Get(filePath);
 			if (cached == null)
 				return false;
@@ -685,7 +679,6 @@ export class HttpRequest extends IncomingBase {
 			return true;
 		}
 		else if (range.state == libRequest.RangeState.issue) {
-			this.outputHeaders['Content-Range'] = `bytes */${cached.fileSize()}`;
 			this.respondRangeIssue(this.headers.range!, cached.fileSize(), { exception: true });
 			return true;
 		}
@@ -697,18 +690,18 @@ export class HttpRequest extends IncomingBase {
 			this.response.end();
 			return true;
 		}
-
-		/* create the stream for the file and add the range header */
-		let source: libStream.Readable = cached.stream({ start: range.first, end: range.last });
 		if (range.state == libRequest.RangeState.valid)
 			this.outputHeaders['Content-Range'] = `bytes ${range.first}-${range.last}/${cached.fileSize()}`;
 
-		/* create the writer stream and connect the components */
+		/* create the writer stream */
 		let stream: libStream.Writable | null = null;
 		try {
-			/* create the write stream for the content */
 			const status = (range.state == libRequest.RangeState.noRange ? libRequest.Status.Ok : libRequest.Status.PartialContent);
-			stream = this.sendClientData(media, status, { encoded: options?.encoded, contentSize: range.last - range.first + 1, noEncode: range.state != libRequest.RangeState.noRange });
+			stream = this.sendClientData(media, status, {
+				encoded: options?.encoded,
+				contentSize: range.last - range.first + 1,
+				noEncode: range.state != libRequest.RangeState.noRange
+			});
 			this.log(`Sending content [${range.first} - ${range.last}/${cached.fileSize()}] from [${filePath}]`);
 		}
 		catch (err: any) {
@@ -716,18 +709,24 @@ export class HttpRequest extends IncomingBase {
 			return true;
 		}
 
-		/* pipe the components together */
+		/* create the source stream of the file to read from */
+		let source: libStream.Readable = cached.stream({ start: range.first, end: range.last });
+
+		/* pipe the components together and await completion */
 		let closed = false;
-		source.pipe(stream);
-		source.on('error', (err: any) => {
-			if (closed) return; closed = true;
-			this.respondFileSystemError();
-			this.error(`Error while sending file [${filePath}]: [${err.message}]`);
-			stream.destroy(err);
-		});
-		stream.on('error', (err: any) => {
-			if (closed) return; closed = true;
-			source.destroy(err);
+		await new Promise<void>((resolve) => {
+			source.pipe(stream);
+			source.on('error', (err: any) => {
+				if (closed) return; closed = true;
+				this.respondFileSystemError();
+				this.error(`Error while sending file [${filePath}]: [${err.message}]`);
+				stream.destroy(err);
+			});
+			stream.on('error', (err: any) => {
+				if (closed) return; closed = true;
+				source.destroy(err);
+			});
+			stream.on('close', () => resolve());
 		});
 		return true;
 	}
@@ -784,7 +783,7 @@ export class HttpRequest extends IncomingBase {
 				return reject(err);
 			}
 
-			/* create the stream to the file to be written and setup the blumbing */
+			/* create the stream to the file to be written and setup the plumbing */
 			const destination = libFs.createWriteStream(path, { flags: 'wx' });
 			let fileFailed = false, sourceFailed = false, opened = false;
 			source.on('error', (err: any) => {
@@ -826,7 +825,7 @@ export class HttpRequest extends IncomingBase {
 }
 
 /*
-*	Will drain any uploaded data
+*	WebSocket upgrade requests, which were not accepted, will be closed after responding
 */
 export class HttpUpgrade extends IncomingBase {
 	private socket: libStream.Duplex;
@@ -842,14 +841,11 @@ export class HttpUpgrade extends IncomingBase {
 		const buffer = Buffer.from(content, 'utf-8');
 
 		this.outputHeaders['Date'] = new Date().toUTCString();
-		this.outputHeaders['Server'] = libServer.Config.serverName;
+		this.outputHeaders['Server'] = libConfig.serverName;
 		this.outputHeaders['Content-Type'] = libRequest.BuildMediaTypeIdentifier(media);
 		this.outputHeaders['Content-Length'] = buffer.byteLength.toString();
 		this.outputHeaders['Accept-Ranges'] = 'none';
-		if ((this.request.headers.connection ?? "").toLowerCase() != "close" && this.request.httpVersionMajor < 2) {
-			this.outputHeaders['Connection'] = 'keep-alive';
-			this.outputHeaders['Keep-Alive'] = 'timeout=5';
-		}
+		this.outputHeaders['Connection'] = 'close';
 
 		/* construct the entire header content and send it away */
 		let header = `HTTP/1.1 ${status.code} ${status.msg}\r\n`;
@@ -857,14 +853,24 @@ export class HttpUpgrade extends IncomingBase {
 			header += `${key}: ${this.outputHeaders[key]}\r\n`;
 		header += '\r\n';
 		this.socket.write(header, 'utf-8');
-		this.socket.write(buffer);
+		this.socket.end(buffer);
 	}
-	protected override async finishSelf(): Promise<void> {
-		this.request.resume();
-	}
-	protected override destroySelfIfIncomplete(): void {
-		if (!this.socket.destroyed)
+	protected override async finishSelfHandling(): Promise<void> {
+		/* check if the connection was accepted (only reason to keep it alive;
+		*	header-sent is only set by the accept web-socket method) */
+		if (this.state == ResponseState.headerSent)
+			return;
+		if (this.state != ResponseState.completed)
+			this.respondInternalError('Request processing failed');
+
+		if (this.socket.writableFinished) {
 			this.socket.destroy();
+			this.request.destroy();
+		}
+		else this.socket.on('finish', () => {
+			this.socket.destroy();
+			this.request.destroy();
+		});
 	}
 
 	/* marks the object as having been handled (returns false, if connection is not a valid websocket upgrade request) */
@@ -879,11 +885,19 @@ export class HttpUpgrade extends IncomingBase {
 		if (this.headers?.upgrade?.toLowerCase() != 'websocket' || this.request.method != 'GET')
 			return false;
 
-		this.state = ResponseState.responded;
+		this.state = ResponseState.headerSent;
 
+		/* perform the upgrade (will automatically send http error responses
+		*	and close the socket on errors in the upgrade process) */
+		this.trace(`Performing upgrade on web socket connection [${this.fullPath}]`);
 		WebSocketServerInstance.handleUpgrade(this.request, this.socket, this.head, (ws, request) => {
-			WebSocketServerInstance.emit('connection', ws, request);
-			cb(new ClientSocket(ws, this));
+			try {
+				WebSocketServerInstance.emit('connection', ws, request);
+				cb(new ClientSocket(ws, this));
+			} catch (err: any) {
+				this.error(`Unhandled exception while processing web socket accept: ${err.message}`);
+				ws.close();
+			}
 		});
 		return true;
 	}
@@ -939,7 +953,7 @@ export class ClientSocket extends ClientBase {
 		if (!this.isAlive)
 			return this.closeSelf();
 		this.isAlive = false;
-		this.aliveTimer = setTimeout(() => this.checkIsAlive(), libServer.Config.webSocketTimeout);
+		this.aliveTimer = setTimeout(() => this.checkIsAlive(), libConfig.webSocketTimeout);
 
 		/* try to ping the remote to check the liveliness */
 		try {
@@ -954,7 +968,7 @@ export class ClientSocket extends ClientBase {
 		this.isAlive = true;
 		if (this.aliveTimer != null)
 			clearTimeout(this.aliveTimer);
-		this.aliveTimer = setTimeout(() => this.checkIsAlive(), libServer.Config.webSocketTimeout);
+		this.aliveTimer = setTimeout(() => this.checkIsAlive(), libConfig.webSocketTimeout);
 	}
 	private closeSelf(): void {
 		if (this.ws.readyState != libWs.WebSocket.CLOSED)

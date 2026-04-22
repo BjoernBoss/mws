@@ -129,7 +129,7 @@ export class UnhandledModule implements ModuleInterface {
 		const cached = client.shiftLog(this.handler.name);
 
 		await this.handler.request(client);
-		if (!client.handled && this.requestLambda != null)
+		if (client.unhandled && this.requestLambda != null)
 			await this.requestLambda(client);
 
 		client.unshift(cached);
@@ -139,7 +139,7 @@ export class UnhandledModule implements ModuleInterface {
 		const cached = client.shiftLog(this.handler.name);
 
 		await this.handler.upgrade(client);
-		if (!client.handled && this.upgradeLambda != null)
+		if (client.unhandled && this.upgradeLambda != null)
 			await this.upgradeLambda(client);
 
 		client.unshift(cached);

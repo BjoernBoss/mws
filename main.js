@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 /* Copyright (c) 2024-2026 Bjoern Boss Henrichsen */
+import * as libConfig from "core/config.js";
 import * as libServer from "core/server.js";
 import * as libLog from "core/log.js";
-import * as libCache from "core/cache.js";
 
 const logger = libLog.Logger('main');
 
@@ -25,8 +25,7 @@ async function Setup(setupModule) {
 }
 
 /* initialize the default configuration (before loading the local module!) */
-libServer.Initialize();
-libCache.Initialize();
+libConfig.Initialize();
 
 /* try to load the local configuration and otherwise perform the default-setup */
 import("./modules/setup.js")

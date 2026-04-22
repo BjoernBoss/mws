@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 /* Copyright (c) 2026 Bjoern Boss Henrichsen */
+import { Config as libConfig } from "./config.js";
 import * as libLog from "./log.js";
 import * as libFs from "fs";
 import * as libStream from "stream";
@@ -12,48 +13,99 @@ interface CacheEntry {
 	touched: number;
 	persistent: boolean;
 }
-const cacheMap: Record<string, CacheEntry> = {};
-let nextTouchStamp: number = 0, totalCacheAllocated: number = 0, totalCacheCapacity: number = 0, maxLargestSize: number = 0;
+class CacheManager {
+	private cacheMap: Record<string, CacheEntry> = {};
+	private nextStamp: number = 0;
+	private allocated: number = 0;
+	private totalCapacity: number = 0;
+	private largestSize: number = 0;
 
-function CacheAdd(path: string, data: Buffer, mtime: number, persistent: boolean): void {
-	if (data.byteLength > totalCacheCapacity || data.byteLength > maxLargestSize)
-		return;
+	public constructor() {
+		this.totalCapacity = libConfig.cacheSize;
+		this.largestSize = libConfig.cacheFileSizeLimit;
+		libConfig.subscribe(() => this.applyConfig());
+	}
 
-	/* check if the entry is already part of the cache */
-	if (path in cacheMap) {
-		const entry = cacheMap[path];
-		if (entry.mtime >= mtime)
+	private applyConfig(): void {
+		this.totalCapacity = Math.max(libConfig.cacheSize, 0);
+		this.largestSize = Math.max(libConfig.cacheFileSizeLimit, 0);
+
+		/* check if the cache needs to be reduced */
+		if (this.allocated > this.totalCapacity)
+			this.reduce(this.allocated - this.totalCapacity);
+	}
+	private reduce(capacity: number): void {
+		/* create the list of all cached objects sorted by the touched count */
+		const paths: string[] = Object.keys(this.cacheMap).sort((a, b) => this.cacheMap[a].touched - this.cacheMap[b].touched);
+
+		/* drop the first half of the entries or more, if the size has not yet been freed (valid as callers
+		*	guarantee capacity <= allocated, thus the capacity will reach <= 0 before i overflows the paths) */
+		for (let i = 0; i < (paths.length + 1) / 2 || capacity > 0; ++i) {
+			capacity -= this.cacheMap[paths[i]].data.byteLength;
+			this.drop(paths[i]);
+		}
+	}
+
+	public add(path: string, data: Buffer, mtime: number, persistent: boolean): void {
+		if (!this.cacheable(data.byteLength))
 			return;
-		CacheDrop(path);
+
+		/* check if the entry is already part of the cache */
+		if (path in this.cacheMap) {
+			const entry = this.cacheMap[path];
+			if (entry.mtime >= mtime)
+				return;
+			this.drop(path);
+		}
+
+		/* check if space needs to be reserved */
+		if (this.allocated + data.byteLength > this.totalCapacity)
+			this.reduce(this.allocated + data.byteLength - this.totalCapacity);
+
+		/* add the entry to the cache */
+		logger.log(`Added [${path}] to the cache`);
+		this.allocated += data.byteLength;
+		this.cacheMap[path] = { data: data, mtime: mtime, touched: ++this.nextStamp, persistent };
 	}
+	public drop(path: string): void {
+		if (!(path in this.cacheMap))
+			return;
+		logger.log(`Dropped [${path}] from the cache`);
+		this.allocated -= this.cacheMap[path].data.byteLength;
+		delete this.cacheMap[path];
+	}
+	public cacheable(size: number): boolean {
+		return (size <= this.largestSize && size <= this.totalCapacity);
+	}
+	public findPersistent(path: string): CacheEntry | null {
+		const entry = this.cacheMap[path] ?? null;
+		if (entry == null)
+			return null;
 
-	/* check if space needs to be reserved */
-	if (totalCacheAllocated + data.byteLength > totalCacheCapacity)
-		CacheReduce(totalCacheAllocated + data.byteLength - totalCacheCapacity);
+		if (entry.persistent) {
+			entry.touched = ++this.nextStamp;
+			return entry;
+		}
+		return null;
+	}
+	public find(path: string, mtime: number, size: number): CacheEntry | null {
+		const entry = this.cacheMap[path] ?? null;
+		if (entry == null)
+			return null;
 
-	/* add the entry to the cache */
-	logger.log(`Added [${path}] to the cache`);
-	totalCacheAllocated += data.byteLength;
-	cacheMap[path] = { data: data, mtime: mtime, touched: ++nextTouchStamp, persistent };
-}
-function CacheReduce(capacity: number): void {
-	/* create the list of all cached objects sorted by the touched count */
-	const paths: string[] = Object.keys(cacheMap).sort((a, b) => cacheMap[a].touched - cacheMap[b].touched);
+		/* validate that the entry is still up-to-date and return it */
+		if (entry.mtime == mtime && entry.data.length == size) {
+			entry.touched = ++this.nextStamp;
+			return entry;
+		}
 
-	/* drop the first half of the entries or more, if the size has not yet been freed (valid as callers guarantee
-	*	capacity <= totalCacheAllocated, thus the capacity will reach <= 0 before i overflows the paths) */
-	for (let i = 0; i < (paths.length + 1) / 2 || capacity > 0; ++i) {
-		capacity -= cacheMap[paths[i]].data.byteLength;
-		CacheDrop(paths[i]);
+		/* remove the entry as it seems to be outdated */
+		this.drop(path);
+		return null;
 	}
 }
-function CacheDrop(path: string): void {
-	if (!(path in cacheMap))
-		return;
-	logger.log(`Dropped [${path}] from the cache`);
-	totalCacheAllocated -= cacheMap[path].data.byteLength;
-	delete cacheMap[path];
-}
+const cacheManager: CacheManager = new CacheManager();
+
 
 export class Cached {
 	private path: string;
@@ -84,7 +136,7 @@ export class Cached {
 		}
 
 		/* check if only a partial file is being read, or it is too large, in which case it will not be added to the cache */
-		if (this.size > maxLargestSize || this.size > totalCacheCapacity || (options?.start != null && options.start != 0) || (options?.end != null && options.end + 1 != this.size))
+		if (!cacheManager.cacheable(this.size) || (options?.start != null && options.start != 0) || (options?.end != null && options.end + 1 != this.size))
 			return stream;
 
 		/* create the transformer stream to cache the data */
@@ -98,8 +150,8 @@ export class Cached {
 			},
 			final: (cb) => {
 				if (failed) return;
-				if (totalLength == this.size && this.size <= maxLargestSize && this.size <= totalCacheCapacity)
-					CacheAdd(this.path, Buffer.concat(buffers), this.mtime, this.persistent);
+				if (totalLength == this.size && cacheManager.cacheable(this.size))
+					cacheManager.add(this.path, Buffer.concat(buffers), this.mtime, this.persistent);
 				cb(null);
 			}
 		});
@@ -133,31 +185,21 @@ export class Cached {
 
 	/* [persistent]: if cached, dont check if the underlying file has changed since caching */
 	public static make(path: string, options?: { persistent?: boolean }): Cached | null {
-		/* check if the entry is marked as persistent and already in the cache, in which case the file doesn't even need to be checked */
-		if (options?.persistent === true && cacheMap[path]?.persistent === true) {
-			const entry = cacheMap[path];
-			entry.touched = ++nextTouchStamp;
+		/* check if the entry is marked as persistent and already in the
+		*	cache, in which case the file doesn't even need to be checked */
+		let entry = (options?.persistent === true ? cacheManager.findPersistent(path) : null);
+		if (entry != null)
 			return new Cached(path, entry.data.byteLength, entry.data, entry.mtime, entry.persistent);
-		}
 
 		/* check if the file exists and read its stats */
 		const [fileSize, mtime] = Cached.checkStats(path);
 		if (fileSize == null)
 			return null;
 
-		/* check if the entry is cached */
-		if (path in cacheMap) {
-			const entry = cacheMap[path];
-
-			/* validate that the entry is still up-to-date and return it */
-			if (entry.mtime == mtime && entry.data.length == fileSize) {
-				entry.touched = ++nextTouchStamp;
-				return new Cached(path, fileSize, entry.data, mtime, options?.persistent ?? false);
-			}
-
-			/* remove the entry as it seems to be outdated */
-			CacheDrop(path);
-		}
+		/* check if the path exists as non-persistent in the cache and otherwise return the uncached entry */
+		entry = cacheManager.find(path, mtime, fileSize);
+		if (entry != null)
+			return new Cached(path, fileSize, entry.data, mtime, options?.persistent ?? false);
 		return new Cached(path, fileSize, null, mtime, options?.persistent ?? false);
 	}
 
@@ -192,8 +234,7 @@ export class Cached {
 
 		/* add the read buffer back to the cache (using the fetched data from before
 		*	reading the file - to detect a file-change since before reading the file) */
-		if (this.size <= maxLargestSize && this.size <= totalCacheCapacity)
-			CacheAdd(this.path, this.data, this.mtime, this.persistent);
+		cacheManager.add(this.path, this.data, this.mtime, this.persistent);
 		return this.data;
 	}
 
@@ -227,20 +268,4 @@ export class Cached {
 
 export function Get(path: string, options?: { persistent?: boolean }): Cached | null {
 	return Cached.make(path, options);
-}
-export function SetCacheOptions(options: { cacheSize?: number, largestFile?: number }): void {
-	if (options.cacheSize != null && options.cacheSize > 0)
-		totalCacheCapacity = options.cacheSize;
-	if (options.largestFile != null && options.largestFile > 0)
-		maxLargestSize = options.largestFile;
-	logger.info(`Cache capacity set to: ${totalCacheCapacity} with largest objects: ${maxLargestSize}`);
-
-	/* check if the cache needs to be reduced */
-	if (totalCacheAllocated > totalCacheCapacity)
-		CacheReduce(totalCacheAllocated - totalCacheCapacity);
-}
-
-/* initialize the default configuration */
-export function Initialize(): void {
-	SetCacheOptions({ cacheSize: 50_000_000, largestFile: 10_000_000 });
 }

@@ -85,7 +85,7 @@ export function MakeLocation(path: string): (path: string) => string {
 	};
 }
 
-/* create path-creator, which returns paths within the module base path and optionally the nested path [path] */
+/* create path-creator, which returns paths relative to the file url path (like the script itself using 'import.meta.url') and optionally the nested path [path] */
 export function MakeSelfPath(urlFilePath: string, path: string | null = null): (path: string) => string {
 	let dirName = libPath.dirname(libUrl.fileURLToPath(urlFilePath));
 	if (path != null)
