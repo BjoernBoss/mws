@@ -38,7 +38,7 @@ export class Server {
 		let client = null;
 		try {
 			/* setup the client object */
-			const rawHostName = (request.headers.host ?? '_').toLowerCase();
+			const rawHostName = (request.headers.host ?? '').toLowerCase();
 			client = establish(rawHostName);
 			client.info(`${wasRequest ? 'Request' : 'Upgrade'}:${port} from [${request.socket.remoteAddress}]:${request.socket.remotePort} to [${request.headers.host}]:[${request.url}] (user-agent: [${request.headers['user-agent'] ?? ''}])`);
 
@@ -75,14 +75,14 @@ export class Server {
 		else
 			request.resume();
 	}
-	private handleRequest(request: libHttp.IncomingMessage, response: libHttp.ServerResponse, check: libInterface.CheckHost, handler: libInterface.ModuleInterface, port: number): void {
+	private handleRequest(request: libHttp.IncomingMessage, response: libHttp.ServerResponse, check: libInterface.CheckHost, handler: libInterface.ModuleInterface, port: number, secure: boolean): void {
 		this.handleWrapper(true, request, check, handler, port, function (host: string): libClient.HttpRequest {
-			return new libClient.HttpRequest(request, response, host);
+			return new libClient.HttpRequest(request, response, host, (secure ? 'https:' : 'http:'));
 		});
 	}
-	private handleUpgrade(request: libHttp.IncomingMessage, socket: libStream.Duplex, head: Buffer, check: libInterface.CheckHost, handler: libInterface.ModuleInterface, port: number): void {
+	private handleUpgrade(request: libHttp.IncomingMessage, socket: libStream.Duplex, head: Buffer, check: libInterface.CheckHost, handler: libInterface.ModuleInterface, port: number, secure: boolean): void {
 		this.handleWrapper(false, request, check, handler, port, function (host: string): libClient.HttpUpgrade {
-			return new libClient.HttpUpgrade(request, socket, head, host);
+			return new libClient.HttpUpgrade(request, socket, head, host, (secure ? 'https:' : 'http:'));
 		});
 	}
 
@@ -94,9 +94,9 @@ export class Server {
 			};
 
 			/* start the actual server */
-			const server = libHttp.createServer(config, (req, resp) => this.handleRequest(req, resp, checkHost, handler, port)).listen(port);
+			const server = libHttp.createServer(config, (req, resp) => this.handleRequest(req, resp, checkHost, handler, port, false)).listen(port);
 			server.on('error', (err) => libLog.Error(`While listening to port ${port} using http: ${err}`));
-			server.on('upgrade', (req, sock, head) => this.handleUpgrade(req, sock, head, checkHost, handler, port));
+			server.on('upgrade', (req, sock, head) => this.handleUpgrade(req, sock, head, checkHost, handler, port, false));
 			if (!server.listening)
 				return;
 
@@ -120,9 +120,9 @@ export class Server {
 			};
 
 			/* start the actual server */
-			const server = libHttps.createServer(config, (req, resp) => this.handleRequest(req, resp, checkHost, handler, port)).listen(port);
+			const server = libHttps.createServer(config, (req, resp) => this.handleRequest(req, resp, checkHost, handler, port, true)).listen(port);
 			server.on('error', (err) => libLog.Error(`While listening to port ${port} using https: ${err}`));
-			server.on('upgrade', (req, sock, head) => this.handleUpgrade(req, sock, head, checkHost, handler, port));
+			server.on('upgrade', (req, sock, head) => this.handleUpgrade(req, sock, head, checkHost, handler, port, true));
 			if (!server.listening)
 				return;
 

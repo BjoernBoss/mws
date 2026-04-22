@@ -121,8 +121,8 @@ export abstract class IncomingBase extends ClientBase {
 	protected abstract finishSelf(): Promise<void>;
 	protected abstract destroySelfIfIncomplete(): void;
 
-	constructor(request: libHttp.IncomingMessage, host: string) {
-		super(new libUrl.URL(`http://${host}${request.url}`));
+	constructor(request: libHttp.IncomingMessage, host: string, protocol: string) {
+		super(new libUrl.URL(`${protocol}//${host == '' ? '_' : host}${request.url}`));
 		this.request = request;
 		this.state = ResponseState.none;
 		this.outputHeaders = {};
@@ -283,8 +283,8 @@ export class HttpRequest extends IncomingBase {
 	private responding: Promise<void> | null;
 	private htmlResponse?: { page: libBuilder.HtmlPage, status: libRequest.StatusType };
 
-	constructor(request: libHttp.IncomingMessage, response: libHttp.ServerResponse, host: string) {
-		super(request, host);
+	constructor(request: libHttp.IncomingMessage, response: libHttp.ServerResponse, host: string, protocol: string) {
+		super(request, host, protocol);
 		this.response = response;
 		this.receiving = false;
 		this.responding = null;
@@ -810,8 +810,8 @@ export class HttpUpgrade extends IncomingBase {
 	private socket: libStream.Duplex;
 	private head: Buffer;
 
-	constructor(request: libHttp.IncomingMessage, socket: libStream.Duplex, head: Buffer, host: string) {
-		super(request, host);
+	constructor(request: libHttp.IncomingMessage, socket: libStream.Duplex, head: Buffer, host: string, protocol: string) {
+		super(request, host, protocol);
 		this.socket = socket;
 		this.head = head;
 	}
