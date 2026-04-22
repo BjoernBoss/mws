@@ -12,16 +12,36 @@ import * as libNet from "net";
 
 const logger = libLog.Logger('server');
 
-let serverName = '';
-export function SetServerName(name: string): void {
-	serverName = name;
-	logger.info(`Server name configured as: [${serverName}]`);
+export class ServerConfig {
+	private _serverName: string;
+	private _webSocketTimeout: number;
+
+	constructor() {
+		this._serverName = '';
+		this._webSocketTimeout = 0;
+	}
+
+	public get serverName(): string { return this._serverName }
+	public get webSocketTimeout(): number { return this._webSocketTimeout }
+
+	public set serverName(value: string) {
+		this._serverName = value;
+		logger.info(`Server name set to [${this._serverName}]`);
+	}
+	public set webSocketTimeout(value: number) {
+		this._webSocketTimeout = value;
+		logger.info(`WebSocket timeout set to [${this._webSocketTimeout}]`);
+	}
 }
-export function GetServerName(): string {
-	return serverName;
-}
+
+/*
+*	Server wide configurations
+*/
+export const Config: ServerConfig = new ServerConfig();
+
 export function Initialize(): void {
-	SetServerName('modular-web-server');
+	Config.serverName = 'modular-web-server';
+	Config.webSocketTimeout = 60_000;
 }
 
 export class Server {

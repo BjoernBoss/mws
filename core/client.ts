@@ -317,7 +317,7 @@ export class HttpRequest extends IncomingBase {
 		/* check if the data should be encoded */
 		const encoding = libRequest.EncodingOption(this.headers['accept-encoding'] ?? null, buffer.byteLength, media);
 		if (encoding != null) {
-			this.log(`Sending content [${media.mediaType}] of size [${buffer.byteLength}] encoded using [${encoding.name}]`);
+			this.trace(`Sending content [${media.mediaType}] of size [${buffer.byteLength}] encoded using [${encoding.name}]`);
 			buffer = encoding.encodeBuffer(buffer);
 			this.outputHeaders['Content-Encoding'] = encoding.name;
 			this.outputHeaders['Vary'] = 'Accept-Encoding';
@@ -354,7 +354,7 @@ export class HttpRequest extends IncomingBase {
 		this.response.statusMessage = status.msg;
 		for (const key in this.outputHeaders)
 			this.response.setHeader(key, this.outputHeaders[key]);
-		this.response.setHeader('Server', libServer.GetServerName());
+		this.response.setHeader('Server', libServer.Config.serverName);
 		this.response.setHeader('Content-Type', libRequest.BuildMediaTypeIdentifier(media));
 		this.response.setHeader('Date', new Date().toUTCString());
 		if (!('Accept-Ranges' in this.outputHeaders))
@@ -448,7 +448,6 @@ export class HttpRequest extends IncomingBase {
 		/* check if the object is already responded */
 		if (this.state != ResponseState.none)
 			throw new Error('Request has already been handled');
-		this.log(`Responding with data and status [${status.msg}]`);
 		if (this.response.destroyed)
 			throw new Error('Connection is broken');
 
@@ -532,7 +531,7 @@ export class HttpRequest extends IncomingBase {
 				}
 
 				/* send the final header away and write the content to the stream */
-				this.log(`Sending content [${media.mediaType}] of size [${fullContentSize ?? 'unknown'}] encoded using [${encoder}]`);
+				this.trace(`Sending content [${media.mediaType}] of size [${fullContentSize ?? 'unknown'}] encoded using [${encoder}]`);
 				this.closeHeader(status, media, fullContentSize, true);
 				headerSent = true;
 				resolver!();
@@ -640,7 +639,7 @@ export class HttpRequest extends IncomingBase {
 		if (this.state != ResponseState.none)
 			throw new Error('Request has already been handled');
 
-		this.log(`Responding with HTML content and status [${status.code}]`);
+		this.log(`Responding with HTML content and status [${status.msg}]`);
 		this.state = ResponseState.acknowledged;
 		this.htmlResponse = { page, status };
 	}
@@ -649,7 +648,9 @@ export class HttpRequest extends IncomingBase {
 	*	if a content size is provided, stream expects exactly this amount of bytes
 	*	the encoding can be configured, if the data is pre-encoded (warning: no checks against accepted encodings performed!) */
 	public sendData(media: libRequest.MediaType = libRequest.Media.Unknown, options?: { status?: libRequest.StatusType, encoded?: string, contentSize?: number }): libStream.Writable {
-		return this.sendClientData(media, options?.status ?? libRequest.Status.Ok, { encoded: options?.encoded, contentSize: options?.contentSize });
+		const status: libRequest.StatusType = options?.status ?? libRequest.Status.Ok;
+		this.log(`Responding with data and status [${status.msg}]`);
+		return this.sendClientData(media, status, { encoded: options?.encoded, contentSize: options?.contentSize });
 	}
 
 	/* try to respond with the given file, and return false, if not found (http-range aware)
@@ -773,7 +774,7 @@ export class HttpRequest extends IncomingBase {
 	*	if the file already exists and delete the file if it could not be received in full
 	*	automatically responds with given exceptions if the payload cannot be received properly or file operations fail */
 	public receiveToFile(path: string, maxLength: number | null): Promise<void> {
-		this.log(`Collecting data from [${this.url.pathname}] to: [${path}]`);
+		this.trace(`Collecting data from [${this.url.pathname}] to: [${path}]`);
 		return new Promise((resolve, reject) => {
 			let source: libStream.Readable | null = null;
 			try {
@@ -841,7 +842,7 @@ export class HttpUpgrade extends IncomingBase {
 		const buffer = Buffer.from(content, 'utf-8');
 
 		this.outputHeaders['Date'] = new Date().toUTCString();
-		this.outputHeaders['Server'] = libServer.GetServerName();
+		this.outputHeaders['Server'] = libServer.Config.serverName;
 		this.outputHeaders['Content-Type'] = libRequest.BuildMediaTypeIdentifier(media);
 		this.outputHeaders['Content-Length'] = buffer.byteLength.toString();
 		this.outputHeaders['Accept-Ranges'] = 'none';
@@ -888,55 +889,87 @@ export class HttpUpgrade extends IncomingBase {
 	}
 }
 
+/*
+*	WebSocket with integrated alive checks
+*/
 export class ClientSocket extends ClientBase {
 	private ws: libWs.WebSocket;
+	private aliveTimer: null | NodeJS.Timeout;
+	private isAlive: boolean;
 
-	public onpong?: () => void;
 	public ondata?: (data: libWs.RawData, isBinary: boolean) => void;
 	public onclose?: () => void;
 
 	constructor(ws: libWs.WebSocket, base: HttpUpgrade) {
 		super(base);
 		this.ws = ws;
+		this.aliveTimer = null;
+		this.isAlive = true;
 
+		this.ws.on('pong', () => {
+			this.trace(`Alive check pong received`);
+			this.selfIsAlive();
+		});
 		this.ws.on('message', (data, isBinary) => {
+			this.selfIsAlive();
 			if (this.ondata != null)
 				this.ondata(data, isBinary);
 		});
 		this.ws.on('close', () => {
+			if (this.aliveTimer != null)
+				clearTimeout(this.aliveTimer);
+			this.aliveTimer = null;
+
 			if (this.onclose != null)
 				this.onclose();
 		});
-		this.ws.on('pong', () => {
-			if (this.onpong != null)
-				this.onpong();
-		});
 		this.ws.on('error', (err: any) => {
 			this.error(`WebSocket error: ${err.message}`);
-			if (this.ws.readyState != libWs.WebSocket.CLOSED)
-				this.ws.close();
+			this.closeSelf();
 		});
+
+		/* start the first alive check */
+		this.selfIsAlive();
 	}
 
-	public ping(): void {
+	private checkIsAlive(): void {
+		this.aliveTimer = null;
+
+		/* cycle through the alive state and check again */
+		if (!this.isAlive)
+			return this.closeSelf();
+		this.isAlive = false;
+		this.aliveTimer = setTimeout(() => this.checkIsAlive(), libServer.Config.webSocketTimeout);
+
+		/* try to ping the remote to check the liveliness */
 		try {
+			this.trace(`Sending ping to determine if connection is alive`);
 			this.ws.ping();
 		} catch (err: any) {
 			this.error(`WebSocket error while pinging: ${err.message}`);
-			if (this.ws.readyState != libWs.WebSocket.CLOSED)
-				this.ws.close();
+			this.closeSelf();
 		}
 	}
+	private selfIsAlive(): void {
+		this.isAlive = true;
+		if (this.aliveTimer != null)
+			clearTimeout(this.aliveTimer);
+		this.aliveTimer = setTimeout(() => this.checkIsAlive(), libServer.Config.webSocketTimeout);
+	}
+	private closeSelf(): void {
+		if (this.ws.readyState != libWs.WebSocket.CLOSED)
+			this.ws.close();
+	}
+
 	public send(data: string | Buffer): void {
 		try {
 			this.ws.send(data);
 		} catch (err: any) {
 			this.error(`WebSocket error while sending data: ${err.message}`);
-			if (this.ws.readyState != libWs.WebSocket.CLOSED)
-				this.ws.close();
+			this.closeSelf();
 		}
 	}
 	public close(): void {
-		this.ws.close();
+		this.closeSelf();
 	}
 }
