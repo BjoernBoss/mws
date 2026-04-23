@@ -14,7 +14,7 @@ import * as libNet from "net";
 const logger = libLog.Logger('server');
 
 export class Server {
-	private stopList: (() => Promise<void>)[];
+	private stopList: ((forceShutdown: boolean) => Promise<void>)[];
 
 	constructor() {
 		logger.info(`Server object created`);
@@ -79,8 +79,8 @@ export class Server {
 	private applyConfig(server: libHttp.Server | libHttps.Server): void {
 		if (libConfig.requestTimeout > 0)
 			server.requestTimeout = libConfig.requestTimeout;
-		if (libConfig.responseTimeout > 0)
-			server.timeout = libConfig.responseTimeout;
+		if (libConfig.connectionTimeout > 0)
+			server.timeout = libConfig.connectionTimeout;
 		if (libConfig.keepAliveTimeout > 0)
 			server.keepAliveTimeout = libConfig.keepAliveTimeout;
 	}
@@ -105,8 +105,12 @@ export class Server {
 			libConfig.subscribe(updateTimeouts);
 
 			/* register the stop-function */
-			this.stopList.push(() => new Promise((resolve) => {
+			this.stopList.push((forceShutdown: boolean) => new Promise((resolve) => {
 				libConfig.unsubscribe(updateTimeouts);
+				if (forceShutdown)
+					server.closeAllConnections();
+				else
+					server.closeIdleConnections();
 				server.close(() => resolve());
 			}));
 
@@ -139,8 +143,12 @@ export class Server {
 			libConfig.subscribe(updateTimeouts);
 
 			/* register the stop-function */
-			this.stopList.push(() => new Promise((resolve) => {
+			this.stopList.push((forceShutdown: boolean) => new Promise((resolve) => {
 				libConfig.unsubscribe(updateTimeouts);
+				if (forceShutdown)
+					server.closeAllConnections();
+				else
+					server.closeIdleConnections();
 				server.close(() => resolve());
 			}));
 
@@ -151,8 +159,10 @@ export class Server {
 			logger.error(`While listening to port ${port} using https: ${err}`);
 		}
 	}
-	public async stop(): Promise<void> {
+
+	/* force-shutdown kills all currently open and used connections */
+	public async stop(forceShutdown: boolean): Promise<void> {
 		for (const cb of this.stopList)
-			await cb();
+			await cb(forceShutdown);
 	}
 }

@@ -699,14 +699,16 @@ export class HttpRequest extends IncomingBase {
 		return true;
 	}
 
-	/* respond with html, can be built on by parent modules, sent once the client has been fully processed */
-	public respondHtml(page: libBuilder.HtmlPage | null, status: libRequest.StatusType): libBuilder.HtmlPage {
+	/* respond with html, can be built on by parent modules, sent once the client has been fully processed
+	*	(if no initial page is provided, creates an empty new page, default status is ok) */
+	public respondHtml(page?: libBuilder.HtmlPage | null, status?: libRequest.StatusType): libBuilder.HtmlPage {
 		if (this.state != ResponseState.none)
 			throw new Error('Request has already been handled');
-
-		this.log(`Responding with HTML content and status [${status.msg}]`);
 		this.state = ResponseState.acknowledged;
-		this.htmlResponse = { page: page ?? new libBuilder.HtmlPage(), status, lightBuild: false };
+
+		const actualStatus = (status ?? libRequest.Status.Ok);
+		this.log(`Responding with HTML content and status [${actualStatus.msg}]`);
+		this.htmlResponse = { page: page ?? new libBuilder.HtmlPage(), status: actualStatus, lightBuild: false };
 		return this.htmlResponse.page;
 	}
 

@@ -9,7 +9,7 @@ export class CoreConfig {
 	private _serverName: string = '';
 	private _webSocketTimeout: number = 0;
 	private _requestTimeout: number = 0;
-	private _responseTimeout: number = 0;
+	private _connectionTimeout: number = 0;
 	private _keepAliveTimeout: number = 0;
 	private _cacheSize: number = 0;
 	private _cacheFileSizeLimit: number = 0;
@@ -56,13 +56,13 @@ export class CoreConfig {
 		this.notifyAll();
 	}
 
-	public get responseTimeout(): number { return this._responseTimeout }
-	public set responseTimeout(value: number) {
-		if (this._responseTimeout == value)
+	public get connectionTimeout(): number { return this._connectionTimeout }
+	public set connectionTimeout(value: number) {
+		if (this._connectionTimeout == value)
 			return;
 
-		this._responseTimeout = value;
-		logger.info(`Response timeout set to [${this._responseTimeout}]`);
+		this._connectionTimeout = value;
+		logger.info(`Connection timeout set to [${this._connectionTimeout}]`);
 		this.notifyAll();
 	}
 
@@ -109,7 +109,7 @@ export function Initialize(): void {
 	Config.serverName = 'modular-web-server';
 	Config.webSocketTimeout = 60_000;
 	Config.requestTimeout = 120_000;
-	Config.responseTimeout = 300_000;
+	Config.connectionTimeout = 300_000;
 	Config.keepAliveTimeout = 10_000;
 	Config.cacheSize = 50_000_000;
 	Config.cacheFileSizeLimit = 10_000_000;
