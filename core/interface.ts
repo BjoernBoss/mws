@@ -36,9 +36,9 @@ export class LambdaModule implements ModuleInterface {
 	private upgradeLambda?: UpgradeLambda;
 
 	public name: string = 'lambda';
-	constructor(request?: RequestLambda, upgrade?: UpgradeLambda) {
-		this.requestLambda = request;
-		this.upgradeLambda = upgrade;
+	constructor(options?: { request?: RequestLambda, upgrade?: UpgradeLambda }) {
+		this.requestLambda = options?.request;
+		this.upgradeLambda = options?.upgrade;
 	}
 
 	public async request(client: libClient.HttpRequest): Promise<void> {
@@ -118,11 +118,11 @@ export class UnhandledModule implements ModuleInterface {
 	private upgradeLambda?: UpgradeLambda;
 
 	public name: string = 'unhandler';
-	constructor(handler: ModuleInterface, request?: RequestLambda, upgrade?: UpgradeLambda) {
+	constructor(handler: ModuleInterface, options?: { request?: RequestLambda, upgrade?: UpgradeLambda }) {
 		this.handler = handler;
 		libLog.Logger(this.name).info(`Binding [/] to child [${handler.name}]`);
-		this.requestLambda = request;
-		this.upgradeLambda = upgrade;
+		this.requestLambda = options?.request;
+		this.upgradeLambda = options?.upgrade;
 	}
 
 	public async request(client: libClient.HttpRequest): Promise<void> {
@@ -155,11 +155,11 @@ export class WrapModule implements ModuleInterface {
 	private upgradeWrap?: UpgradeWrap;
 
 	public name: string = 'wrap';
-	constructor(handler: ModuleInterface, request?: RequestWrap, upgrade?: UpgradeWrap) {
+	constructor(handler: ModuleInterface, options?: { request?: RequestWrap, upgrade?: UpgradeWrap }) {
 		this.handler = handler;
 		libLog.Logger(this.name).info(`Binding [/] to child [${handler.name}]`);
-		this.requestWrap = request;
-		this.upgradeWrap = upgrade;
+		this.requestWrap = options?.request;
+		this.upgradeWrap = options?.upgrade;
 	}
 
 	public async request(client: libClient.HttpRequest): Promise<void> {
