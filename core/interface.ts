@@ -94,18 +94,18 @@ export class DispatchModule implements ModuleInterface {
 		if (match == null)
 			return;
 
-		const cached = client.translate(match[1], match[0].name)!;
+		const snapshot = client.translate(match[1], match[0].name)!;
 		await match[0].request(client);
-		client.unshift(cached);
+		client.restore(snapshot);
 	}
 	public async upgrade(client: libClient.HttpUpgrade): Promise<void> {
 		const match = this.dispatch(client);
 		if (match == null)
 			return;
 
-		const cached = client.translate(match[1], match[0].name)!;
+		const snapshot = client.translate(match[1], match[0].name)!;
 		await match[0].upgrade(client);
-		client.unshift(cached);
+		client.restore(snapshot);
 	}
 }
 
@@ -126,23 +126,23 @@ export class UnhandledModule implements ModuleInterface {
 	}
 
 	public async request(client: libClient.HttpRequest): Promise<void> {
-		const cached = client.shiftLog(this.handler.name);
+		const snapshot = client.shiftLog(this.handler.name);
 
 		await this.handler.request(client);
 		if (client.unhandled && this.requestLambda != null)
 			await this.requestLambda(client);
 
-		client.unshift(cached);
+		client.restore(snapshot);
 	}
 
 	public async upgrade(client: libClient.HttpUpgrade): Promise<void> {
-		const cached = client.shiftLog(this.handler.name);
+		const snapshot = client.shiftLog(this.handler.name);
 
 		await this.handler.upgrade(client);
 		if (client.unhandled && this.upgradeLambda != null)
 			await this.upgradeLambda(client);
 
-		client.unshift(cached);
+		client.restore(snapshot);
 	}
 }
 
@@ -163,24 +163,24 @@ export class WrapModule implements ModuleInterface {
 	}
 
 	public async request(client: libClient.HttpRequest): Promise<void> {
-		const cached = client.shiftLog(this.handler.name);
+		const snapshot = client.shiftLog(this.handler.name);
 
 		if (this.requestWrap != null)
 			await this.requestWrap(client, () => this.handler.request(client));
 		else
 			await this.handler.request(client);
 
-		client.unshift(cached);
+		client.restore(snapshot);
 	}
 
 	public async upgrade(client: libClient.HttpUpgrade): Promise<void> {
-		const cached = client.shiftLog(this.handler.name);
+		const snapshot = client.shiftLog(this.handler.name);
 
 		if (this.upgradeWrap != null)
 			await this.upgradeWrap(client, () => this.handler.upgrade(client));
 		else
 			await this.handler.upgrade(client);
 
-		client.unshift(cached);
+		client.restore(snapshot);
 	}
 }

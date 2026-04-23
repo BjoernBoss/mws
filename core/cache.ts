@@ -243,22 +243,22 @@ export class Cached {
 		return new Promise((resolve, reject) => {
 			const stream: libStream.Readable = this.makeStream();
 			const buffers: Buffer[] = [];
-			let failed: boolean = false;
+			let settled: boolean = false;
 
 			/* register the handler to collect the data and stream them out */
 			stream.on("data", (chunk) => {
-				if (!failed)
+				if (!settled)
 					buffers.push(chunk);
 			});
 			stream.on("error", (err) => {
-				if (!failed) {
-					failed = true;
+				if (!settled) {
+					settled = true;
 					reject(err);
 				}
 			});
 			stream.on("end", () => {
-				if (!failed) {
-					failed = true;
+				if (!settled) {
+					settled = true;
 					resolve(Buffer.concat(buffers));
 				}
 			});

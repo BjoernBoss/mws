@@ -100,7 +100,7 @@ export function FileLogger(filePath: string, options?: { flushingDelayMs?: numbe
 		}
 
 		/* write the log to the buffer and check if the data need to be flushed inplace, or if the flushing can be delayed */
-		logBuffer.push(`${FormatLine(level, date, identity, msg, true)}\n`);
+		logBuffer.push(FormatLine(level, date, identity, msg, true));
 		if (logBuffer.length >= bufMaxLineCount)
 			flushToFile();
 		else {
