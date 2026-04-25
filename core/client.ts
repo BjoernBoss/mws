@@ -123,7 +123,12 @@ export class ClientBase extends libLog.LogIdentity {
 	}
 }
 
+/* look at the state and modify the headers accordingly (only add or remove headers, must not try to alter the response) */
 export type HeaderPatch = (status: libRequest.StatusType, headers: Record<string, string>, error: boolean) => void;
+
+/* look at the page and modify it or the headers accordingly (return true if this was only a light/shallow
+*	build, due to a HEAD request; can be interrupted by returning an alternate response - such as an error) */
+export type HtmlPatch = (page: libBuilder.HtmlPage, status: libRequest.StatusType, headers: Record<string, string>, shouldLightBuild: boolean) => boolean;
 
 enum ResponseState {
 	none,
@@ -176,8 +181,8 @@ export abstract class IncomingBase extends ClientBase {
 		/* check if the response can still be sent or fail the operation */
 		if (this.state == ResponseState.none || (error && this.state == ResponseState.acknowledged)) {
 			this.log(`Responding ${this.isHead ? 'to HEAD ' : ''}with [${status.msg}]${logReason}`);
-			this.finalizeBufferHeader(status, error, headers, content);
 			this.state = ResponseState.completed;
+			this.finalizeBufferHeader(status, error, headers, content);
 		}
 		else if (!error)
 			throw new Error('Request has already been handled');
@@ -357,7 +362,6 @@ export abstract class IncomingBase extends ClientBase {
 }
 
 /*
-*	Html response is sent once its content has been set and the modules have completed the processing
 *	Http HEAD aware (will silently drain any data sent from a HEAD request)
 *
 *	Receiving data: Will automatically decode the stream and ensure a given maximum is not passed
@@ -369,18 +373,18 @@ export abstract class IncomingBase extends ClientBase {
 *		=> Checks if promised number of bytes is provided
 *		=> Will automatically error, if the broken state is detected, and will auto-respond or send the connection into the broken state (stream user does not need to respond)
 *	Cleanup: request detects incomplete responses (headers committed but body never finished) and will auto-respond or send the connection into the broken state
-*
-*	Responses [except for tryRespondFile] do not add or modify any cache configurations
+*	Responding with files, data, or html can and will modify cache properties
 */
 export class HttpRequest extends IncomingBase {
 	private response: libHttp.ServerResponse;
 	private receiving: boolean;
-	private htmlResponse?: { page: libBuilder.HtmlPage, status: libRequest.StatusType, lightBuild: boolean, headers: Record<string, string> };
+	private htmlPatcher: HtmlPatch[];
 
 	constructor(request: libHttp.IncomingMessage, response: libHttp.ServerResponse, host: string, protocol: string) {
 		super(request, host, protocol);
 		this.response = response;
 		this.receiving = false;
+		this.htmlPatcher = [];
 	}
 
 	protected override finalizeBufferHeader(status: libRequest.StatusType, error: boolean, headers: Record<string, string>, content: { media: libRequest.MediaType, body: Buffer | null } | null): void {
@@ -407,15 +411,6 @@ export class HttpRequest extends IncomingBase {
 		if (!this.receiving)
 			this.request.resume();
 
-		/* check if html has been queued and respond with it */
-		if (this.state == ResponseState.acknowledged && this.htmlResponse != null) {
-			if (this.htmlResponse.lightBuild)
-				this.finalizeBufferHeader(this.htmlResponse.status, false, this.htmlResponse.headers, { media: libRequest.Media.Html, body: null });
-			else
-				this.finalizeBufferHeader(this.htmlResponse.status, false, this.htmlResponse.headers, { media: libRequest.Media.Html, body: Buffer.from(this.htmlResponse.page.finalize(), 'utf-8') });
-			this.state = ResponseState.completed;
-		}
-
 		/* check if data were started but not completed or if data were promised but not provided */
 		if (this.state == ResponseState.headerSent)
 			this.respondInternalError('Response started but not completed');
@@ -440,7 +435,6 @@ export class HttpRequest extends IncomingBase {
 		if (updateState)
 			this.state = ResponseState.headerSent;
 
-		/* add the remaining required headers and perform the post processing */
 		headers['Date'] = new Date().toUTCString();
 		headers['Server'] = libConfig.serverName;
 		if (!('Accept-Ranges' in headers))
@@ -449,8 +443,10 @@ export class HttpRequest extends IncomingBase {
 			headers['Content-Size'] = contentSize.toString();
 		if (media != null)
 			headers['Content-Type'] = libRequest.BuildMediaTypeIdentifier(media);
-		for (const cb of this.headerPatchers)
-			cb(status, headers, error);
+
+		/* perform the header post processing (in reverse order to ensure first added is last executed) */
+		for (let i = this.headerPatchers.length - 1; i >= 0; --i)
+			this.headerPatchers[i](status, headers, error);
 
 		/* setup the response status and headers */
 		this.response.statusCode = status.code;
@@ -833,29 +829,16 @@ export class HttpRequest extends IncomingBase {
 		});
 	}
 
-	/* return the html-page, if a child module plans to produce html */
-	public getHtmlPage(): libBuilder.HtmlPage | null {
-		return this.htmlResponse?.page ?? null;
-	}
-
-	/* return the html-headers, if a child module plans to produce html */
-	public getHtmlHeaders(): Record<string, string> | null {
-		return this.htmlResponse?.headers ?? null;
-	}
-
-	/* returns true, if a page is built, and method is HEAD (triggers a size unspecific header to be sent due to incomplete builds;
-	*	if at least one light build occurs, the entire page will be deemed a light-build, otherwise a full accurate header is returned) */
-	public htmlLightBuild(): boolean {
-		if (this.htmlResponse == null || !this.isHead)
-			return false;
-		this.htmlResponse.lightBuild = true;
-		return true;
+	/* register a callback to be invoked if html is built, to adjust the headers or the content to be sent */
+	public patchHtmlPage(cb: HtmlPatch): void {
+		this.htmlPatcher.push(cb);
 	}
 
 	/* respond with html, can be built on by parent modules, sent once the client has been fully processed
-	*	(if no initial page is provided, creates an empty new page, default status is ok)
+	*	(default status is ok, for HEAD builds, light build indicates that the actual content was not produced, but rather only
+	*	some shallow content; if at least one build is shallow, the HEAD response will only contain an estimage of the size)
 	*	automatically adds Config.dynamicCacheControl, if no other cache control is specified */
-	public respondHtml(options?: { page?: libBuilder.HtmlPage, status?: libRequest.StatusType, lightBuild?: boolean, headers?: Record<string, string> }): libBuilder.HtmlPage {
+	public respondHtml(page: libBuilder.HtmlPage, options?: { status?: libRequest.StatusType, headers?: Record<string, string>, lightBuild?: boolean }): void {
 		if (this.state != ResponseState.none)
 			throw new Error('Request has already been handled');
 
@@ -865,9 +848,24 @@ export class HttpRequest extends IncomingBase {
 		if (!('Cache-Control' in headers) && libConfig.dynamicCacheControl != '')
 			headers['Cache-Control'] = libConfig.dynamicCacheControl;
 
-		this.log(`Responding with HTML content and status [${status.msg}]`);
-		this.htmlResponse = { page: options?.page ?? new libBuilder.HtmlPage(), status: status, lightBuild: (this.isHead && options?.lightBuild === true), headers };
-		return this.htmlResponse.page;
+		/* invoke all registered html patcher to let them modify the content (in reverse order to ensure
+		*	first added is last executed, and check if one of them produced an alternate response) */
+		let lightBuild = (options?.lightBuild ?? false);
+		for (let i = this.htmlPatcher.length - 1; i >= 0; --i) {
+			lightBuild = this.htmlPatcher[i](page, status, headers, this.isHead) || lightBuild;
+			if (this.state != ResponseState.acknowledged)
+				return;
+		}
+		if (!this.isHead)
+			lightBuild = false;
+
+		/* mark first as completed now */
+		this.log(`Responding with HTML content and status [${status.msg}]${lightBuild ? 'as light-build' : ''}`);
+		this.state = ResponseState.completed;
+		if (lightBuild)
+			this.finalizeBufferHeader(status, false, headers, { media: libRequest.Media.Html, body: null });
+		else
+			this.finalizeBufferHeader(status, false, headers, { media: libRequest.Media.Html, body: Buffer.from(page.finalize(), 'utf-8') });
 	}
 
 	/* send data with [media type] and [status] and return a writable stream (default status is ok, media is unknown)
@@ -1046,7 +1044,6 @@ export class HttpUpgrade extends IncomingBase {
 	}
 
 	protected override finalizeBufferHeader(status: libRequest.StatusType, error: boolean, headers: Record<string, string>, content: { media: libRequest.MediaType, body: Buffer } | null): void {
-		/* add the remaining required headers and perform the post processing */
 		if (content != null) {
 			headers['Content-Length'] = content.body.byteLength.toString();
 			headers['Content-Type'] = libRequest.BuildMediaTypeIdentifier(content!.media);
@@ -1055,8 +1052,10 @@ export class HttpUpgrade extends IncomingBase {
 		headers['Server'] = libConfig.serverName;
 		headers['Accept-Ranges'] = 'none';
 		headers['Connection'] = 'close';
-		for (const cb of this.headerPatchers)
-			cb(status, headers, error);
+
+		/* perform the header post processing (in reverse order to ensure first added is last executed) */
+		for (let i = this.headerPatchers.length - 1; i >= 0; --i)
+			this.headerPatchers[i](status, headers, error);
 
 		/* construct the entire header content and send it away */
 		let headerText = `HTTP/1.1 ${status.code} ${status.msg}\r\n`;

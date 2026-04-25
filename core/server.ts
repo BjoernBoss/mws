@@ -58,7 +58,7 @@ export class Server {
 			else
 				await handler.upgrade(client as libClient.HttpUpgrade);
 		} catch (err: any) {
-			logger.error(`Uncaught exception encountered for client [${client != null ? client.id : null}]: ${err}`)
+			logger.error(`Uncaught exception encountered for client!${client != null ? client.id : '#'}: ${err}`)
 			if (client != null)
 				client.respondInternalError('Unknown internal error encountered');
 		}
