@@ -29,8 +29,7 @@ export async function Run(server) {
     try {
         const mod = await import("my-module/app.js");
         server.listenHttp(8080, new mod.MyModule(), (host) => host == 'localhost');
-    }
-    catch (e) {
+    } catch (e) {
         throw new Error(`Failed to load module: ${e.message}`);
     }
 }
@@ -48,7 +47,7 @@ export class MyModule implements libInterface.ModuleInterface {
     public name: string = 'my-module';
 
     public async request(client: libClient.HttpRequest): Promise<void> {
-        client.respondText('Hello from my module!', libRequest.Media.Text);
+        client.respondString('Hello from my module!', { media: libRequest.Media.Text });
     }
 
     public async upgrade(client: libClient.HttpUpgrade): Promise<void> {
@@ -60,6 +59,7 @@ Any requests not handled by a module, may be handled by parent modules, should t
 
 The framework also provides default helper implementations of modules:
 
+- **`LambdaModule`** handles requests/upgrades via callback functions
 - **`DispatchModule`** routes requests by URL path prefix to child modules
 - **`UnhandledModule`** wraps a module and catches unhandled requests with a fallback
 - **`WrapModule`** intercepts requests before/after passing them to an inner module
@@ -69,7 +69,10 @@ const dispatch = new libInterface.DispatchModule({
     '/api': apiModule,
     '/static': fileModule
 });
-server.listenHttp(8080, dispatch, (host) => host == 'localhost');
+const unhandled = new libInterface.UnhandledModule(dispatch, {
+    request: async (client) => { client.respondString('Custom not found', { status: libRequest.Status.NotFound }); }
+});
+server.listenHttp(8080, unhandled, (host) => host == 'localhost');
 ```
 
 ## Core Components
@@ -77,10 +80,11 @@ The `core` workspace provides all server functionality:
 
 | File | Purpose |
 |---|---|
-| `interface.ts` | `ModuleInterface` interface, and additional helper: `DispatchModule`, `LambdaModule`, `UnhandledModule`, `WrapModule` |
+| `interface.ts` | `ModuleInterface` interface, and helper modules: `LambdaModule`, `DispatchModule`, `UnhandledModule`, `WrapModule` |
 | `client.ts` | `HttpRequest` (response helpers, body parsing, file serving), `HttpUpgrade` and `ClientSocket` (WebSocket) |
 | `request.ts` | HTTP status codes, media types, range parsing, and encoding negotiation (gzip, deflate, brotli, zstd) |
-| `server.ts` | `Server` class managing HTTP/HTTPS listeners with host-header validation and server name configuration |
+| `server.ts` | `Server` class managing HTTP/HTTPS listeners with host-header validation |
+| `config.ts` | `CoreConfig` class and global `Config` instance for server name, timeouts, and cache settings |
 | `cache.ts` | File cache with LRU eviction, sync/async read, and streaming |
 | `templates.ts` | Template loading and placeholder expansion |
 | `builder.ts` | Programmatic HTML page construction |
@@ -90,9 +94,6 @@ The `core` workspace provides all server functionality:
 ## Configuration
 The `modules/setup.js` `Run` method receives a `Server` instance and is responsible for all configuration:
 
-- **Server name:** `libServer.SetServerName('my-server')` (via `core/server.js`)
+- **Config:** `libConfig.Config` exposes server name, timeouts, and cache settings (via `core/config.js`). Default initialized via `libConfig.Initialize()`, which is called by `main.js`
 - **Logging:** `libLog.AddLogger(...)` for file or custom loggers (via `core/log.js`)
-- **Caching:** `libCache.SetCacheOptions({ cacheSize, largestFile })` (via `core/cache.js`)
 - **Listeners:** `server.listenHttp(port, module, hostCheck)` or `server.listenHttps(port, key, cert, module, hostCheck)`
-
-Host validation is mandatory: every listener requires a callback that approves or rejects the incoming `Host` header.

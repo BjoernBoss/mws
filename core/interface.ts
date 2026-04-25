@@ -8,6 +8,7 @@ import * as libLocation from "./location.js";
 *	Module interface
 *	If the returned promise resolves, and the client has not yet been handled,
 *	it is expected to not be handled anymore by the given client.
+*	Modules expect clients to be completely unhandled when being passed to the module.
 */
 export interface ModuleInterface {
 	name: string;

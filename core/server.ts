@@ -22,8 +22,11 @@ export class Server {
 	}
 
 	private respondBadEndpoint(request: libHttp.IncomingMessage, client: libClient.HttpRequest | libClient.HttpUpgrade): void {
-		client.addHeader('Connection', 'close');
-		client.respondAnyText(`No resource found at [${request.headers.host ?? ''}]:[${client.url.pathname}]`, { status: libRequest.Status.NotFound, media: libRequest.Media.Text });
+		client.respond(`No resource found at [${request.headers.host ?? ''}]:[${client.url.pathname}]`, {
+			status: libRequest.Status.NotFound,
+			media: libRequest.Media.Text,
+			headers: { 'Connection': 'close' }
+		});
 	}
 	private async handleWrapper(wasRequest: boolean, request: libHttp.IncomingMessage, checkHost: libInterface.CheckHost, handler: libInterface.ModuleInterface, port: number, establish: (host: string) => libClient.HttpRequest | libClient.HttpUpgrade): Promise<void> {
 		let client = null;

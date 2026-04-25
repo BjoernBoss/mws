@@ -82,6 +82,12 @@ export function PermanentRedirect(payload: { path: string, destination: string }
 }
 
 /* html formatted template message for error */
+export function ErrorPreconditionFailed(payload: { path: string, reason: string }): string {
+	const content: string = LoadRelative('412.template');
+	return ExpandPlaceholders(content, { path: payload.path, reason: payload.reason });
+}
+
+/* html formatted template message for error */
 export function ErrorBadRequest(payload: { path: string, reason: string }): string {
 	const content: string = LoadRelative('400.template');
 	return ExpandPlaceholders(content, { path: payload.path, reason: payload.reason });

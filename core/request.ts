@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 /* Copyright (c) 2026 Bjoern Boss Henrichsen */
+import * as libLocation from "core/location.js";
 import * as libZlib from "zlib";
 import * as libStream from "stream";
 
@@ -11,12 +12,14 @@ export const Status = {
 	Ok: { code: 200, msg: 'Ok' },
 	PartialContent: { code: 206, msg: 'Partial Content' },
 	SeeOther: { code: 303, msg: 'See Other' },
+	NotModified: { code: 304, msg: 'Not Modified' },
 	TemporaryRedirect: { code: 307, msg: 'Temporary Redirect' },
 	PermanentRedirect: { code: 308, msg: 'Permanent Redirect' },
 	BadRequest: { code: 400, msg: 'Bad Request' },
 	NotFound: { code: 404, msg: 'Not Found' },
 	MethodNotAllowed: { code: 405, msg: 'Method Not Allowed' },
 	Conflict: { code: 409, msg: 'Conflict' },
+	PreconditionFailed: { code: 412, msg: 'Precondition Failed' },
 	ContentTooLarge: { code: 413, msg: 'Content Too Large' },
 	UnsupportedMediaType: { code: 415, msg: 'Unsupported Media Type' },
 	RangeIssue: { code: 416, msg: 'Range Not Satisfiable' },
@@ -143,6 +146,33 @@ export function ParseRangeHeader(range: string | null, fileSize: number): { firs
 	return { first: fileSize - last!, last: fileSize - 1, state: RangeState.valid };
 }
 
+/* check if the [etag] matches the list (i.e. in list or list is '*'), will not match for undefined list */
+export function ETagMatchesList(etag: string, header: string | null): boolean {
+	if (header == null)
+		return false;
+	const list = header.split(',');
+
+	if (list.length == 1 && list[0].trim() == '*')
+		return true;
+
+	for (const entry of list) {
+		if (etag == entry.trim())
+			return true;
+	}
+	return false;
+}
+
+/* returns null on invalid times, [>0] for b being greater, [<0] for b being smaller, [=0] for same time */
+export function TimeStampCompare(a: string, b: string): number | null {
+	try {
+		const _a = new Date(a);
+		const _b = new Date(b);
+		return (_b.getTime() - _a.getTime());
+	} catch (err: any) {
+		return null;
+	}
+}
+
 /* setup the reverse list of file-endings to media types and encoding-names to encoding types */
 const FileEndingToMediaTypeMapping: Record<string, MediaType> = {}
 Object.entries(Media).forEach(([_, value]) => {
@@ -156,20 +186,11 @@ Object.entries(Encoding).forEach(([_, value]) => {
 
 /* map extension of file-path/file-name to media type (defaults to Unknown) */
 export function LookupMediaTypeFromFile(filePath: string): MediaType {
-	/* extract the file-ending */
-	for (let i = filePath.length; i >= 0; --i) {
-		if (filePath[i] == '/' || filePath[i] == '\\')
-			break;
-		if (filePath[i] != '.')
-			continue;
-		if (filePath[i - 1] == '/' || filePath[i - 1] == '\\')
-			break;
-
-		/* extract the file-ending, sanitize it, and return the media type */
-		const fileEnding: string = filePath.substring(i + 1).toLowerCase();
-		if (fileEnding in FileEndingToMediaTypeMapping)
-			return FileEndingToMediaTypeMapping[fileEnding];
-		break;
+	const fileExtension = libLocation.GetFileExtension(filePath);
+	if (fileExtension != '') {
+		const type = FileEndingToMediaTypeMapping[fileExtension.substring(1)] ?? null;
+		if (type != null)
+			return type;
 	}
 	return Media.Unknown;
 }

@@ -114,7 +114,7 @@ export class Cached {
 	private mtime: number;
 	private persistent: boolean;
 
-	private constructor(path: string, size: number, data: Buffer | null, mtime: number, persistent: boolean) {
+	public constructor(path: string, size: number, data: Buffer | null, mtime: number, persistent: boolean) {
 		this.path = path;
 		this.size = size;
 		this.data = data;
@@ -140,16 +140,16 @@ export class Cached {
 			return stream;
 
 		/* create the transformer stream to cache the data */
-		let buffers: Buffer[] = [], failed: boolean = false, totalLength: number = 0;
+		let buffers: Buffer[] = [], settled: boolean = false, totalLength: number = 0;
 		const transformer = new libStream.Transform({
 			transform: (chunk, _, cb) => {
-				if (failed) return;
+				if (settled) return cb(new Error('Reading already completed'));
 				totalLength += chunk.byteLength;
 				buffers.push(chunk);
 				cb(null, chunk);
 			},
 			final: (cb) => {
-				if (failed) return;
+				if (settled) return cb(new Error('Reading already completed'));
 				if (totalLength == this.size && cacheManager.cacheable(this.size))
 					cacheManager.add(this.path, Buffer.concat(buffers), this.mtime, this.persistent);
 				cb(null);
@@ -158,53 +158,36 @@ export class Cached {
 
 		/* setup the file exceptions to be propagated to the stream */
 		let wrapped = stream.pipe(transformer);
-		stream.on('error', (e: Error) => {
-			logger.error(`Filesystem error while streaming [${this.path}]: ${e.message}`);
-			failed = true;
-			wrapped.destroy(new Error('File operation failed'));
+		stream.on('error', (err: any) => {
+			if (settled) return; settled = true;
+			wrapped.destroy(err);
+		});
+		wrapped.on('error', (err: any) => {
+			if (settled) return; settled = true;
+			stream.destroy(err);
 		});
 		return wrapped;
 	}
-	private static checkStats(path: string): [number | null, number] {
-		/* check if the file exists and read its file-size and mtime */
-		try {
-			/* check if the file exists and is a file */
-			if (!libFs.existsSync(path))
-				return [null, 0];
-			const stats = libFs.lstatSync(path);
-			if (!stats.isFile())
-				return [null, 0];
 
-			/* extract the file size and modified time */
-			return [stats.size, stats.mtime.getTime()];
-		} catch (err: any) {
-			logger.error(`Filesystem error while checking [${path}]: ${err.message}`);
-			throw new Error('File operation failed');
-		}
-	}
-
-	/* [persistent]: if cached, dont check if the underlying file has changed since caching */
-	public static make(path: string, options?: { persistent?: boolean }): Cached | null {
-		/* check if the entry is marked as persistent and already in the
-		*	cache, in which case the file doesn't even need to be checked */
-		let entry = (options?.persistent === true ? cacheManager.findPersistent(path) : null);
-		if (entry != null)
-			return new Cached(path, entry.data.byteLength, entry.data, entry.mtime, entry.persistent);
-
-		/* check if the file exists and read its stats */
-		const [fileSize, mtime] = Cached.checkStats(path);
-		if (fileSize == null)
-			return null;
-
-		/* check if the path exists as non-persistent in the cache and otherwise return the uncached entry */
-		entry = cacheManager.find(path, mtime, fileSize);
-		if (entry != null)
-			return new Cached(path, fileSize, entry.data, mtime, options?.persistent ?? false);
-		return new Cached(path, fileSize, null, mtime, options?.persistent ?? false);
-	}
-
+	/* size in bytes of the file */
 	public fileSize(): number {
 		return this.size;
+	}
+
+	/* fetch the last modified time formatted for the network */
+	public lastModified(): string {
+		return new Date(this.mtime).toUTCString();
+	}
+
+	/* fetch the unique-id to identify this version of the cached file (constructed,
+	*	just like the cache identifies them as equivalent: size+last-modified) */
+	public uniqueId(): string {
+		return `${this.mtime}-${this.size}`;
+	}
+
+	/* current path of the cache object */
+	public getPath(): string {
+		return this.path;
 	}
 
 	/* object must not be used anymore after reading or streaming from it (on errors, logs them and throws exception) */
@@ -266,6 +249,31 @@ export class Cached {
 	}
 }
 
+/* [persistent]: if cached as persistent, dont check if the underlying file has changed since caching */
 export function Get(path: string, options?: { persistent?: boolean }): Cached | null {
-	return Cached.make(path, options);
+	/* check if the entry is marked as persistent and already in the
+	*	cache, in which case the file doesn't even need to be checked */
+	let entry = (options?.persistent === true ? cacheManager.findPersistent(path) : null);
+	if (entry != null)
+		return new Cached(path, entry.data.byteLength, entry.data, entry.mtime, entry.persistent);
+
+	/* check if the file exists and read its file-size and mtime */
+	let fileSize = 0, mtime = 0;
+	try {
+		if (!libFs.existsSync(path))
+			return null;
+		const stats = libFs.lstatSync(path);
+		if (!stats.isFile())
+			return null;
+		fileSize = stats.size, mtime = stats.mtime.getTime();
+	} catch (err: any) {
+		logger.error(`Filesystem error while checking [${path}]: ${err.message}`);
+		throw new Error('File operation failed');
+	}
+
+	/* check if the path exists as non-persistent in the cache and otherwise return the uncached entry */
+	entry = cacheManager.find(path, mtime, fileSize);
+	if (entry != null)
+		return new Cached(path, fileSize, entry.data, mtime, options?.persistent ?? false);
+	return new Cached(path, fileSize, null, mtime, options?.persistent ?? false);
 }

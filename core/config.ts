@@ -13,6 +13,8 @@ export class CoreConfig {
 	private _keepAliveTimeout: number = 0;
 	private _cacheSize: number = 0;
 	private _cacheFileSizeLimit: number = 0;
+	private _fileCacheControl: string = '';
+	private _dynamicCacheControl: string = '';
 
 	private notifyAll(): void {
 		for (const fn of this._subscriber)
@@ -26,7 +28,7 @@ export class CoreConfig {
 		this._subscriber = this._subscriber.filter((v) => v != cb);
 	}
 
-	public get serverName(): string { return this._serverName }
+	public get serverName(): string { return this._serverName; }
 	public set serverName(value: string) {
 		if (this._serverName == value)
 			return;
@@ -36,7 +38,7 @@ export class CoreConfig {
 		this.notifyAll();
 	}
 
-	public get webSocketTimeout(): number { return this._webSocketTimeout }
+	public get webSocketTimeout(): number { return this._webSocketTimeout; }
 	public set webSocketTimeout(value: number) {
 		if (this._webSocketTimeout == value)
 			return;
@@ -46,7 +48,7 @@ export class CoreConfig {
 		this.notifyAll();
 	}
 
-	public get requestTimeout(): number { return this._requestTimeout }
+	public get requestTimeout(): number { return this._requestTimeout; }
 	public set requestTimeout(value: number) {
 		if (this._requestTimeout == value)
 			return;
@@ -56,7 +58,7 @@ export class CoreConfig {
 		this.notifyAll();
 	}
 
-	public get connectionTimeout(): number { return this._connectionTimeout }
+	public get connectionTimeout(): number { return this._connectionTimeout; }
 	public set connectionTimeout(value: number) {
 		if (this._connectionTimeout == value)
 			return;
@@ -66,7 +68,7 @@ export class CoreConfig {
 		this.notifyAll();
 	}
 
-	public get keepAliveTimeout(): number { return this._keepAliveTimeout }
+	public get keepAliveTimeout(): number { return this._keepAliveTimeout; }
 	public set keepAliveTimeout(value: number) {
 		if (this._keepAliveTimeout == value)
 			return;
@@ -76,7 +78,7 @@ export class CoreConfig {
 		this.notifyAll();
 	}
 
-	public get cacheSize(): number { return this._cacheSize }
+	public get cacheSize(): number { return this._cacheSize; }
 	public set cacheSize(value: number) {
 		if (this._cacheSize == value)
 			return;
@@ -86,13 +88,33 @@ export class CoreConfig {
 		this.notifyAll();
 	}
 
-	public get cacheFileSizeLimit(): number { return this._cacheFileSizeLimit }
+	public get cacheFileSizeLimit(): number { return this._cacheFileSizeLimit; }
 	public set cacheFileSizeLimit(value: number) {
 		if (this._cacheFileSizeLimit == value)
 			return;
 
 		this._cacheFileSizeLimit = value;
 		logger.info(`Cache file size limit set to [${this._cacheFileSizeLimit}]`);
+		this.notifyAll();
+	}
+
+	public get fileCacheControl(): string { return this._fileCacheControl; };
+	public set fileCacheControl(value: string) {
+		if (this._fileCacheControl == value)
+			return;
+
+		this._fileCacheControl = value;
+		logger.info(`File cache control set to [${this._fileCacheControl}]`);
+		this.notifyAll();
+	}
+
+	public get dynamicCacheControl(): string { return this._dynamicCacheControl; };
+	public set dynamicCacheControl(value: string) {
+		if (this._dynamicCacheControl == value)
+			return;
+
+		this._dynamicCacheControl = value;
+		logger.info(`Dynamic cache control set to [${this._dynamicCacheControl}]`);
 		this.notifyAll();
 	}
 }
@@ -113,4 +135,6 @@ export function Initialize(): void {
 	Config.keepAliveTimeout = 10_000;
 	Config.cacheSize = 50_000_000;
 	Config.cacheFileSizeLimit = 10_000_000;
+	Config.fileCacheControl = 'public, max-age=600, must-revalidate';
+	Config.dynamicCacheControl = 'no-store';
 }
