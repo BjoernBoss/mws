@@ -96,7 +96,7 @@ export function MakeSelfPath(urlFilePath: string, path: string | null = null): (
 /* get the file extension of the path (returns the last dot and continuing, if there is more to the name before the dot; otherwise the empty string) */
 export function GetFileExtension(path: string): string {
 	let extension = '';
-	for (let i = path.length; i >= 0 && (path[i] != '/' && path[i] != '\\'); --i) {
+	for (let i = path.length - 1; i >= 0 && (path[i] != '/' && path[i] != '\\'); --i) {
 		if (extension != '')
 			return extension;
 		if (path[i] == '.')

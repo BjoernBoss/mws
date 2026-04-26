@@ -14,7 +14,8 @@ export class CoreConfig {
 	private _cacheSize: number = 0;
 	private _cacheFileSizeLimit: number = 0;
 	private _fileCacheControl: string = '';
-	private _dynamicCacheControl: string = '';
+	private _errorCacheControl: string = '';
+	private _responseCacheControl: string = '';
 
 	private notifyAll(): void {
 		for (const fn of this._subscriber)
@@ -108,13 +109,23 @@ export class CoreConfig {
 		this.notifyAll();
 	}
 
-	public get dynamicCacheControl(): string { return this._dynamicCacheControl; };
-	public set dynamicCacheControl(value: string) {
-		if (this._dynamicCacheControl == value)
+	public get errorCacheControl(): string { return this._errorCacheControl; };
+	public set errorCacheControl(value: string) {
+		if (this._errorCacheControl == value)
 			return;
 
-		this._dynamicCacheControl = value;
-		logger.info(`Dynamic cache control set to [${this._dynamicCacheControl}]`);
+		this._errorCacheControl = value;
+		logger.info(`Error cache control set to [${this._errorCacheControl}]`);
+		this.notifyAll();
+	}
+
+	public get responseCacheControl(): string { return this._responseCacheControl; };
+	public set responseCacheControl(value: string) {
+		if (this._responseCacheControl == value)
+			return;
+
+		this._responseCacheControl = value;
+		logger.info(`Response cache control set to [${this._responseCacheControl}]`);
 		this.notifyAll();
 	}
 }
@@ -136,5 +147,6 @@ export function Initialize(): void {
 	Config.cacheSize = 50_000_000;
 	Config.cacheFileSizeLimit = 10_000_000;
 	Config.fileCacheControl = 'public, max-age=600, must-revalidate';
-	Config.dynamicCacheControl = 'no-store';
+	Config.errorCacheControl = 'no-store';
+	Config.responseCacheControl = 'no-cache';
 }

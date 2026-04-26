@@ -265,7 +265,7 @@ export function Get(path: string, options?: { persistent?: boolean }): Cached | 
 		const stats = libFs.lstatSync(path);
 		if (!stats.isFile())
 			return null;
-		fileSize = stats.size, mtime = stats.mtime.getTime();
+		fileSize = stats.size, mtime = stats.mtimeMs;
 	} catch (err: any) {
 		logger.error(`Filesystem error while checking [${path}]: ${err.message}`);
 		throw new Error('File operation failed');

@@ -200,6 +200,7 @@ export function BuildMediaTypeIdentifier(media: MediaType): string {
 	return `${media.mediaType}; ${media.encoding}`;
 }
 
+/* does not respect 'no-identity' encoding requests */
 export const MIN_ENCODING_SIZE: number = 1_000;
 export function EncodingOption(accept: string | null, atLeastSize: number, mediaType: MediaType): EncodingType | null {
 	/* check if any accepted encodings can be found or if the type/size does not make sense */
@@ -211,12 +212,12 @@ export function EncodingOption(accept: string | null, atLeastSize: number, media
 	for (const part of accept.split(',')) {
 		const segments = part.split(';');
 
-		/* check if its an supported encoding */
+		/* check if its an supported encoding (no match includes '*' and results in identity) */
 		const name = segments[0].trim().toLowerCase();
 		if (!(name in EncodingNameToEncodingTypeMapping))
 			continue;
 
-		/* check if the encoding has been explicitly excluded via q=0 */
+		/* parse the weight score of the value but default to 1.0, if none was given */
 		let score = 1.0;
 		for (let i = 1; i < segments.length; ++i) {
 			const match = segments[i].match(/^\s*q\s*=\s*(\d+\.?\d*)\s*$/);
@@ -225,7 +226,9 @@ export function EncodingOption(accept: string | null, atLeastSize: number, media
 				break;
 			}
 		}
-		if (score == 0.0)
+
+		/* check if the encoding should be skipped and automatically skip the identity - is implicit identity on null-return */
+		if (score == 0.0 || name == 'identity' || name == '*')
 			continue;
 
 		/* check if this is a better match to the request */

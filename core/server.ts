@@ -60,7 +60,7 @@ export class Server {
 		} catch (err: any) {
 			logger.error(`Uncaught exception encountered for client!${client != null ? client.id : '#'}: ${err}`)
 			if (client != null)
-				client.respondInternalError('Unknown internal error encountered');
+				client.respondBadInternalUsage();
 		}
 
 		/* finish the client handling or consume all remaining data in the pipline */
