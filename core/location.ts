@@ -94,13 +94,16 @@ export function MakeSelfPath(urlFilePath: string, path: string | null = null): (
 }
 
 /* get the file extension of the path (returns the last dot and continuing, if there is more to the name before the dot; otherwise the empty string) */
-export function GetFileExtension(path: string): string {
-	let extension = '';
-	for (let i = path.length - 1; i >= 0 && (path[i] != '/' && path[i] != '\\'); --i) {
-		if (extension != '')
-			return extension;
-		if (path[i] == '.')
-			extension = path.substring(i);
+export function SplitFileName(path: string): [string, string] {
+	let dot: number | null = null;
+	let name = path.length - 1;
+
+	for (; name >= 0 && (path[name] != '/' && path[name] != '\\'); --name) {
+		if (path[name] == '.' && dot == null)
+			dot = name;
 	}
-	return '';
+
+	if (dot == null || dot == name + 1)
+		dot = path.length;
+	return [path.substring(name + 1, dot), path.substring(dot)];
 }

@@ -905,20 +905,25 @@ export class HttpRequest extends IncomingBase {
 	*	the encoding can be configured, if the file is pre-encoded (warning: no checks against accepted encodings performed!)
 	*	status will be [Ok], [partial-content], [not-modified] or according errors
 	*	cache aware and etag/last-modified aware; automatically adds Config.fileCacheControl, if no other cache control is specified */
-	public async tryRespondFile(filePath: string, options?: { encoded?: string, media?: libRequest.MediaType, headers?: Record<string, string> }): Promise<boolean> {
+	public async tryRespondFile(filePath: string, options?: { encoded?: string, media?: libRequest.MediaType, headers?: Record<string, string>, persistent?: boolean }): Promise<boolean> {
 		if (this.state != ResponseState.none) {
 			this.respondBadInternalUsage();
 			return true;
 		}
 
+		/* read the entry from the cache and check if it has been permanently moved and apply the move */
 		let cached: libCache.Cached | null = null;
 		try {
-			cached = libCache.Get(filePath);
+			cached = libCache.Get(filePath, { persistent: options?.persistent });
 			if (cached == null)
 				return false;
 		}
 		catch (_) {
 			this.respondFileSystemError();
+			return true;
+		}
+		if (cached.relocated() != null) {
+			this.respondPermanentRedirect(cached.relocated()!);
 			return true;
 		}
 
@@ -938,8 +943,12 @@ export class HttpRequest extends IncomingBase {
 		headers['Accept-Ranges'] = 'bytes';
 		headers['Last-Modified'] = cached.lastModified();
 		headers['ETag'] = `"${cached.uniqueId()}"`;
-		if (!('Cache-Control' in headers) && libConfig.fileCacheControl != '')
-			headers['Cache-Control'] = libConfig.fileCacheControl;
+		if (!('Cache-Control' in headers)) {
+			if (cached.isImmutable() && libConfig.immutableCacheControl != '')
+				headers['Cache-Control'] = libConfig.immutableCacheControl;
+			else if (libConfig.fileCacheControl != '')
+				headers['Cache-Control'] = libConfig.fileCacheControl;
+		}
 
 		/* validate the conditions */
 		if (this.requestHeaders['if-match'] != null && !libRequest.ETagMatchesList(cached.uniqueId(), this.requestHeaders['if-match'])) {

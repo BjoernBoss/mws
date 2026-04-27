@@ -2,10 +2,26 @@
 /* Copyright (c) 2026 Bjoern Boss Henrichsen */
 import { Config as libConfig } from "./config.js";
 import * as libLog from "./log.js";
+import * as libLocation from "./location.js";
 import * as libFs from "fs";
 import * as libStream from "stream";
+import * as libCrypto from "crypto";
 
 const logger = libLog.Logger('cache');
+
+function ReadStats(path: string): null | [number, number] {
+	try {
+		if (!libFs.existsSync(path))
+			return null;
+		const stats = libFs.lstatSync(path);
+		if (stats.isFile())
+			return [stats.size, stats.mtimeMs];
+	} catch (err: any) {
+		logger.error(`Filesystem error while checking [${path}]: ${err.message}`);
+		throw new Error('File operation failed');
+	}
+	return null;
+}
 
 interface CacheEntry {
 	data: Buffer;
@@ -14,11 +30,11 @@ interface CacheEntry {
 	persistent: boolean;
 }
 class CacheManager {
-	private cacheMap: Record<string, CacheEntry> = {};
+	private map: Record<string, CacheEntry> = {};
 	private nextStamp: number = 0;
 	private allocated: number = 0;
-	private totalCapacity: number = 0;
-	private largestSize: number = 0;
+	private totalCapacity: number;
+	private largestSize: number;
 
 	public constructor() {
 		this.totalCapacity = libConfig.cacheSize;
@@ -36,12 +52,12 @@ class CacheManager {
 	}
 	private reduce(capacity: number): void {
 		/* create the list of all cached objects sorted by the touched count */
-		const paths: string[] = Object.keys(this.cacheMap).sort((a, b) => this.cacheMap[a].touched - this.cacheMap[b].touched);
+		const paths: string[] = Object.keys(this.map).sort((a, b) => this.map[a].touched - this.map[b].touched);
 
 		/* drop the first half of the entries or more, if the size has not yet been freed (valid as callers
 		*	guarantee capacity <= allocated, thus the capacity will reach <= 0 before i overflows the paths) */
 		for (let i = 0; i < (paths.length + 1) / 2 || capacity > 0; ++i) {
-			capacity -= this.cacheMap[paths[i]].data.byteLength;
+			capacity -= this.map[paths[i]].data.byteLength;
 			this.drop(paths[i]);
 		}
 	}
@@ -51,8 +67,8 @@ class CacheManager {
 			return;
 
 		/* check if the entry is already part of the cache */
-		if (path in this.cacheMap) {
-			const entry = this.cacheMap[path];
+		if (path in this.map) {
+			const entry = this.map[path];
 			if (entry.mtime >= mtime)
 				return;
 			this.drop(path);
@@ -65,20 +81,20 @@ class CacheManager {
 		/* add the entry to the cache */
 		logger.log(`Added [${path}] to the cache`);
 		this.allocated += data.byteLength;
-		this.cacheMap[path] = { data: data, mtime: mtime, touched: ++this.nextStamp, persistent };
+		this.map[path] = { data: data, mtime: mtime, touched: ++this.nextStamp, persistent };
 	}
 	public drop(path: string): void {
-		if (!(path in this.cacheMap))
+		if (!(path in this.map))
 			return;
 		logger.log(`Dropped [${path}] from the cache`);
-		this.allocated -= this.cacheMap[path].data.byteLength;
-		delete this.cacheMap[path];
+		this.allocated -= this.map[path].data.byteLength;
+		delete this.map[path];
 	}
 	public cacheable(size: number): boolean {
 		return (size <= this.largestSize && size <= this.totalCapacity);
 	}
 	public findPersistent(path: string): CacheEntry | null {
-		const entry = this.cacheMap[path] ?? null;
+		const entry = this.map[path] ?? null;
 		if (entry == null)
 			return null;
 
@@ -89,7 +105,7 @@ class CacheManager {
 		return null;
 	}
 	public find(path: string, mtime: number, size: number): CacheEntry | null {
-		const entry = this.cacheMap[path] ?? null;
+		const entry = this.map[path] ?? null;
 		if (entry == null)
 			return null;
 
@@ -104,8 +120,78 @@ class CacheManager {
 		return null;
 	}
 }
-const cacheManager: CacheManager = new CacheManager();
 
+interface ImmutableEntry {
+	immutable: string;
+	actual: string | null;
+	size: number;
+	mtime: number;
+	id: string;
+}
+class ImmutableManager {
+	private map: Record<string, ImmutableEntry> = {};
+	private reverse: Record<string, string> = {};
+
+	private assignId(path: string, entry: ImmutableEntry): void {
+		const id = libCrypto.randomUUID();
+		const [name, extension] = libLocation.SplitFileName(path);
+		const idPath = `${path.substring(0, path.length - name.length - extension.length)}${name}.${id}${extension}`;
+
+		logger.trace(`Allocated immutable id [${id}] for [${path}]`);
+
+		entry.immutable = idPath;
+		entry.id = id;
+		this.reverse[id] = path;
+	}
+
+	public make(path: string): string {
+		let entry = this.map[path] ?? null;
+		if (entry != null)
+			return entry.immutable;
+
+		entry = (this.map[path] = { immutable: '', id: '', actual: null, size: 0, mtime: 0 });
+		this.assignId(path, entry);
+
+		return entry.immutable;
+	}
+	public get(path: string): [ImmutableEntry | null, boolean] {
+		const [temp, extension] = libLocation.SplitFileName(path);
+		const [name, tempId] = libLocation.SplitFileName(temp);
+
+		/* check if it might be an immutable-id */
+		if (tempId == null)
+			return [null, false];
+		const id = tempId.substring(1);
+		const srcPath = this.reverse[id];
+		if (srcPath == null)
+			return [null, false];
+		const entry = this.map[srcPath]!;
+
+		/* check if this is the first assignment of the immutable entry */
+		const first = (entry.actual == null);
+		if (first)
+			entry.actual = `${path.substring(0, path.length - temp.length - extension.length)}${name}${extension}`;
+
+		/* fetch the stats to check if the entry is dirty and needs to receive a new id */
+		const stats = ReadStats(entry.actual!);
+		if (stats == null) {
+			logger.warning(`Immutable path [${entry.actual}] does not exist`);
+			return [null, false];
+		}
+		const [fileSize, mtime] = stats;
+		if (!first && (entry.size != fileSize || entry.mtime < mtime))
+			this.assignId(srcPath, entry);
+		entry.size = fileSize;
+		entry.mtime = Math.max(entry.mtime, mtime);
+
+		/* even if a new id was assigned, the old entry can still refer to the new file, as
+		*	this request for the old id will just get the new entry (be valid) despite being
+		*	an outdated name, but indicate that it has been moved (i.e. invalidated) */
+		return [entry, entry.id != id];
+	}
+}
+const cacheManager: CacheManager = new CacheManager();
+const immutableManager: ImmutableManager = new ImmutableManager();
 
 export class Cached {
 	private path: string;
@@ -113,13 +199,17 @@ export class Cached {
 	private data: Buffer | null;
 	private mtime: number;
 	private persistent: boolean;
+	private immutable: boolean;
+	private relocate: string | null;
 
-	public constructor(path: string, size: number, data: Buffer | null, mtime: number, persistent: boolean) {
+	public constructor(path: string, size: number, data: Buffer | null, mtime: number, persistent: boolean, immutable: boolean, relocate: string | null) {
 		this.path = path;
 		this.size = size;
 		this.data = data;
 		this.mtime = mtime;
 		this.persistent = persistent;
+		this.immutable = immutable;
+		this.relocate = relocate;
 	}
 	private makeStream(options?: { start?: number, end?: number }): libStream.Readable {
 		/* check if the data have already been cached */
@@ -169,6 +259,16 @@ export class Cached {
 		return wrapped;
 	}
 
+	/* check if this is an immutable file entry */
+	public isImmutable(): boolean {
+		return this.immutable;
+	}
+
+	/* check if the file has been permanently moved (i.e. old file/id became invalid) */
+	public relocated(): string | null {
+		return this.relocate;
+	}
+
 	/* size in bytes of the file */
 	public fileSize(): number {
 		return this.size;
@@ -183,11 +283,6 @@ export class Cached {
 	*	just like the cache identifies them as equivalent: size+last-modified) */
 	public uniqueId(): string {
 		return `${this.mtime}-${this.size}`;
-	}
-
-	/* current path of the cache object */
-	public getPath(): string {
-		return this.path;
 	}
 
 	/* object must not be used anymore after reading or streaming from it (on errors, logs them and throws exception) */
@@ -251,29 +346,33 @@ export class Cached {
 
 /* [persistent]: if cached as persistent, dont check if the underlying file has changed since caching */
 export function Get(path: string, options?: { persistent?: boolean }): Cached | null {
+	/* check if the entry is immutable and fetch its actual path */
+	const [immutable, immutableMoved] = immutableManager.get(path);
+	if (immutable != null)
+		path = immutable.actual!;
+	const isImmutable = (immutable != null), relocate = ((immutable != null && immutableMoved) ? immutable.immutable : null);
+
 	/* check if the entry is marked as persistent and already in the
 	*	cache, in which case the file doesn't even need to be checked */
 	let entry = (options?.persistent === true ? cacheManager.findPersistent(path) : null);
-	if (entry != null)
-		return new Cached(path, entry.data.byteLength, entry.data, entry.mtime, entry.persistent);
+	if (entry != null && (immutable == null || (immutable.size == entry.data.byteLength && immutable.mtime == entry.mtime)))
+		return new Cached(path, entry.data.byteLength, entry.data, entry.mtime, entry.persistent, isImmutable, relocate);
 
-	/* check if the file exists and read its file-size and mtime */
-	let fileSize = 0, mtime = 0;
-	try {
-		if (!libFs.existsSync(path))
-			return null;
-		const stats = libFs.lstatSync(path);
-		if (!stats.isFile())
-			return null;
-		fileSize = stats.size, mtime = stats.mtimeMs;
-	} catch (err: any) {
-		logger.error(`Filesystem error while checking [${path}]: ${err.message}`);
-		throw new Error('File operation failed');
-	}
+	/* check if the file exists and read its file-size and mtime (not necessary
+	*	for immutable entries, as their stats are already up-to-date) */
+	const stats = (immutable == null ? ReadStats(path) : [immutable.size, immutable.mtime]);
+	if (stats == null)
+		return null;
+	const [fileSize, mtime] = stats;
 
 	/* check if the path exists as non-persistent in the cache and otherwise return the uncached entry */
 	entry = cacheManager.find(path, mtime, fileSize);
 	if (entry != null)
-		return new Cached(path, fileSize, entry.data, mtime, options?.persistent ?? false);
-	return new Cached(path, fileSize, null, mtime, options?.persistent ?? false);
+		return new Cached(path, fileSize, entry.data, mtime, options?.persistent ?? false, isImmutable, relocate);
+	return new Cached(path, fileSize, null, mtime, options?.persistent ?? false, isImmutable, relocate);
+}
+
+/* generate a unique tagged path for the given query path, which will change whenever the underlying file changes */
+export function Immutable(path: string): string {
+	return immutableManager.make(path);
 }

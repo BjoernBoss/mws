@@ -14,6 +14,7 @@ export class CoreConfig {
 	private _cacheSize: number = 0;
 	private _cacheFileSizeLimit: number = 0;
 	private _fileCacheControl: string = '';
+	private _immutableCacheControl: string = '';
 	private _errorCacheControl: string = '';
 	private _responseCacheControl: string = '';
 
@@ -109,6 +110,16 @@ export class CoreConfig {
 		this.notifyAll();
 	}
 
+	public get immutableCacheControl(): string { return this._immutableCacheControl; };
+	public set immutableCacheControl(value: string) {
+		if (this._immutableCacheControl == value)
+			return;
+
+		this._immutableCacheControl = value;
+		logger.info(`Immutable cache control set to [${this._immutableCacheControl}]`);
+		this.notifyAll();
+	}
+
 	public get errorCacheControl(): string { return this._errorCacheControl; };
 	public set errorCacheControl(value: string) {
 		if (this._errorCacheControl == value)
@@ -146,7 +157,12 @@ export function Initialize(): void {
 	Config.keepAliveTimeout = 10_000;
 	Config.cacheSize = 50_000_000;
 	Config.cacheFileSizeLimit = 10_000_000;
-	Config.fileCacheControl = 'public, max-age=600, must-revalidate';
 	Config.errorCacheControl = 'no-store';
 	Config.responseCacheControl = 'no-cache';
+
+	/* cache valid for 10minutes */
+	Config.fileCacheControl = 'public, max-age=600, must-revalidate';
+
+	/* cache valid for 30days */
+	Config.immutableCacheControl = 'public, max-age=2592000, immutable';
 }

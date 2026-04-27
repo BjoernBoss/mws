@@ -186,7 +186,7 @@ Object.entries(Encoding).forEach(([_, value]) => {
 
 /* map extension of file-path/file-name to media type (defaults to Unknown) */
 export function LookupMediaTypeFromFile(filePath: string): MediaType {
-	const fileExtension = libLocation.GetFileExtension(filePath);
+	const fileExtension = libLocation.SplitFileName(filePath)[1];
 	if (fileExtension != '') {
 		const type = FileEndingToMediaTypeMapping[fileExtension.substring(1)] ?? null;
 		if (type != null)
