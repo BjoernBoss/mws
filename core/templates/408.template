@@ -1,0 +1,14 @@
+<!doctype html>
+<html>
+
+<head>
+	<title>Error 408: Request Timeout!</title>
+	<meta name="description" content="Request timed out">
+	<meta name="keywords" content="408 error">
+</head>
+
+<body>
+	<p style="font-family: monospace;">Request processing of [{#path}] timed out due to [{#reason}].</p>
+</body>
+
+</html>

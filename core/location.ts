@@ -1,7 +1,9 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 /* Copyright (c) 2025-2026 Bjoern Boss Henrichsen */
+import * as libLog from "./log.js";
 import * as libUrl from "url";
 import * as libPath from "path";
+import * as libFs from "fs/promises";
 
 /* sanitize path and remove relative path components and convert it to an absolute path */
 export function Sanitize(path: string, relative: boolean): string {
@@ -106,4 +108,33 @@ export function SplitFileName(path: string): [string, string] {
 	if (dot == null || dot == name + 1)
 		dot = path.length;
 	return [path.substring(name + 1, dot), path.substring(dot)];
+}
+
+/* perform an atomic write by first writing the file to [path.temp] and then replacing it (returns false on failure) */
+export async function AtomicWrite(path: string, content: string, what: string, _logger: libLog.LogIdentity): Promise<boolean> {
+	const tempPath = `${path}.temp`;
+
+	let written = false;
+	try {
+		_logger.trace(`Writing ${what} to [${path}]`);
+
+		/* write the content to the temporary file */
+		await libFs.writeFile(tempPath, content, { encoding: 'utf-8' });
+		written = true;
+		await libFs.rename(tempPath, path);
+		return true;
+	} catch (err: any) {
+		if (written)
+			_logger.error(`Failed to replace the original file [${path}]: ${err.message}`);
+		else
+			_logger.error(`Failed to write to temporary file [${tempPath}]: ${err.message}`);
+
+		try {
+			await libFs.unlink(tempPath);
+		} catch (err: any) {
+			if (err.code != 'ENOENT')
+				_logger.warning(`Failed to remove temporary file [${tempPath}]: ${err.message}`);
+		}
+	}
+	return false;
 }

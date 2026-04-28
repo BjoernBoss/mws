@@ -12,6 +12,7 @@ export class CoreConfig {
 	private _connectionTimeout: number = 0;
 	private _keepAliveTimeout: number = 0;
 	private _cacheSize: number = 0;
+	private _cacheAllowStable: boolean = false;
 	private _cacheFileSizeLimit: number = 0;
 	private _fileCacheControl: string = '';
 	private _immutableCacheControl: string = '';
@@ -90,6 +91,16 @@ export class CoreConfig {
 		this.notifyAll();
 	}
 
+	public get cacheAllowStable(): boolean { return this._cacheAllowStable; }
+	public set cacheAllowStable(value: boolean) {
+		if (this._cacheAllowStable == value)
+			return;
+
+		this._cacheAllowStable = value;
+		logger.info(`Cache allow stable set to [${this._cacheAllowStable}]`);
+		this.notifyAll();
+	}
+
 	public get cacheFileSizeLimit(): number { return this._cacheFileSizeLimit; }
 	public set cacheFileSizeLimit(value: number) {
 		if (this._cacheFileSizeLimit == value)
@@ -156,6 +167,7 @@ export function Initialize(): void {
 	Config.connectionTimeout = 300_000;
 	Config.keepAliveTimeout = 10_000;
 	Config.cacheSize = 50_000_000;
+	Config.cacheAllowStable = true;
 	Config.cacheFileSizeLimit = 10_000_000;
 	Config.errorCacheControl = 'no-store';
 	Config.responseCacheControl = 'no-cache';

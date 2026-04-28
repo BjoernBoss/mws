@@ -160,8 +160,8 @@ export abstract class IncomingBase extends ClientBase {
 	protected headerPatchers: HeaderPatch[];
 	protected state: ResponseState;
 
-	/* write the given header and content out (no need to update state) */
-	protected abstract finalizeBufferHeader(status: libRequest.StatusType, error: boolean, headers: Record<string, string>, content: { media: libRequest.MediaType, body: Buffer } | null): void;
+	/* write the given header and content out (no need to update state; body may be null for HEAD responses of unknown size) */
+	protected abstract finalizeBufferHeader(status: libRequest.StatusType, error: boolean, headers: Record<string, string>, content: { media: libRequest.MediaType, body: Buffer | null } | null): void;
 
 	/* finish handling the request (if ends on 'broken', must close the connection) */
 	protected abstract finishSelfHandling(): Promise<void>;
@@ -258,17 +258,21 @@ export abstract class IncomingBase extends ClientBase {
 
 	/* respond with a any response of the given configuration (defaults to media-type: text/unknown/-, status: ok) */
 	public respond(content: string | Buffer | null, options?: { media?: libRequest.MediaType, status?: libRequest.StatusType, error?: boolean, headers?: Record<string, string> }): void {
+		const status = options?.status ?? libRequest.Status.Ok;
+
+		if (content == null)
+			return this.constructQuickResponse(status, ` with no body`, options?.error, options?.headers, null);
+
 		let media = options?.media ?? libRequest.Media.Text;
 		if (typeof content == 'string')
 			content = Buffer.from(content, 'utf-8');
-		else if (media == null && content != null)
+		else if (options?.media == null)
 			media = libRequest.Media.Unknown;
-		const status = options?.status ?? libRequest.Status.Ok;
 
-		const logReason = ` of type [${media.mediaType}] and size [${content == null ? 'none' : content.byteLength}]`;
-		this.constructQuickResponse(status, logReason, options?.error, options?.headers, (content == null ? null : {
+		const logReason = ` of type [${media.mediaType}] and size [${content.byteLength}]`;
+		this.constructQuickResponse(status, logReason, options?.error, options?.headers, {
 			media, body: content
-		}));
+		});
 	}
 
 	/* respond with [ok] and a pre-defined html template response */
@@ -333,6 +337,13 @@ export abstract class IncomingBase extends ClientBase {
 		header['Allow'] = allowed;
 		this.constructQuickResponse(libRequest.Status.MethodNotAllowed, ` because [${method}] was used and only [${allowed}] supported`, options?.error, header, {
 			media: libRequest.Media.Html, body: Buffer.from(libTemplates.ErrorInvalidMethod({ path: this.url.pathname, method: method, allowed }), 'utf-8')
+		});
+	}
+
+	/* respond with [request-timeout] and a pre-defined html template response */
+	public respondRequestTimeout(reason: string, options?: { error?: boolean, headers?: Record<string, string> }): void {
+		this.constructQuickResponse(libRequest.Status.RequestTimeout, ` due to [${reason}]`, options?.error, options?.headers, {
+			media: libRequest.Media.Html, body: Buffer.from(libTemplates.ErrorRequestTimeout({ path: this.url.pathname, reason }), 'utf-8')
 		});
 	}
 
@@ -450,7 +461,7 @@ export class HttpRequest extends IncomingBase {
 		if (!('Accept-Ranges' in headers))
 			headers['Accept-Ranges'] = 'none';
 		if (contentSize != null)
-			headers['Content-Size'] = contentSize.toString();
+			headers['Content-Length'] = contentSize.toString();
 		if (media != null)
 			headers['Content-Type'] = libRequest.BuildMediaTypeIdentifier(media);
 
@@ -731,7 +742,7 @@ export class HttpRequest extends IncomingBase {
 			if (type === types[i].mediaType)
 				return types[i];
 		}
-		this.respondUnsupported(type, types.join(','));
+		this.respondUnsupported(type, types.map(t => t.mediaType).join(','));
 		return null;
 	}
 
@@ -746,8 +757,14 @@ export class HttpRequest extends IncomingBase {
 			return defEncoding;
 		index += 8;
 
+		/* remove the potential quotes around the charset */
 		let end = index;
-		while (end < type.length && type[end] != ';')
+		if (end < type.length && type[end] == '"') {
+			end = type.indexOf('"', ++index);
+			if (end == -1)
+				return defEncoding;
+		}
+		else while (end < type.length && type[end] != ';')
 			++end;
 
 		if (index == end)
@@ -891,30 +908,31 @@ export class HttpRequest extends IncomingBase {
 	*	the encoding can be configured, if the data is pre-encoded (warning: no checks against accepted encodings performed!)
 	*	for a HEAD request, no encoding will be negotiated, no lengths verified, and the written data will just be drained (can immediately be ended using '.end()')
 	*	automatically adds Config.responseCacheControl, if no other cache control is specified */
-	public respondData(media: libRequest.MediaType = libRequest.Media.Unknown, options?: { status?: libRequest.StatusType, media?: libRequest.MediaType, encoded?: string, contentSize?: number, noEncoding?: boolean, headers?: Record<string, string> }): libStream.Writable {
+	public respondData(options?: { status?: libRequest.StatusType, media?: libRequest.MediaType, encoded?: string, contentSize?: number, noEncoding?: boolean, headers?: Record<string, string> }): libStream.Writable {
 		const status: libRequest.StatusType = options?.status ?? libRequest.Status.Ok;
 		this.log(`Responding with data and status [${status.msg}]`);
 		const headers = (options?.headers ?? {});
 		if (!('Cache-Control' in headers) && libConfig.responseCacheControl != '')
 			headers['Cache-Control'] = libConfig.responseCacheControl;
-		return this.sendClientData(status, media ?? libRequest.Media.Unknown, headers, { encoded: options?.encoded, contentSize: options?.contentSize, noEncoding: options?.noEncoding });
+		return this.sendClientData(status, options?.media ?? libRequest.Media.Unknown, headers, { encoded: options?.encoded, contentSize: options?.contentSize, noEncoding: options?.noEncoding });
 	}
 
 	/* [no-throw] try to respond with the given file, return false, if the file does not exist (range aware, HEAD aware)
+	*	specify [stable] if the cache does not need to validate if the underlying file on disk has been modified
 	*	the media type can be overwritten (defaults to extracting media-type from the file-path)
 	*	the encoding can be configured, if the file is pre-encoded (warning: no checks against accepted encodings performed!)
 	*	status will be [Ok], [partial-content], [not-modified] or according errors
 	*	cache aware and etag/last-modified aware; automatically adds Config.fileCacheControl, if no other cache control is specified */
-	public async tryRespondFile(filePath: string, options?: { encoded?: string, media?: libRequest.MediaType, headers?: Record<string, string>, persistent?: boolean }): Promise<boolean> {
+	public async tryRespondFile(filePath: string, stable: boolean, options?: { encoded?: string, media?: libRequest.MediaType, headers?: Record<string, string> }): Promise<boolean> {
 		if (this.state != ResponseState.none) {
 			this.respondBadInternalUsage();
 			return true;
 		}
 
 		/* read the entry from the cache and check if it has been permanently moved and apply the move */
-		let cached: libCache.Cached | null = null;
+		let cached: libCache.Cached | string | null = null;
 		try {
-			cached = libCache.Get(filePath, { persistent: options?.persistent });
+			cached = libCache.Get(filePath, stable);
 			if (cached == null)
 				return false;
 		}
@@ -922,8 +940,8 @@ export class HttpRequest extends IncomingBase {
 			this.respondFileSystemError();
 			return true;
 		}
-		if (cached.relocated() != null) {
-			this.respondPermanentRedirect(cached.relocated()!);
+		if (typeof cached == 'string') {
+			this.respondPermanentRedirect(cached);
 			return true;
 		}
 
@@ -939,10 +957,10 @@ export class HttpRequest extends IncomingBase {
 		}
 
 		/* mark byte-ranges to be supported in principle and add the caching properties */
-		const headers = (options?.headers ?? {});
+		const headers = (options?.headers ?? {}), etag = `"${cached.uniqueId()}"`;
 		headers['Accept-Ranges'] = 'bytes';
 		headers['Last-Modified'] = cached.lastModified();
-		headers['ETag'] = `"${cached.uniqueId()}"`;
+		headers['ETag'] = etag;
 		if (!('Cache-Control' in headers)) {
 			if (cached.isImmutable() && libConfig.immutableCacheControl != '')
 				headers['Cache-Control'] = libConfig.immutableCacheControl;
@@ -951,13 +969,13 @@ export class HttpRequest extends IncomingBase {
 		}
 
 		/* validate the conditions */
-		if (this.requestHeaders['if-match'] != null && !libRequest.ETagMatchesList(cached.uniqueId(), this.requestHeaders['if-match'])) {
-			this.respondPreconditionFailed(`ETag "${cached.uniqueId()}" not found`, { headers });
+		if (this.requestHeaders['if-match'] != null && !libRequest.ETagMatchesList(etag, this.requestHeaders['if-match'])) {
+			this.respondPreconditionFailed(`ETag ${etag} not found`, { headers });
 			return true;
 		}
 
 		/* check if the response can be skipped due to the resource not having been modified in the last time */
-		if (libRequest.ETagMatchesList(cached.uniqueId(), this.requestHeaders['if-none-match'] ?? null)) {
+		if (libRequest.ETagMatchesList(etag, this.requestHeaders['if-none-match'] ?? null)) {
 			this.respondNotModified({ headers });
 			return true;
 		}
@@ -1066,10 +1084,11 @@ export class HttpUpgrade extends IncomingBase {
 		this.head = head;
 	}
 
-	protected override finalizeBufferHeader(status: libRequest.StatusType, error: boolean, headers: Record<string, string>, content: { media: libRequest.MediaType, body: Buffer } | null): void {
+	protected override finalizeBufferHeader(status: libRequest.StatusType, error: boolean, headers: Record<string, string>, content: { media: libRequest.MediaType, body: Buffer | null } | null): void {
 		if (content != null) {
-			headers['Content-Length'] = content.body.byteLength.toString();
-			headers['Content-Type'] = libRequest.BuildMediaTypeIdentifier(content!.media);
+			if (content.body != null)
+				headers['Content-Length'] = content.body.byteLength.toString();
+			headers['Content-Type'] = libRequest.BuildMediaTypeIdentifier(content.media);
 		}
 		headers['Date'] = new Date().toUTCString();
 		headers['Server'] = libConfig.serverName;
@@ -1087,7 +1106,7 @@ export class HttpUpgrade extends IncomingBase {
 		headerText += '\r\n';
 		this.socket.write(headerText, 'utf-8');
 
-		if (this.isHead || content == null)
+		if (this.isHead || content?.body == null)
 			this.socket.end();
 		else
 			this.socket.end(content.body);

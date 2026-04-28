@@ -9,7 +9,7 @@ const logger = libLog.Logger('template');
 const TemplateDirectory = libLocation.MakeSelfPath(import.meta.url, 'templates');
 function LoadRelative(name: string): string {
 	try {
-		const data: Buffer | null = libCache.Get(TemplateDirectory(name), { persistent: true })?.readSync() ?? null;
+		const data: Buffer | null = libCache.GetNormal(TemplateDirectory(name), true)?.readSync() ?? null;
 		if (data != null)
 			return data.toString('utf-8');
 	} catch (_) { }
@@ -18,7 +18,7 @@ function LoadRelative(name: string): string {
 	logger.error(`Unable to load template [${name}] properly`);
 	return '<!doctype html><html><body><p style="font-family: monospace;">Response message not found.</p></body></html>';
 }
-function ExpandPlaceholders(content: string, map: Record<string, string>): string {
+function ExpandPlaceholders(content: string, map: Record<string, string>, escapeValues: boolean = true): string {
 	let out = '', name = '', placeholder = false;
 
 	/* construct the new output content */
@@ -47,7 +47,7 @@ function ExpandPlaceholders(content: string, map: Record<string, string>): strin
 			if (!(name in map))
 				logger.warning(`Undefined placeholder [${name}] encountered`);
 			else
-				out += map[name];
+				out += (escapeValues ? EscapeHtml(map[name]) : map[name]);
 		}
 	}
 
@@ -112,6 +112,12 @@ export function ErrorConflict(payload: { path: string, conflict: string }): stri
 }
 
 /* html formatted template message for error */
+export function ErrorRequestTimeout(payload: { path: string, reason: string }): string {
+	const content: string = LoadRelative('408.template');
+	return ExpandPlaceholders(content, { path: payload.path, reason: payload.reason });
+}
+
+/* html formatted template message for error */
 export function ErrorContentTooLarge(payload: { path: string, allowedLength: number, providedLength: number }): string {
 	const content: string = LoadRelative('413.template');
 	return ExpandPlaceholders(content, { path: payload.path, allowed: payload.allowedLength.toString(), size: payload.providedLength.toString() });
@@ -135,9 +141,26 @@ export function ErrorInternalServerError(payload: { path: string, what: string }
 	return ExpandPlaceholders(content, { path: payload.path, what: payload.what });
 }
 
-/* expand the placeholders in the content (format: {#name}, with '{#' being escaped as '{##') */
-export function Expand(content: string, args: Record<string, string>): string {
-	return ExpandPlaceholders(content, args);
+/* expand the placeholders in the content (format: {#name}, with '{#' being
+*	escaped as '{##'; values are html-escaped by default to prevent injection) */
+export function Expand(content: string, args: Record<string, string>, escapeValues: boolean = true): string {
+	return ExpandPlaceholders(content, args, escapeValues);
+}
+
+/* escape html entities to prevent injection when embedding untrusted values into html */
+export function EscapeHtml(content: string): string {
+	let out = '';
+	for (let i = 0; i < content.length; ++i) {
+		switch (content[i]) {
+			case '&': out += '&amp;'; break;
+			case '<': out += '&lt;'; break;
+			case '>': out += '&gt;'; break;
+			case '"': out += '&quot;'; break;
+			case '\'': out += '&#39;'; break;
+			default: out += content[i]; break;
+		}
+	}
+	return out;
 }
 
 /* create the escaped content */

@@ -58,16 +58,20 @@ export class Server {
 			else
 				await handler.upgrade(client as libClient.HttpUpgrade);
 		} catch (err: any) {
-			logger.error(`Uncaught exception encountered for client!${client != null ? client.id : '#'}: ${err}`)
+			logger.error(`Uncaught exception encountered for client!${client != null ? client.id : '#'}: ${err.message}`)
 			if (client != null)
 				client.respondBadInternalUsage();
 		}
 
-		/* finish the client handling or consume all remaining data in the pipline */
+		/* finish the client handling or consume all remaining data in the pipeline */
 		if (client == null)
 			request.destroy();
-		else
-			client.finishIncoming().catch((err: any) => logger.error(`Failed to complete client [${client!.id}]: ${err}`));
+		else try {
+			await client.finishIncoming();
+		} catch (err: any) {
+			logger.error(`Failed to complete client!${client.id}: ${err.message}`);
+			client.respondBadInternalUsage();
+		}
 	}
 	private handleRequest(request: libHttp.IncomingMessage, response: libHttp.ServerResponse, check: libInterface.CheckHost, handler: libInterface.ModuleInterface, port: number, secure: boolean): void {
 		this.handleWrapper(true, request, check, handler, port, function (host: string): libClient.HttpRequest {
@@ -87,79 +91,53 @@ export class Server {
 		if (libConfig.keepAliveTimeout > 0)
 			server.keepAliveTimeout = libConfig.keepAliveTimeout;
 	}
+	private setupListener(server: libHttp.Server | libHttps.Server, port: number, protocol: string, handler: libInterface.ModuleInterface): void {
+		/* register the config listener and initialize the configuration */
+		const updateTimeouts = () => this.applyConfig(server);
+		updateTimeouts();
+		libConfig.subscribe(updateTimeouts);
+
+		/* register the stop-function */
+		this.stopList.push((forceShutdown: boolean) => new Promise((resolve) => {
+			libConfig.unsubscribe(updateTimeouts);
+			if (forceShutdown)
+				server.closeAllConnections();
+			else
+				server.closeIdleConnections();
+			server.close(() => resolve());
+		}));
+
+		/* log the established listener once the port is actually bound */
+		server.on('listening', () => {
+			const address = server.address() as libNet.AddressInfo;
+			logger.info(`${protocol}-server started successfully on [${address.address}]:${address.port} [family: ${address.family}] with handler [${handler.name}]`);
+		});
+		server.listen(port);
+	}
 
 	public listenHttp(port: number, handler: libInterface.ModuleInterface, checkHost: libInterface.CheckHost): void {
 		try {
-			/* initialize the server config */
-			const config = {
-				requireHostHeader: true
-			};
-
-			/* start the actual server */
-			const server = libHttp.createServer(config, (req, resp) => this.handleRequest(req, resp, checkHost, handler, port, false)).listen(port);
-			server.on('error', (err) => logger.error(`While listening to port ${port} using http: ${err}`));
+			const server = libHttp.createServer({ requireHostHeader: true }, (req, resp) => this.handleRequest(req, resp, checkHost, handler, port, false));
+			server.on('error', (err) => logger.error(`While listening to port ${port} using http: ${err.message}`));
 			server.on('upgrade', (req, sock, head) => this.handleUpgrade(req, sock, head, checkHost, handler, port, false));
-			if (!server.listening)
-				return;
-
-			/* register the config listener and initialize the configuration */
-			const updateTimeouts = () => this.applyConfig(server);
-			updateTimeouts();
-			libConfig.subscribe(updateTimeouts);
-
-			/* register the stop-function */
-			this.stopList.push((forceShutdown: boolean) => new Promise((resolve) => {
-				libConfig.unsubscribe(updateTimeouts);
-				if (forceShutdown)
-					server.closeAllConnections();
-				else
-					server.closeIdleConnections();
-				server.close(() => resolve());
-			}));
-
-			/* log the established listener */
-			const address = server.address() as libNet.AddressInfo;
-			logger.info(`Http-server started successfully on [${address.address}]:${address.port} [family: ${address.family}] with handler [${handler.name}]`);
+			this.setupListener(server, port, 'Http', handler);
 		} catch (err: any) {
-			logger.error(`While listening to port ${port} using http: ${err}`);
+			logger.error(`While listening to port ${port} using http: ${err.message}`);
 		}
 	}
 	public listenHttps(port: number, key: string, cert: string, handler: libInterface.ModuleInterface, checkHost: libInterface.CheckHost): void {
 		try {
-			/* initialize the server config and load the key and certificate */
 			const config = {
 				requireHostHeader: true,
 				key: libFs.readFileSync(key),
 				cert: libFs.readFileSync(cert)
 			};
-
-			/* start the actual server */
-			const server = libHttps.createServer(config, (req, resp) => this.handleRequest(req, resp, checkHost, handler, port, true)).listen(port);
-			server.on('error', (err) => logger.error(`While listening to port ${port} using https: ${err}`));
+			const server = libHttps.createServer(config, (req, resp) => this.handleRequest(req, resp, checkHost, handler, port, true));
+			server.on('error', (err) => logger.error(`While listening to port ${port} using https: ${err.message}`));
 			server.on('upgrade', (req, sock, head) => this.handleUpgrade(req, sock, head, checkHost, handler, port, true));
-			if (!server.listening)
-				return;
-
-			/* register the config listener and initialize the configuration */
-			const updateTimeouts = () => this.applyConfig(server);
-			updateTimeouts();
-			libConfig.subscribe(updateTimeouts);
-
-			/* register the stop-function */
-			this.stopList.push((forceShutdown: boolean) => new Promise((resolve) => {
-				libConfig.unsubscribe(updateTimeouts);
-				if (forceShutdown)
-					server.closeAllConnections();
-				else
-					server.closeIdleConnections();
-				server.close(() => resolve());
-			}));
-
-			/* log the established listener */
-			const address = server.address() as libNet.AddressInfo;
-			logger.info(`Https-server started successfully on [${address.address}]:${address.port} [family: ${address.family}] with handler [${handler.name}]`);
+			this.setupListener(server, port, 'Https', handler);
 		} catch (err: any) {
-			logger.error(`While listening to port ${port} using https: ${err}`);
+			logger.error(`While listening to port ${port} using https: ${err.message}`);
 		}
 	}
 

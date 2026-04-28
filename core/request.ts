@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 /* Copyright (c) 2026 Bjoern Boss Henrichsen */
-import * as libLocation from "core/location.js";
+import * as libLocation from "./location.js";
 import * as libZlib from "zlib";
 import * as libStream from "stream";
 
@@ -22,6 +22,7 @@ export const Status = {
 	PreconditionFailed: { code: 412, msg: 'Precondition Failed' },
 	ContentTooLarge: { code: 413, msg: 'Content Too Large' },
 	UnsupportedMediaType: { code: 415, msg: 'Unsupported Media Type' },
+	RequestTimeout: { code: 408, msg: 'Request Timeout' },
 	RangeIssue: { code: 416, msg: 'Range Not Satisfiable' },
 	InternalError: { code: 500, msg: 'Internal Server Error' }
 } as const satisfies Record<string, StatusType>
@@ -164,13 +165,13 @@ export function ETagMatchesList(etag: string, header: string | null): boolean {
 
 /* returns null on invalid times, [>0] for b being greater, [<0] for b being smaller, [=0] for same time */
 export function TimeStampCompare(a: string, b: string): number | null {
-	try {
-		const _a = new Date(a);
-		const _b = new Date(b);
-		return (_b.getTime() - _a.getTime());
-	} catch (err: any) {
+	const _a = new Date(a).getTime();
+	if (isNaN(_a))
 		return null;
-	}
+	const _b = new Date(b).getTime();
+	if (isNaN(_b))
+		return null;
+	return (_b - _a);
 }
 
 /* setup the reverse list of file-endings to media types and encoding-names to encoding types */
