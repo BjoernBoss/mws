@@ -74,18 +74,24 @@ export class Server {
 		}
 	}
 	private handleRequest(request: libHttp.IncomingMessage, response: libHttp.ServerResponse, check: libInterface.CheckHost, handler: libInterface.ModuleInterface, port: number, secure: boolean): void {
-		this.handleWrapper(true, request, check, handler, port, function (host: string): libClient.HttpRequest {
+		this.handleWrapper(true, request, check, handler, port, (host: string): libClient.HttpRequest => {
 			return new libClient.HttpRequest(request, response, host, (secure ? 'https:' : 'http:'));
+		}).catch((err: any) => {
+			logger.error(`Fatal error in request handler: ${err.message}`);
+			request.destroy(new Error('Unhandled exception'));
 		});
 	}
 	private handleUpgrade(request: libHttp.IncomingMessage, socket: libStream.Duplex, head: Buffer, check: libInterface.CheckHost, handler: libInterface.ModuleInterface, port: number, secure: boolean): void {
-		this.handleWrapper(false, request, check, handler, port, function (host: string): libClient.HttpUpgrade {
+		this.handleWrapper(false, request, check, handler, port, (host: string): libClient.HttpUpgrade => {
 			return new libClient.HttpUpgrade(request, socket, head, host, (secure ? 'https:' : 'http:'));
+		}).catch((err: any) => {
+			logger.error(`Fatal error in upgrade handler: ${err.message}`);
+			request.destroy(new Error('Unhandled exception'));
 		});
 	}
 	private applyConfig(server: libHttp.Server | libHttps.Server): void {
-		if (libConfig.requestTimeout > 0)
-			server.requestTimeout = libConfig.requestTimeout;
+		if (libConfig.headerTimeout > 0)
+			server.headersTimeout = libConfig.headerTimeout;
 		if (libConfig.connectionTimeout > 0)
 			server.timeout = libConfig.connectionTimeout;
 		if (libConfig.keepAliveTimeout > 0)

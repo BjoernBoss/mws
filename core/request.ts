@@ -97,9 +97,9 @@ export function ParseRangeHeader(range: string | null, fileSize: number): { firs
 	if (range == null)
 		return { first: 0, last: fileSize - 1, state: RangeState.noRange };
 
-	/* check if it requests bytes */
-	if (!range.startsWith('bytes='))
-		return { first: 0, last: 0, state: RangeState.issue };
+	/* ignore unknown range units (range units are case-insensitive) */
+	if (range.length < 6 || range.substring(0, 6).toLowerCase() != 'bytes=')
+		return { first: 0, last: fileSize - 1, state: RangeState.noRange };
 	range = range.substring(6);
 
 	/* extract the first number */
@@ -147,17 +147,36 @@ export function ParseRangeHeader(range: string | null, fileSize: number): { firs
 	return { first: fileSize - last!, last: fileSize - 1, state: RangeState.valid };
 }
 
-/* check if the [etag] matches the list (i.e. in list or list is '*'), will not match for undefined list */
+/* check if the [etag] matches the list (i.e. in list or list is '*'), will not match
+*	for undefined list (performs equality comparisions, without regard to weak etags) */
 export function ETagMatchesList(etag: string, header: string | null): boolean {
 	if (header == null)
 		return false;
-	const list = header.split(',');
+
+	/* parse comma-separated list while respecting quoted strings */
+	const list: string[] = [];
+	let current = '', inQuote = false;
+	for (const c of header) {
+		if (c == ',' && !inQuote) {
+			list.push(current);
+			current = '';
+		}
+		else {
+			if (c == '"')
+				inQuote = !inQuote;
+			current += c;
+		}
+	}
+	list.push(current);
 
 	if (list.length == 1 && list[0].trim() == '*')
 		return true;
 
+	/* check if its a weak comparison and strip W/ prefix and compare opaque-tags */
+	const target = etag.startsWith('W/') ? etag.substring(2) : etag;
 	for (const entry of list) {
-		if (etag == entry.trim())
+		const trimmed = entry.trim();
+		if (target == (trimmed.startsWith('W/') ? trimmed.substring(2) : trimmed))
 			return true;
 	}
 	return false;
@@ -175,21 +194,21 @@ export function TimeStampCompare(a: string, b: string): number | null {
 }
 
 /* setup the reverse list of file-endings to media types and encoding-names to encoding types */
-const FileEndingToMediaTypeMapping: Record<string, MediaType> = {}
-Object.entries(Media).forEach(([_, value]) => {
-	for (const fileEnding of value.fileEnding)
-		FileEndingToMediaTypeMapping[fileEnding] = value;
-});
-const EncodingNameToEncodingTypeMapping: Record<string, EncodingType> = {}
-Object.entries(Encoding).forEach(([_, value]) => {
-	EncodingNameToEncodingTypeMapping[value.name] = value;
-});
+const FileEndingToMediaTypeMapping: Record<string, MediaType> = {};
+for (const media of Object.values(Media)) {
+	for (const fileEnding of media.fileEnding)
+		FileEndingToMediaTypeMapping[fileEnding] = media;
+}
+
+const EncodingNameToEncodingTypeMapping: Record<string, EncodingType> = {};
+for (const encoding of Object.values(Encoding))
+	EncodingNameToEncodingTypeMapping[encoding.name] = encoding;
 
 /* map extension of file-path/file-name to media type (defaults to Unknown) */
 export function LookupMediaTypeFromFile(filePath: string): MediaType {
 	const fileExtension = libLocation.SplitFileName(filePath)[1];
 	if (fileExtension != '') {
-		const type = FileEndingToMediaTypeMapping[fileExtension.substring(1)] ?? null;
+		const type = FileEndingToMediaTypeMapping[fileExtension.substring(1).toLowerCase()] ?? null;
 		if (type != null)
 			return type;
 	}
@@ -208,35 +227,47 @@ export function EncodingOption(accept: string | null, atLeastSize: number, media
 	if (accept == null || atLeastSize < MIN_ENCODING_SIZE || !mediaType.compressible)
 		return null;
 
-	/* parse the encoding types and look for a match */
-	let bestMatch: EncodingType | null = null, bestScore: number = 0;
+	/* parse the encoding types and their score */
+	const scores: Record<string, number> = {};
+	let bestScore: string | null = null;
 	for (const part of accept.split(',')) {
 		const segments = part.split(';');
-
-		/* check if its an supported encoding (no match includes '*' and results in identity) */
 		const name = segments[0].trim().toLowerCase();
-		if (!(name in EncodingNameToEncodingTypeMapping))
+
+		/* check if the name is even supported and otherwise drop it */
+		if (!(name in EncodingNameToEncodingTypeMapping) && name != '*')
 			continue;
 
-		/* parse the weight score of the value but default to 1.0, if none was given */
+		/* parse the weight score of the value but default to 1.0 if none was given */
 		let score = 1.0;
 		for (let i = 1; i < segments.length; ++i) {
-			const match = segments[i].match(/^\s*q\s*=\s*(\d+\.?\d*)\s*$/);
+			const match = segments[i].match(/^\s*q\s*=\s*(\d+\.?\d*)\s*$/i);
 			if (match != null) {
 				score = parseFloat(match[1]);
 				break;
 			}
 		}
 
-		/* check if the encoding should be skipped and automatically skip the identity - is implicit identity on null-return */
-		if (score == 0.0 || name == 'identity' || name == '*')
-			continue;
-
-		/* check if this is a better match to the request */
-		if (bestMatch == null || score > bestScore)
-			bestMatch = EncodingNameToEncodingTypeMapping[name], bestScore = score;
+		/* update the scores and best match */
+		scores[name] = (name in scores ? Math.max(scores[name], score) : score);
+		if (bestScore == null || scores[bestScore] < score)
+			bestScore = name;
+		else if (scores[bestScore] == score && (bestScore == name || bestScore == 'identity' || (bestScore == '*' && name != 'identity')))
+			bestScore = name;
 	}
-	return bestMatch;
+
+	/* check if a best-match has been found */
+	if (bestScore == null || scores[bestScore] <= 0)
+		return null;
+	if (bestScore != null && bestScore != '*')
+		return (bestScore == 'identity' ? null : EncodingNameToEncodingTypeMapping[bestScore]);
+
+	/* lookup the best entry not mentioned (because '*' was the best match) */
+	for (const encoding in EncodingNameToEncodingTypeMapping) {
+		if (!(encoding in scores))
+			return EncodingNameToEncodingTypeMapping[encoding];
+	}
+	return null;
 }
 export function LookupEncoding(name: string): EncodingType | null {
 	return EncodingNameToEncodingTypeMapping[name.trim().toLowerCase()] ?? null;

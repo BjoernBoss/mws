@@ -3,16 +3,19 @@
 import * as libLog from "./log.js";
 import * as libLocation from "./location.js";
 import * as libCache from "./cache.js";
+import * as libBuilder from "./builder.js";
 
 const logger = libLog.Logger('template');
 
 const TemplateDirectory = libLocation.MakeSelfPath(import.meta.url, 'templates');
 function LoadRelative(name: string): string {
 	try {
-		const data: Buffer | null = libCache.GetNormal(TemplateDirectory(name), true)?.readSync() ?? null;
+		const data: Buffer | null = libCache.GetCached(TemplateDirectory(name), true)?.readSync() ?? null;
 		if (data != null)
 			return data.toString('utf-8');
-	} catch (_) { }
+	} catch (err: any) {
+		logger.trace(`Error while loading template [${name}]: ${err.message}`);
+	}
 
 	/* return the default place-holder */
 	logger.error(`Unable to load template [${name}] properly`);
@@ -47,7 +50,7 @@ function ExpandPlaceholders(content: string, map: Record<string, string>, escape
 			if (!(name in map))
 				logger.warning(`Undefined placeholder [${name}] encountered`);
 			else
-				out += (escapeValues ? EscapeHtml(map[name]) : map[name]);
+				out += (escapeValues ? libBuilder.EscapeHtml(map[name]) : map[name]);
 		}
 	}
 
@@ -145,22 +148,6 @@ export function ErrorInternalServerError(payload: { path: string, what: string }
 *	escaped as '{##'; values are html-escaped by default to prevent injection) */
 export function Expand(content: string, args: Record<string, string>, escapeValues: boolean = true): string {
 	return ExpandPlaceholders(content, args, escapeValues);
-}
-
-/* escape html entities to prevent injection when embedding untrusted values into html */
-export function EscapeHtml(content: string): string {
-	let out = '';
-	for (let i = 0; i < content.length; ++i) {
-		switch (content[i]) {
-			case '&': out += '&amp;'; break;
-			case '<': out += '&lt;'; break;
-			case '>': out += '&gt;'; break;
-			case '"': out += '&quot;'; break;
-			case '\'': out += '&#39;'; break;
-			default: out += content[i]; break;
-		}
-	}
-	return out;
 }
 
 /* create the escaped content */

@@ -8,7 +8,7 @@
 </head>
 
 <body>
-	<p style="font-family: monospace;">Operation [{#op}] on [{#path}] successfully executed.</p>
+	<p style="font-family: monospace;">Operation [{#op}] was successful for [{#path}].</p>
 </body>
 
 </html>

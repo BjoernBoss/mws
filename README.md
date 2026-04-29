@@ -47,7 +47,7 @@ export class MyModule implements libInterface.ModuleInterface {
     public name: string = 'my-module';
 
     public async request(client: libClient.HttpRequest): Promise<void> {
-        client.respondString('Hello from my module!', { media: libRequest.Media.Text });
+        client.respond('Hello from my module!', { media: libRequest.Media.Text });
     }
 
     public async upgrade(client: libClient.HttpUpgrade): Promise<void> {
@@ -70,7 +70,7 @@ const dispatch = new libInterface.DispatchModule({
     '/static': fileModule
 });
 const unhandled = new libInterface.UnhandledModule(dispatch, {
-    request: async (client) => { client.respondString('Custom not found', { status: libRequest.Status.NotFound }); }
+    request: async (client) => { client.respond('Custom not found', { status: libRequest.Status.NotFound }); }
 });
 server.listenHttp(8080, unhandled, (host) => host == 'localhost');
 ```
@@ -85,7 +85,7 @@ The `core` workspace provides all server functionality:
 | `request.ts` | HTTP status codes, media types, range parsing, and encoding negotiation (gzip, deflate, brotli, zstd) |
 | `server.ts` | `Server` class managing HTTP/HTTPS listeners with host-header validation |
 | `config.ts` | `CoreConfig` class and global `Config` instance for server name, timeouts, and cache settings |
-| `cache.ts` | File cache with LRU eviction, sync/async read, and streaming |
+| `cache.ts` | File cache with LRU eviction, immutable file versioning, sync/async read, and streaming |
 | `templates.ts` | Template loading and placeholder expansion |
 | `builder.ts` | Programmatic HTML page construction |
 | `location.ts` | Path sanitization, joining, and sub-directory checks |
@@ -97,3 +97,13 @@ The `modules/setup.js` `Run` method receives a `Server` instance and is responsi
 - **Config:** `libConfig.Config` exposes server name, timeouts, and cache settings (via `core/config.js`). Default initialized via `libConfig.Initialize()`, which is called by `main.js`
 - **Logging:** `libLog.AddLogger(...)` for file or custom loggers (via `core/log.js`)
 - **Listeners:** `server.listenHttp(port, module, hostCheck)` or `server.listenHttps(port, key, cert, module, hostCheck)`
+
+## Caching
+
+MWS has a two-layer caching system: a server-side in-memory file cache and HTTP cache headers for client-side caching.
+The in-memory file cache is used to serve frequently used content. Optionally, it determines freshness before every read.
+
+On top of the in-memory caching, the cache system also allows for immutable versioned unique paths to be used, which allows clients to cache entries immutably.
+For this, the given paths are tagged with a `UUID` (`style.css` becomes `style.<uuid>.css`), which is then associated with the given version of the file. This allows content to serve the file as immutable, as the path will change, if the file changes.
+
+Other features for caching include the support for `etag` and `last-modified` to allow clients to identify freshness of their cached content.

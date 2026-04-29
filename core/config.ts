@@ -8,7 +8,7 @@ export class CoreConfig {
 	private _subscriber: (() => void)[] = [];
 	private _serverName: string = '';
 	private _webSocketTimeout: number = 0;
-	private _requestTimeout: number = 0;
+	private _headerTimeout: number = 0;
 	private _connectionTimeout: number = 0;
 	private _keepAliveTimeout: number = 0;
 	private _cacheSize: number = 0;
@@ -18,8 +18,12 @@ export class CoreConfig {
 	private _immutableCacheControl: string = '';
 	private _errorCacheControl: string = '';
 	private _responseCacheControl: string = '';
+	private _throughputCheck: number = 0;
+	private _throughputStartup: number = 0;
+	private _throughputThreshold: number = 0;
 
-	private notifyAll(): void {
+	private changed(name: string, value: unknown): void {
+		logger.info(`${name} set to [${value}]`);
 		for (const fn of this._subscriber)
 			fn();
 	}
@@ -31,124 +35,139 @@ export class CoreConfig {
 		this._subscriber = this._subscriber.filter((v) => v != cb);
 	}
 
+	/* default server name to be used in the http:server header [empty value prevents server header] */
 	public get serverName(): string { return this._serverName; }
 	public set serverName(value: string) {
 		if (this._serverName == value)
 			return;
-
 		this._serverName = value;
-		logger.info(`Server name set to [${this._serverName}]`);
-		this.notifyAll();
+		this.changed('Server name', value);
 	}
 
+	/* default web-socket timeout before performing a ping to determine liveness [in milliseconds] */
 	public get webSocketTimeout(): number { return this._webSocketTimeout; }
 	public set webSocketTimeout(value: number) {
 		if (this._webSocketTimeout == value)
 			return;
-
 		this._webSocketTimeout = value;
-		logger.info(`WebSocket timeout set to [${this._webSocketTimeout}]`);
-		this.notifyAll();
+		this.changed('WebSocket timeout', value);
 	}
 
-	public get requestTimeout(): number { return this._requestTimeout; }
-	public set requestTimeout(value: number) {
-		if (this._requestTimeout == value)
+	/* default timeout for request headers to be fully received [0 implies no timeout, in milliseconds] */
+	public get headerTimeout(): number { return this._headerTimeout; }
+	public set headerTimeout(value: number) {
+		if (this._headerTimeout == value)
 			return;
-
-		this._requestTimeout = value;
-		logger.info(`Request timeout set to [${this._requestTimeout}]`);
-		this.notifyAll();
+		this._headerTimeout = value;
+		this.changed('Header timeout', value);
 	}
 
+	/* default timeout for a connection to be considered dead if no data is received [0 implies no timeout, in milliseconds] */
 	public get connectionTimeout(): number { return this._connectionTimeout; }
 	public set connectionTimeout(value: number) {
 		if (this._connectionTimeout == value)
 			return;
-
 		this._connectionTimeout = value;
-		logger.info(`Connection timeout set to [${this._connectionTimeout}]`);
-		this.notifyAll();
+		this.changed('Connection timeout', value);
 	}
 
+	/* default keep-alive timeout for connections [0 implies no keep-alive, in milliseconds] */
 	public get keepAliveTimeout(): number { return this._keepAliveTimeout; }
 	public set keepAliveTimeout(value: number) {
 		if (this._keepAliveTimeout == value)
 			return;
-
 		this._keepAliveTimeout = value;
-		logger.info(`Keep-alive timeout set to [${this._keepAliveTimeout}]`);
-		this.notifyAll();
+		this.changed('Keep-alive timeout', value);
 	}
 
+	/* maximum sum of data cached before evicting old cache entries [in bytes] */
 	public get cacheSize(): number { return this._cacheSize; }
 	public set cacheSize(value: number) {
 		if (this._cacheSize == value)
 			return;
-
 		this._cacheSize = value;
-		logger.info(`Cache size set to [${this._cacheSize}]`);
-		this.notifyAll();
+		this.changed('Cache size', value);
 	}
 
+	/* allow the usage of stable caches, otherwise all cached entries will re-validate cached entries before serving */
 	public get cacheAllowStable(): boolean { return this._cacheAllowStable; }
 	public set cacheAllowStable(value: boolean) {
 		if (this._cacheAllowStable == value)
 			return;
-
 		this._cacheAllowStable = value;
-		logger.info(`Cache allow stable set to [${this._cacheAllowStable}]`);
-		this.notifyAll();
+		this.changed('Cache allow stable', value);
 	}
 
+	/* maximum file size of files considered to be cached, larger files will not be cached [in bytes] */
 	public get cacheFileSizeLimit(): number { return this._cacheFileSizeLimit; }
 	public set cacheFileSizeLimit(value: number) {
 		if (this._cacheFileSizeLimit == value)
 			return;
-
 		this._cacheFileSizeLimit = value;
-		logger.info(`Cache file size limit set to [${this._cacheFileSizeLimit}]`);
-		this.notifyAll();
+		this.changed('Cache file size limit', value);
 	}
 
-	public get fileCacheControl(): string { return this._fileCacheControl; };
+	/* default cache-control value for normal cache reads [empty string does not set any cache-control] */
+	public get fileCacheControl(): string { return this._fileCacheControl; }
 	public set fileCacheControl(value: string) {
 		if (this._fileCacheControl == value)
 			return;
-
 		this._fileCacheControl = value;
-		logger.info(`File cache control set to [${this._fileCacheControl}]`);
-		this.notifyAll();
+		this.changed('File cache control', value);
 	}
 
-	public get immutableCacheControl(): string { return this._immutableCacheControl; };
+	/* default cache-control value for immutable cache reads [empty string does not set any cache-control] */
+	public get immutableCacheControl(): string { return this._immutableCacheControl; }
 	public set immutableCacheControl(value: string) {
 		if (this._immutableCacheControl == value)
 			return;
-
 		this._immutableCacheControl = value;
-		logger.info(`Immutable cache control set to [${this._immutableCacheControl}]`);
-		this.notifyAll();
+		this.changed('Immutable cache control', value);
 	}
 
-	public get errorCacheControl(): string { return this._errorCacheControl; };
+	/* default cache-control value for any error responses [empty string does not set any cache-control] */
+	public get errorCacheControl(): string { return this._errorCacheControl; }
 	public set errorCacheControl(value: string) {
 		if (this._errorCacheControl == value)
 			return;
-
 		this._errorCacheControl = value;
-		logger.info(`Error cache control set to [${this._errorCacheControl}]`);
-		this.notifyAll();
+		this.changed('Error cache control', value);
 	}
 
-	public get responseCacheControl(): string { return this._responseCacheControl; };
+	/* default cache-control value for any basic responses [empty string does not set any cache-control] */
+	public get responseCacheControl(): string { return this._responseCacheControl; }
 	public set responseCacheControl(value: string) {
 		if (this._responseCacheControl == value)
 			return;
-
 		this._responseCacheControl = value;
-		logger.info(`Response cache control set to [${this._responseCacheControl}]`);
-		this.notifyAll();
+		this.changed('Response cache control', value);
+	}
+
+	/* interval to check if the throughput is valid [in milliseconds] */
+	public get throughputCheck(): number { return this._throughputCheck; }
+	public set throughputCheck(value: number) {
+		if (this._throughputCheck == value)
+			return;
+		this._throughputCheck = value;
+		this.changed('Throughput check', value);
+	}
+
+	/* grace period before the throughput is started to be measured [in milliseconds] */
+	public get throughputStartup(): number { return this._throughputStartup; }
+	public set throughputStartup(value: number) {
+		if (this._throughputStartup == value)
+			return;
+		this._throughputStartup = value;
+		this.changed('Throughput startup', value);
+	}
+
+	/* throughput required for sending/receiving bodies of requests [in bytes/second] */
+	public get throughputThreshold(): number { return this._throughputThreshold; }
+	public set throughputThreshold(value: number) {
+		if (this._throughputThreshold == value)
+			return;
+		this._throughputThreshold = value;
+		this.changed('Throughput threshold', value);
 	}
 }
 
@@ -163,7 +182,7 @@ export const Config: CoreConfig = new CoreConfig();
 export function Initialize(): void {
 	Config.serverName = 'modular-web-server';
 	Config.webSocketTimeout = 60_000;
-	Config.requestTimeout = 120_000;
+	Config.headerTimeout = 45_000;
 	Config.connectionTimeout = 300_000;
 	Config.keepAliveTimeout = 10_000;
 	Config.cacheSize = 50_000_000;
@@ -171,6 +190,9 @@ export function Initialize(): void {
 	Config.cacheFileSizeLimit = 10_000_000;
 	Config.errorCacheControl = 'no-store';
 	Config.responseCacheControl = 'no-cache';
+	Config.throughputCheck = 5_000;
+	Config.throughputStartup = 5_000;
+	Config.throughputThreshold = 1_000;
 
 	/* cache valid for 10minutes */
 	Config.fileCacheControl = 'public, max-age=600, must-revalidate';

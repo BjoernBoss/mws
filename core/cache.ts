@@ -9,7 +9,7 @@ import * as libCrypto from "crypto";
 
 const logger = libLog.Logger('cache');
 
-const ID_EXTENSION_REGEX = '^\\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$';
+const ID_EXTENSION_REGEX: RegExp = /^\\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 function ReadStats(path: string): null | [number, number] {
 	try {
@@ -28,6 +28,7 @@ function ReadStats(path: string): null | [number, number] {
 interface CacheEntry {
 	data: Buffer;
 	mtime: number;
+	age: number;
 	touched: number;
 }
 class CacheManager {
@@ -63,14 +64,14 @@ class CacheManager {
 		}
 	}
 
-	public add(path: string, data: Buffer, mtime: number): void {
+	public add(path: string, data: Buffer, mtime: number, age: number): void {
 		if (!this.cacheable(data.byteLength))
 			return;
 
-		/* check if the entry is already part of the cache */
+		/* check if the entry is already part of the cache and check if the current entry should be evicted */
 		if (path in this.map) {
 			const entry = this.map[path];
-			if (entry.mtime >= mtime)
+			if (entry.age >= age)
 				return;
 			this.drop(path);
 		}
@@ -82,7 +83,7 @@ class CacheManager {
 		/* add the entry to the cache */
 		logger.log(`Added [${path}] to the cache`);
 		this.allocated += data.byteLength;
-		this.map[path] = { data: data, mtime: mtime, touched: ++this.nextStamp };
+		this.map[path] = { data, mtime, touched: ++this.nextStamp, age };
 	}
 	public drop(path: string): void {
 		if (!(path in this.map))
@@ -225,14 +226,14 @@ class ImmutableManager {
 		const [fileSize, mtime] = stats;
 
 		/* check if the stats have changed, in which case a new id needs to be assigned (thus binding the id to the stats) */
-		const wasDirty = (firstFetch || entry.size != fileSize || entry.mtime != mtime);
-		if (!firstFetch && (entry.size != fileSize || entry.mtime != mtime))
+		const statsChanged = (entry.size != fileSize || entry.mtime != mtime);
+		if (!firstFetch && statsChanged)
 			this.assignId(srcPath, entry);
 		entry.size = fileSize;
-		entry.mtime = Math.max(entry.mtime, mtime);
+		entry.mtime = mtime;
 		entry.fetched = true;
 
-		if (wasDirty)
+		if (firstFetch || statsChanged)
 			this.markAsDirty();
 		return [entry, entry.id != id];
 	}
@@ -268,13 +269,15 @@ export class Cached {
 	private data: Buffer | null;
 	private mtime: number;
 	private immutable: boolean;
+	private age: number;
 
-	public constructor(path: string, size: number, data: Buffer | null, mtime: number, immutable: boolean) {
+	public constructor(path: string, size: number, data: Buffer | null, mtime: number, age: number, immutable: boolean) {
 		this.path = path;
 		this.size = size;
 		this.data = data;
 		this.mtime = mtime;
 		this.immutable = immutable;
+		this.age = age;
 	}
 	private makeStream(options?: { start?: number, end?: number }): libStream.Readable {
 		/* check if the data have already been cached */
@@ -286,8 +289,7 @@ export class Cached {
 		try {
 			stream = libFs.createReadStream(this.path, { flags: 'r', start: options?.start, end: options?.end });
 		} catch (err: any) {
-			logger.error(`Filesystem error while streaming [${this.path}]: ${err.message}`);
-			throw new Error('File operation failed');
+			return new libStream.Readable({ read() { this.destroy(new Error(`Error reading file: ${err.message}`)) } });
 		}
 
 		/* check if only a partial file is being read, or it is too large, in which case it will not be added to the cache */
@@ -306,7 +308,7 @@ export class Cached {
 			final: (cb) => {
 				if (settled) return cb(new Error('Reading already completed'));
 				if (totalLength == this.size && cacheManager.cacheable(this.size))
-					cacheManager.add(this.path, Buffer.concat(buffers), this.mtime);
+					cacheManager.add(this.path, Buffer.concat(buffers), this.mtime, this.age);
 				cb(null);
 			}
 		});
@@ -345,12 +347,12 @@ export class Cached {
 		return `${this.mtime}-${this.size}`;
 	}
 
-	/* object must not be used anymore after reading or streaming from it (on errors, logs them and throws exception) */
+	/* [no-throw] object must not be used anymore after reading or streaming from it */
 	public stream(options?: { start?: number, end?: number }): libStream.Readable {
 		return this.makeStream(options);
 	}
 
-	/* object must not be used anymore after reading or streaming from it (on errors, logs them and throws exception) */
+	/* [throws] object must not be used anymore after reading or streaming from it */
 	public readSync(): Buffer {
 		/* check if the data have already been cached */
 		if (this.data != null)
@@ -360,23 +362,20 @@ export class Cached {
 		try {
 			this.data = libFs.readFileSync(this.path);
 		} catch (err: any) {
-			logger.error(`Filesystem error while reading [${this.path}]: ${err.message}`);
-			throw new Error('File operation failed');
+			throw new Error(err);
 		}
 
 		/* check if the file-size changed mid operation */
-		if (this.data.byteLength != this.size) {
-			logger.error(`File size changed mid operation [${this.path}]: [${this.data.byteLength}] != [${this.size}]`);
-			throw new Error('File operation failed');
-		}
+		if (this.data.byteLength != this.size)
+			throw new Error(`File size changed mid operation: [${this.data.byteLength}] != [${this.size}]`);
 
 		/* add the read buffer back to the cache (using the fetched data from before
 		*	reading the file - to detect a file-change since before reading the file) */
-		cacheManager.add(this.path, this.data, this.mtime);
+		cacheManager.add(this.path, this.data, this.mtime, this.age);
 		return this.data;
 	}
 
-	/* object must not be used anymore after reading or streaming from it (on errors, logs them and throws exception) */
+	/* [throws] object must not be used anymore after reading or streaming from it */
 	public async readAsync(): Promise<Buffer> {
 		return new Promise((resolve, reject) => {
 			const stream: libStream.Readable = this.makeStream();
@@ -420,7 +419,7 @@ function ResolveCache(path: string, stable: boolean, checkImmutable: boolean): C
 	/* check if the entry is stable and already in the cache, in which case the file doesn't even need to be checked */
 	let entry = (stable ? cacheManager.find(path, null) : null);
 	if (entry != null && (immutable == null || (immutable.size == entry.data.byteLength && immutable.mtime == entry.mtime)))
-		return new Cached(path, entry.data.byteLength, entry.data, entry.mtime, isImmutable);
+		return new Cached(path, entry.data.byteLength, entry.data, entry.mtime, entry.age, isImmutable);
 
 	/* check if the file exists and read its file-size and mtime (not necessary
 	*	for immutable entries, as their stats are already up-to-date) */
@@ -428,22 +427,24 @@ function ResolveCache(path: string, stable: boolean, checkImmutable: boolean): C
 	if (stats == null)
 		return null;
 	const [fileSize, mtime] = stats;
+	const age = Date.now();
 
 	/* check if the path exists in the validated cache and otherwise return the uncached entry */
 	entry = cacheManager.find(path, { mtime, size: fileSize });
 	if (entry != null)
-		return new Cached(path, fileSize, entry.data, mtime, isImmutable);
-	return new Cached(path, fileSize, null, mtime, isImmutable);
+		return new Cached(path, fileSize, entry.data, mtime, age, isImmutable);
+	return new Cached(path, fileSize, null, mtime, age, isImmutable);
 }
 
-/* [stable]: if cached as stable, dont re-validate the file stats before serving from cache; (Cached to interact with cache;
-*	null, if it does not exist, string if the immutable path has been permanently moved to the new path in source space) */
+/* [stable]: if cached as stable, dont re-validate the file stats before serving from cache; resolve immutable ids automatically (Cached to interact
+*	with cache; null, if it does not exist, string if the immutable path has been permanently moved to the new path in source space) */
 export function Get(path: string, stable: boolean): Cached | string | null {
 	return ResolveCache(path, stable, true);
 }
 
-/* return the cached entry or null without any immutable redirects */
-export function GetNormal(path: string, stable: boolean): Cached | null {
+/* [stable]: if cached as stable, dont re-validate the file stats before serving from cache;
+*	no immutable ids are resolved (Cached to interact with cache; null, if it does not exist) */
+export function GetCached(path: string, stable: boolean): Cached | null {
 	return ResolveCache(path, stable, false) as (Cached | null);
 }
 
