@@ -124,6 +124,13 @@ interface ImmutableEntry {
 	id: string;
 	fetched: boolean;
 }
+interface ImmutableSerialized {
+	id: string;
+	src: string;
+	dst: string | null;
+	size: number;
+	mtime: number;
+}
 class ImmutableManager {
 	private map: Record<string, ImmutableEntry> = {};
 	private reverse: Record<string, string> = {};
@@ -143,7 +150,7 @@ class ImmutableManager {
 		entry.id = id;
 		this.reverse[id] = path;
 	}
-	private async markAsDirty(): Promise<void> {
+	private async storeState(): Promise<void> {
 		if (this.writeBack == null)
 			return;
 		this.writeBack.dirty = true;
@@ -162,7 +169,7 @@ class ImmutableManager {
 			for (const srcPath in this.map) {
 				const entry = this.map[srcPath];
 				if (entry.actual != null)
-					output.push({ id: entry.id, src: srcPath, immutable: entry.immutable, dst: entry.actual, size: entry.size, mtime: entry.mtime });
+					output.push({ id: entry.id, src: srcPath, dst: entry.actual, size: entry.size, mtime: entry.mtime });
 			}
 			const content: string = JSON.stringify(output);
 
@@ -172,6 +179,47 @@ class ImmutableManager {
 
 		this.writeBack.writing = null;
 		resolve!();
+	}
+	private async loadState(path: string): Promise<ImmutableSerialized[]> {
+		logger.trace(`Loading immutable state from [${path}]`);
+
+		/* load the current file and parse it as json (skip any content failed to be read or if the file did not exist) */
+		let state: unknown = null;
+		try {
+			const data = await new Promise<string>((resolve, reject) => libFs.readFile(path, { encoding: 'utf-8' }, (err: any, data: string) => {
+				if (err == null)
+					resolve(data);
+				else
+					reject(err);
+			}));
+			state = JSON.parse(data);
+		} catch (err: any) {
+			if (err.code != 'ENOENT')
+				logger.error(`Error while loading immutable state from [${path}]: ${err.message}`);
+			return [];
+		}
+
+		if (!Array.isArray(state)) {
+			logger.error(`Immutable state [${path}] is malformed (discarding state)`);
+			return [];
+		}
+
+		/* parse all of the values and validate their general structure */
+		let corrupted = 0, output: ImmutableSerialized[] = [];
+		for (const entry of state) {
+			if (typeof entry.id != 'string' || typeof entry.src != 'string' || (typeof entry.dst != 'string' && entry.dst !== null))
+				++corrupted;
+			else if (typeof entry.size != 'number' || !isFinite(entry.size) || entry.size < 0)
+				++corrupted;
+			else if (typeof entry.mtime != 'number' || !isFinite(entry.mtime) || entry.mtime < 0)
+				++corrupted;
+			else
+				output.push({ id: entry.id, src: entry.src, dst: entry.dst, size: entry.size, mtime: entry.mtime });
+		}
+
+		if (corrupted > 0)
+			logger.error(`Immutable loaded state [${path}] contained [${corrupted}] malformed entires`);
+		return output;
 	}
 
 	public make(path: string): string {
@@ -220,7 +268,7 @@ class ImmutableManager {
 			logger.warning(`Immutable path [${entry.actual}] does not exist`);
 			delete this.map[srcPath];
 			delete this.reverse[id];
-			this.markAsDirty();
+			this.storeState();
 			return [null, false];
 		}
 		const [fileSize, mtime] = stats;
@@ -234,7 +282,7 @@ class ImmutableManager {
 		entry.fetched = true;
 
 		if (firstFetch || statsChanged)
-			this.markAsDirty();
+			this.storeState();
 		return [entry, entry.id != id];
 	}
 	public invalidate(): void {
@@ -242,14 +290,35 @@ class ImmutableManager {
 			this.map[path].fetched = false;
 	}
 	public async setWriteBack(path: string): Promise<void> {
+		/* fetch the new state to be written back (before updating the write-back to ensure
+		*	the async operation does not result in the file being overwritten before being read) */
+		let states = ((path == '' || path == this.writeBack?.path) ? [] : await this.loadState(path));
+
 		/* wait for any current write-backs to be complete (loop to prevent race-conditions
 		*	between resolving the promise and performing the next write-back) */
 		while (this.writeBack?.writing != null)
 			await this.writeBack.writing;
-
 		if (path == '') {
 			this.writeBack = null;
 			return;
+		}
+
+		/* merge the loaded state into the current state (prefer current state over loaded state) */
+		for (const state of states) {
+			if (state.src in this.map)
+				continue;
+			logger.trace(`Recovering immutable id [${state.id}] for [${state.src}]`);
+
+			const [name, extension] = libLocation.SplitFileName(state.src);
+			this.map[state.src] = {
+				immutable: `${name}.${state.id}${extension}`,
+				actual: state.dst,
+				size: state.size,
+				mtime: state.mtime,
+				id: state.id,
+				fetched: false
+			};
+			this.reverse[state.id] = state.src;
 		}
 
 		/* check if the writeback should be configured and perform the first write back */
@@ -257,7 +326,7 @@ class ImmutableManager {
 			this.writeBack = { path, writing: null, dirty: false };
 		else if (this.writeBack.path == path)
 			return;
-		this.markAsDirty();
+		this.storeState();
 	}
 }
 const cacheManager: CacheManager = new CacheManager();
@@ -462,7 +531,7 @@ export function Flush(): void {
 	immutableManager.invalidate();
 }
 
-/* configure the write back of the immutable state to ensure persistent ids across restarts */
+/* configure the write back of the immutable state to ensure persistent ids across restarts (will be read upon configuration) */
 export async function ConfigureWriteBack(path: string | null): Promise<void> {
 	await immutableManager.setWriteBack(path ?? '');
 }

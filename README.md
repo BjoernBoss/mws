@@ -25,8 +25,12 @@ This compiles all TypeScript sources and runs `node main.js`, which loads `modul
 An example for a `setup.js` could look like:
 
 ```JavaScript
+import { Config as libConfig } from "core/config.js";
+
 export async function Run(server) {
     try {
+        libConfig.cacheWriteBack('./some_local_path/immutable.cache');
+
         const mod = await import("my-module/app.js");
         server.listenHttp(8080, new mod.MyModule(), (host) => host == 'localhost');
     } catch (e) {

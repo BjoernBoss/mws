@@ -534,7 +534,8 @@ export class HttpRequest extends IncomingBase {
 		headers['Date'] = new Date().toUTCString();
 		if (libConfig.serverName != '')
 			headers['Server'] = libConfig.serverName;
-		headers['X-Content-Type-Options'] = 'nosniff';
+		for (const [key, value] of Object.entries(libConfig.commonHeaders))
+			headers[key] = value;
 		if (!('Accept-Ranges' in headers))
 			headers['Accept-Ranges'] = 'none';
 		if (contentSize != null)
@@ -549,9 +550,9 @@ export class HttpRequest extends IncomingBase {
 		/* setup the response status and headers (guard against invalid header values from patchers or modules) */
 		this.response.statusCode = status.code;
 		this.response.statusMessage = status.msg;
-		for (const key in headers) {
+		for (const [key, value] of Object.entries(headers)) {
 			try {
-				this.response.setHeader(key, headers[key]);
+				this.response.setHeader(key, value);
 			} catch (err: any) {
 				this.error(`Failed to set header [${key}]: ${err.message}`);
 			}
@@ -1189,7 +1190,8 @@ export class HttpUpgrade extends IncomingBase {
 		headers['Date'] = new Date().toUTCString();
 		if (libConfig.serverName != '')
 			headers['Server'] = libConfig.serverName;
-		headers['X-Content-Type-Options'] = 'nosniff';
+		for (const [key, value] of Object.entries(libConfig.commonHeaders))
+			headers[key] = value;
 		headers['Accept-Ranges'] = 'none';
 		headers['Connection'] = 'close';
 
@@ -1199,11 +1201,11 @@ export class HttpUpgrade extends IncomingBase {
 
 		/* construct the entire header content and send it away (sanitize values to prevent response splitting) */
 		let headerText = `HTTP/1.1 ${status.code} ${status.msg}\r\n`;
-		for (const key in headers) {
-			if (headers[key].match(BAD_HEADER_VALUE_REGEX))
+		for (const [key, value] of Object.entries(headers)) {
+			if (value.match(BAD_HEADER_VALUE_REGEX))
 				this.error(`Failed to set header [${key}]: Bad header value`);
 			else
-				headerText += `${key}: ${headers[key]}\r\n`;
+				headerText += `${key}: ${value}\r\n`;
 		}
 		headerText += '\r\n';
 		this.socket.write(headerText, 'utf-8');

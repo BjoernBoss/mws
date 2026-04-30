@@ -110,7 +110,7 @@ export function SplitFileName(path: string): [string, string] {
 	return [path.substring(name + 1, dot), path.substring(dot)];
 }
 
-/* perform an atomic write by first writing the file to [path.temp] and then replacing it (returns false on failure) */
+/* perform an atomic write by first writing the file to [path.temp] and then replacing it (logs on failures and returns false, encoded as utf-8) */
 export async function AtomicWrite(path: string, content: string, what: string, _logger: libLog.LogIdentity): Promise<boolean> {
 	const tempPath = `${path}.temp`;
 

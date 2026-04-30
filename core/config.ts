@@ -21,6 +21,7 @@ export class CoreConfig {
 	private _throughputCheck: number = 0;
 	private _throughputStartup: number = 0;
 	private _throughputThreshold: number = 0;
+	private _commonHeaders: Record<string, string> = {};
 
 	private changed(name: string, value: unknown): void {
 		logger.info(`${name} set to [${value}]`);
@@ -42,6 +43,16 @@ export class CoreConfig {
 			return;
 		this._serverName = value;
 		this.changed('Server name', value);
+	}
+
+	/* defaule header values to be added to every http response [can also be done via headerPatchers] */
+	public get commonHeaders(): Record<string, string> { return this._commonHeaders; }
+	public set commonHeaders(value: Record<string, string>) {
+		const _current = Object.entries(this._commonHeaders);
+		if (_current.length == Object.keys(value).length && _current.every(([k, v]) => value[k] === v))
+			return;
+		this._commonHeaders = value;
+		this.changed('Common headers', JSON.stringify(value));
 	}
 
 	/* default web-socket timeout before performing a ping to determine liveness [0 disables the timeout; in milliseconds] */
@@ -177,6 +188,13 @@ export class CoreConfig {
 		this._throughputThreshold = value;
 		this.changed('Throughput threshold', value);
 	}
+
+	/* directly forwarded to cache [ConfigureWriteBack] but for consistency also here [cannot be subscribed to] */
+	public async cacheWriteBack(path: string | null): Promise<void> {
+		/* defer, as the cache initialization imports this module again and interacts with it at initialization */
+		const config = await import("./cache.js");
+		return config.ConfigureWriteBack(path);
+	}
 }
 
 /*
@@ -189,6 +207,7 @@ export const Config: CoreConfig = new CoreConfig();
 */
 export function Initialize(): void {
 	Config.serverName = 'modular-web-server';
+	Config.commonHeaders = { 'X-Content-Type-Options': 'nosniff' };
 	Config.webSocketTimeout = 60_000;
 	Config.headerTimeout = 30_000;
 	Config.connectionTimeout = 60_000;
