@@ -36,6 +36,8 @@ export class HtmlGuard {
 		return new HtmlGuard(safe ? str : EscapeHtml(str));
 	}
 }
+
+/* create a secure string [if safe is true, content is taken as-is; otherwise it is html escaped] */
 export function Safe(content: string, safe: boolean = true): HtmlGuard {
 	return HtmlGuard.make(content, safe);
 }
@@ -108,14 +110,28 @@ export class DualTag implements HtmlComponent {
 
 /* full html page; automatically adds utf-8 charset and defaults language to 'en' */
 export class HtmlPage {
-	public head: HtmlComponent[];
-	public body: HtmlComponent[];
+	private _head: HtmlComponent[];
+	private _body: HtmlComponent[];
 	public language: HtmlString;
 
 	constructor(language: HtmlString = 'en', head: HtmlComponent[] | HtmlComponent = [], body: HtmlComponent[] | HtmlComponent = []) {
-		this.head = (Array.isArray(head) ? head : [head]);
-		this.body = (Array.isArray(body) ? body : [body]);
+		this._head = (Array.isArray(head) ? head : [head]);
+		this._body = (Array.isArray(body) ? body : [body]);
 		this.language = language;
+	}
+
+	public get head(): HtmlComponent[] {
+		return this._head;
+	}
+	public set head(value: HtmlComponent | HtmlComponent[]) {
+		this._head = (Array.isArray(value) ? value : [value]);
+	}
+
+	public get body(): HtmlComponent[] {
+		return this._body;
+	}
+	public set body(value: HtmlComponent | HtmlComponent[]) {
+		this._body = (Array.isArray(value) ? value : [value]);
 	}
 
 	public finalize(): string {
@@ -126,9 +142,9 @@ export class HtmlPage {
 		const page = new DualTag('html', properties, [
 			new DualTag('head', {}, [
 				new SingleTag('meta', { charset: 'utf-8' }),
-				...this.head
+				...this._head
 			]),
-			new DualTag('body', { style: 'margin:0;height:100%;display:flex;' }, this.body)
+			new DualTag('body', { style: 'margin:0;height:100%;display:flex;' }, this._body)
 		]);
 		return `<!DOCTYPE html>\n${page.finalize('')}`;
 	}

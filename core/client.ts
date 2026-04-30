@@ -986,14 +986,12 @@ export class HttpRequest extends IncomingBase {
 		}
 		if (!this.isHead)
 			lightBuild = false;
+		const content = (lightBuild ? null : Buffer.from(page.finalize(), 'utf-8'));
 
 		/* mark first as completed now */
 		this.log(`Responding with HTML content and status [${status.msg}]${lightBuild ? ' as light-build' : ''}`);
 		this.state = ResponseState.completed;
-		if (lightBuild)
-			this.finalizeBufferHeader(status, false, headers, { media: libRequest.Media.Html, body: null });
-		else
-			this.finalizeBufferHeader(status, false, headers, { media: libRequest.Media.Html, body: Buffer.from(page.finalize(), 'utf-8') });
+		this.finalizeBufferHeader(status, false, headers, { media: libRequest.Media.Html, body: content });
 	}
 
 	/* [no-throw but errors] send data with [media type] and [status] and return a writable stream (default status is ok, media is unknown)

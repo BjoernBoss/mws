@@ -19,7 +19,7 @@ function LoadRelative(name: string): string {
 
 	/* return the default place-holder */
 	logger.error(`Unable to load template [${name}] properly`);
-	return '<!doctype html><html><body><p style="font-family: monospace;">Response message not found.</p></body></html>';
+	return '<!DOCTYPE html><html><body><p style="font-family: monospace;">Response message not found.</p></body></html>';
 }
 function ExpandPlaceholders(content: string, map: Record<string, string>, escapeValues: boolean = true): string {
 	let out = '', name = '', placeholder = false;
