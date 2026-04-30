@@ -26,6 +26,8 @@ const NOT_DECODED_STRING: Record<string, string> = {
 };
 const BAD_HEADER_VALUE_REGEX: RegExp = /[\x00-\x1f\x7f]/;
 
+let NextClientId: number = 0;
+
 export class ClientContext {
 	public logIdentity: string;
 	public basePath: string;
@@ -144,7 +146,7 @@ export class ClientBase extends libLog.LogIdentity {
 export type HeaderPatch = (status: libRequest.StatusType, headers: Record<string, string>, error: boolean) => void;
 
 /* look at the page and modify it or the headers accordingly (return true if this was only a light/shallow
-*	build, due to a HEAD request; can be interrupted by returning an alternate response - such as an error) */
+*	build, due to a HEAD request; can be interrupted by returning an alternate response marked as an error) */
 export type HtmlPatch = (page: libBuilder.HtmlPage, status: libRequest.StatusType, headers: Record<string, string>, shouldLightBuild: boolean) => boolean;
 
 enum ReceiveState {
@@ -159,9 +161,6 @@ enum ResponseState {
 	completed,
 	broken
 }
-
-let NextClientId: number = 0;
-const WebSocketServerInstance: libWs.Server = new libWs.WebSocketServer({ noServer: true });
 
 /*
 *	Does not throw any exceptions, unless explicitly stated.
@@ -208,7 +207,7 @@ export abstract class IncomingBase extends ClientBase {
 		const throughput = 1000.0 * (this.throughput.processed / Math.max(1, Date.now() - this.throughput.start));
 		this.throughput.timer = setTimeout(() => this.checkThroughput(), libConfig.throughputCheck);
 
-		/* check if the connection should be closed (give it one check cycle grace to process the response) */
+		/* check if the connection should be closed (if this is the first response, give it one check cycle grace to process the response) */
 		if (throughput >= libConfig.throughputThreshold)
 			return;
 		if (this.state != ResponseState.completed && this.state != ResponseState.broken)
@@ -395,7 +394,9 @@ export abstract class IncomingBase extends ClientBase {
 
 	/* respond with [request-timeout] and a pre-defined html template response */
 	public respondRequestTimeout(reason: string, options?: { error?: boolean, headers?: Record<string, string> }): void {
-		this.constructQuickResponse(libRequest.Status.RequestTimeout, ` due to [${reason}]`, options?.error, options?.headers, {
+		const header = (options?.headers ?? {});
+		header['Connection'] = 'close';
+		this.constructQuickResponse(libRequest.Status.RequestTimeout, ` due to [${reason}]`, options?.error, header, {
 			media: libRequest.Media.Html, body: Buffer.from(libTemplates.ErrorRequestTimeout({ path: this.url.pathname, reason }), 'utf-8')
 		});
 	}
@@ -466,13 +467,17 @@ export class HttpRequest extends IncomingBase {
 		if (content == null)
 			this.closeHeader(status, null, null, false, '', headers, error);
 		else {
-			/* check if the data should be encoded (if no content is given, pretend the contend is large enough) */
-			const encoding = libRequest.EncodingOption(this.requestHeaders['accept-encoding'] ?? null, content.body?.byteLength ?? libRequest.MIN_ENCODING_SIZE, content.media);
-			if (encoding != null) {
-				if (content.body != null)
-					content.body = encoding.encodeBuffer(content.body);
-				headers['Content-Encoding'] = encoding.name;
+			/* check if the data should be encoded (if the size is not known, pretend the buffer to be large enough) */
+			let encoding: libRequest.EncodingType | null = null;
+			if (libRequest.ShouldEncode(content.body?.byteLength ?? null, content.media)) {
 				headers['Vary'] = 'Accept-Encoding';
+
+				encoding = libRequest.SelectEncoding(this.requestHeaders['accept-encoding'] ?? null);
+				if (encoding != null) {
+					if (content.body != null)
+						content.body = encoding.encodeBuffer(content.body);
+					headers['Content-Encoding'] = encoding.name;
+				}
 			}
 			this.closeHeader(status, content.media, content.body?.byteLength ?? null, false, encoding?.name ?? '', headers, error);
 		}
@@ -529,6 +534,7 @@ export class HttpRequest extends IncomingBase {
 		headers['Date'] = new Date().toUTCString();
 		if (libConfig.serverName != '')
 			headers['Server'] = libConfig.serverName;
+		headers['X-Content-Type-Options'] = 'nosniff';
 		if (!('Accept-Ranges' in headers))
 			headers['Accept-Ranges'] = 'none';
 		if (contentSize != null)
@@ -563,7 +569,8 @@ export class HttpRequest extends IncomingBase {
 			return makeErrorStream('Connection is broken');
 		this.receive = ReceiveState.receiving;
 
-		/* setup the accumulation transformer (which will also be returned in the end) */
+		/* setup the accumulation transformer (which will also be returned in the end; mark receiving
+		*	as completed upon destroy - will automatically drain the request on cleanup) */
 		let accumulated = 0;
 		const output = new libStream.Transform({
 			transform: (chunk, _, cb) => {
@@ -582,33 +589,27 @@ export class HttpRequest extends IncomingBase {
 					return cb(null, chunk);
 				this.respondContentTooLarge(maxLength, accumulated, { error: true });
 				cb(new Error('Request payload is too large'));
+			},
+			destroy: (err, cb) => {
+				if (this.receive == ReceiveState.receiving) {
+					this.request.unpipe();
+					this.receive = ReceiveState.completed;
+				}
+				cb(err);
 			}
 		});
-
-		/* mark the receiving as completed - will automatically drain the request on cleanup */
-		const performCleanup = (err: any) => {
-			if (this.receive == ReceiveState.receiving) {
-				this.request.unpipe();
-				this.receive = ReceiveState.completed;
-			}
-			if (!output.destroyed)
-				output.destroy(err);
-		};
-		output.on('close', () => performCleanup(null));
-		output.on('error', (err: any) => performCleanup(err));
 
 		/* check if the content is encoded and create the chain of decoders (in reverse to ensure the nesting is correct) */
 		let stream: libStream.Readable = this.request;
 		if (this.requestHeaders['content-encoding'] != null) {
-			const encodings = this.requestHeaders['content-encoding'].split(',');
+			const encodings = libRequest.SplitAndTrimList(this.requestHeaders['content-encoding'], ',', false);
 
 			for (let i = encodings.length - 1; i >= 0; --i) {
 				const encoding = libRequest.LookupEncoding(encodings[i]);
 
 				if (encoding == null) {
-					performCleanup(null);
-					const accepted = libRequest.SupportedEncodingNames().join(',');
-					this.respondUnsupported(encodings[i], accepted, { error: true });
+					output.destroy();
+					this.respondUnsupported(encodings[i], libRequest.SupportedEncodingNames().join(','), { error: true });
 					return makeErrorStream('Unsupported content encoding');
 				}
 
@@ -632,7 +633,7 @@ export class HttpRequest extends IncomingBase {
 
 			/* check if the length is valid and otherwise mark the request as 'consumed' */
 			if (!isFinite(contentSize) || contentSize < 0 || contentSize > maxLength) {
-				performCleanup(null);
+				output.destroy();
 				this.respondContentTooLarge(maxLength, contentSize, { error: true });
 				return makeErrorStream('Request payload is too large');
 			}
@@ -677,18 +678,19 @@ export class HttpRequest extends IncomingBase {
 			return this.sendClientWrite(resp, chunk, last, cb);
 		}
 
-		/* lookup the dynamic encoder (range content cannot be dynamically encoded, as it cannot be random accessed,
-		*	and otherwise skip trivial checks like no content; for [head] and no explicit content, default to MIN_ENCODING_SIZE
-		*	to just assume an encoding - can always be disabled in the real run, should the data be too short) */
-		let encoding = null, minContentSize = (fullContentSize ?? chunk?.byteLength ?? libRequest.MIN_ENCODING_SIZE);
-		if (!resp.noEncoding && minContentSize > 0)
-			encoding = libRequest.EncodingOption(this.requestHeaders['accept-encoding'] ?? null, minContentSize, resp.contentType);
+		/* lookup the dynamic encoder (range content cannot be dynamically encoded, as it cannot be random
+		*	accessed; for [head] and no explicit content, default to size being valid to just assume an
+		*	encoding - can always be disabled in the real run, should the data be too short) */
+		let encoding = null;
+		if (!resp.noEncoding && libRequest.ShouldEncode(fullContentSize ?? chunk?.byteLength ?? null, resp.contentType)) {
+			resp.headers['Vary'] = 'Accept-Encoding';
+			encoding = libRequest.SelectEncoding(this.requestHeaders['accept-encoding'] ?? null);
+		}
 		if (encoding == null) {
 			this.closeHeader(resp.status, resp.contentType, fullContentSize, true, '', resp.headers, false);
 			return this.sendClientWrite(resp, chunk, last, cb);
 		}
 		resp.headers['Content-Encoding'] = encoding.name;
-		resp.headers['Vary'] = 'Accept-Encoding';
 		resp.headers['Accept-Ranges'] = 'none';
 
 		/* for HEAD, clear the content size, as it is not known through the encoder, and for real
@@ -825,7 +827,7 @@ export class HttpRequest extends IncomingBase {
 
 	/* ensure the media-type is one of the list and otherwise return null and auto-respond with [unsupported-media-type] (defaults to first type) */
 	public ensureMediaType(types: libRequest.MediaType[]): libRequest.MediaType | null {
-		const type = this.requestHeaders['content-type']?.toLowerCase().split(';')[0].trim();
+		const type = libRequest.SplitAndTrimList(this.requestHeaders['content-type'] ?? null, ';', true)[0] ?? null;
 		if (type == null)
 			return types[0];
 		for (let i = 0; i < types.length; ++i) {
@@ -842,28 +844,29 @@ export class HttpRequest extends IncomingBase {
 		if (type == null)
 			return defEncoding;
 
-		let index = type.indexOf('charset=');
-		if (index == -1)
-			return defEncoding;
-		index += 8;
+		/* look for the first charset entry in the content-type list */
+		for (const part of libRequest.SplitAndTrimList(type, ';', true)) {
+			if (part.substring(0, 8).toLowerCase() != 'charset=')
+				continue;
+			let value = part.substring(8).trim();
 
-		/* remove the potential quotes around the charset */
-		let end = index;
-		if (end < type.length && type[end] == '"') {
-			end = type.indexOf('"', ++index);
-			if (end == -1)
-				return defEncoding;
+			/* remove the potential quotes around the charset value */
+			const quoted = value.startsWith('"');
+			if (quoted != value.endsWith('"'))
+				break;
+			if (quoted)
+				value = value.substring(1, value.length - 1).trim();
+
+			if (value.length == 0)
+				break;
+			return value.trim().toLowerCase();
 		}
-		else while (end < type.length && type[end] != ';')
-			++end;
-
-		if (index == end)
-			return defEncoding;
-		return type.substring(index, end).trim().toLowerCase();
+		return defEncoding;
 	}
 
 	/* [no-throw but errors] receive the payload of given max length as a readable stream
-	*	automatically responds with given exceptions if the payload cannot be received properly */
+	*	automatically responds with given exceptions if the payload cannot be received properly
+	*	automatically drained if the readable stream is destroyed before reading all data */
 	public receiveData(maxLength: number | null): libStream.Readable {
 		return this.receiveClientData(maxLength);
 	}
@@ -1048,6 +1051,7 @@ export class HttpRequest extends IncomingBase {
 
 		/* mark byte-ranges to be supported in principle and add the caching properties */
 		const headers = (options?.headers ?? {}), etag = `"${cached.uniqueId()}"`;
+		const media = options?.media ?? libRequest.LookupMediaTypeFromFile(filePath);
 		headers['Accept-Ranges'] = 'bytes';
 		headers['Last-Modified'] = cached.lastModified();
 		headers['ETag'] = etag;
@@ -1057,6 +1061,10 @@ export class HttpRequest extends IncomingBase {
 			else if (libConfig.fileCacheControl != '')
 				headers['Cache-Control'] = libConfig.fileCacheControl;
 		}
+
+		/* add the variation on accept-encoding to ensure all other responses contain it */
+		if (options?.encoded != null || (range.state == libRequest.RangeState.noRange && libRequest.ShouldEncode(cached.fileSize(), media)))
+			headers['Vary'] = 'Accept-Encoding';
 
 		/* validate the conditions */
 		if (this.requestHeaders['if-match'] != null && !libRequest.ETagMatchesList(etag, this.requestHeaders['if-match'])) {
@@ -1079,7 +1087,6 @@ export class HttpRequest extends IncomingBase {
 				return true;
 			}
 		}
-		const media = options?.media ?? libRequest.LookupMediaTypeFromFile(filePath);
 
 		/* check if the file is empty (can only happen for unused ranges, which would otherwise have issues) */
 		if (cached.fileSize() == 0) {
@@ -1166,11 +1173,13 @@ class HttpRequestResponse extends libStream.Writable {
 export class HttpUpgrade extends IncomingBase {
 	private socket: libStream.Duplex;
 	private head: Buffer;
+	private wss: libWs.WebSocketServer;
 
-	constructor(request: libHttp.IncomingMessage, socket: libStream.Duplex, head: Buffer, host: string, protocol: string) {
+	constructor(request: libHttp.IncomingMessage, socket: libStream.Duplex, head: Buffer, host: string, protocol: string, wss: libWs.WebSocketServer) {
 		super(request, host, protocol);
 		this.socket = socket;
 		this.head = head;
+		this.wss = wss;
 	}
 
 	protected override finalizeBufferHeader(status: libRequest.StatusType, error: boolean, headers: Record<string, string>, content: { media: libRequest.MediaType, body: Buffer | null } | null): void {
@@ -1182,6 +1191,7 @@ export class HttpUpgrade extends IncomingBase {
 		headers['Date'] = new Date().toUTCString();
 		if (libConfig.serverName != '')
 			headers['Server'] = libConfig.serverName;
+		headers['X-Content-Type-Options'] = 'nosniff';
 		headers['Accept-Ranges'] = 'none';
 		headers['Connection'] = 'close';
 
@@ -1224,14 +1234,14 @@ export class HttpUpgrade extends IncomingBase {
 	}
 
 	/* marks the object as having been handled (return false, if connection is not a valid websocket upgrade request) */
-	public tryAcceptWebSocket(cb: (ws: ClientSocket) => void): boolean {
+	public tryAcceptWebSocket(cb: (ws: ClientSocket) => Promise<void>): boolean {
 		if (this.state != ResponseState.none) {
 			this.respondBadInternalUsage();
 			return true;
 		}
 
 		/* check if the connection is a valid upgrade request */
-		let connection = this.requestHeaders?.connection?.toLowerCase().split(',').map((v) => v.trim());
+		let connection = libRequest.SplitAndTrimList(this.requestHeaders.connection?.toLowerCase() ?? null, ',', false);
 		if (connection == null || connection.indexOf('upgrade') == -1)
 			return false;
 		if (this.requestHeaders?.upgrade?.toLowerCase() != 'websocket' || this.request.method != 'GET')
@@ -1246,13 +1256,13 @@ export class HttpUpgrade extends IncomingBase {
 		/* perform the upgrade (websocket will automatically send http error responses and close the socket
 		*	on errors in the upgrade process) and restore the context when the accept was performed */
 		this.trace(`Performing upgrade on web socket connection [${this.fullPath}]`);
-		WebSocketServerInstance.handleUpgrade(this.request, this.socket, this.head, (ws, request) => {
+		this.wss.handleUpgrade(this.request, this.socket, this.head, async (ws, request) => {
 			const current = this.restore(snapshot);
 			try {
-				WebSocketServerInstance.emit('connection', ws, request);
+				this.wss.emit('connection', ws, request);
 
 				/* the restored client ensures the websocket object is in the right logging and path context */
-				cb(new ClientSocket(ws, this));
+				await cb(new ClientSocket(ws, this));
 			} catch (err: any) {
 				this.error(`Unhandled exception while processing web socket accept: ${err.message}`);
 				ws.close();
@@ -1308,6 +1318,8 @@ export class ClientSocket extends ClientBase {
 
 	private checkIsAlive(): void {
 		this.aliveTimer = null;
+		if (libConfig.webSocketTimeout == 0)
+			return;
 
 		/* cycle through the alive state and check again */
 		if (!this.isAlive)
@@ -1328,7 +1340,7 @@ export class ClientSocket extends ClientBase {
 		this.isAlive = true;
 		if (this.aliveTimer != null)
 			clearTimeout(this.aliveTimer);
-		this.aliveTimer = setTimeout(() => this.checkIsAlive(), libConfig.webSocketTimeout);
+		this.aliveTimer = (libConfig.webSocketTimeout == 0 ? null : setTimeout(() => this.checkIsAlive(), libConfig.webSocketTimeout));
 	}
 	private closeSelf(): void {
 		if (this.ws.readyState != libWs.WebSocket.CLOSED)

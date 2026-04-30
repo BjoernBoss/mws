@@ -44,36 +44,41 @@ export class CoreConfig {
 		this.changed('Server name', value);
 	}
 
-	/* default web-socket timeout before performing a ping to determine liveness [in milliseconds] */
+	/* default web-socket timeout before performing a ping to determine liveness [0 disables the timeout; in milliseconds] */
 	public get webSocketTimeout(): number { return this._webSocketTimeout; }
 	public set webSocketTimeout(value: number) {
+		value = Math.max(value, 0);
 		if (this._webSocketTimeout == value)
 			return;
 		this._webSocketTimeout = value;
 		this.changed('WebSocket timeout', value);
 	}
 
-	/* default timeout for request headers to be fully received [0 implies no timeout, in milliseconds] */
+	/* default timeout for request headers to be fully received [0 disables the timeout; in milliseconds] */
 	public get headerTimeout(): number { return this._headerTimeout; }
 	public set headerTimeout(value: number) {
+		value = Math.max(value, 0);
 		if (this._headerTimeout == value)
 			return;
 		this._headerTimeout = value;
 		this.changed('Header timeout', value);
 	}
 
-	/* default timeout for a connection to be considered dead if no data is received [0 implies no timeout, in milliseconds] */
+	/* default inactivity timeout — connection is closed if no data is sent or received; resets on any
+	*	I/O activity, so active transfers are not affected [0 disables the timeout; in milliseconds] */
 	public get connectionTimeout(): number { return this._connectionTimeout; }
 	public set connectionTimeout(value: number) {
+		value = Math.max(value, 0);
 		if (this._connectionTimeout == value)
 			return;
 		this._connectionTimeout = value;
 		this.changed('Connection timeout', value);
 	}
 
-	/* default keep-alive timeout for connections [0 implies no keep-alive, in milliseconds] */
+	/* idle time allowed between requests before closing a keep-alive connection [0 falls back to connectionTimeout; in milliseconds] */
 	public get keepAliveTimeout(): number { return this._keepAliveTimeout; }
 	public set keepAliveTimeout(value: number) {
+		value = Math.max(value, 0);
 		if (this._keepAliveTimeout == value)
 			return;
 		this._keepAliveTimeout = value;
@@ -146,6 +151,7 @@ export class CoreConfig {
 	/* interval to check if the throughput is valid [in milliseconds] */
 	public get throughputCheck(): number { return this._throughputCheck; }
 	public set throughputCheck(value: number) {
+		value = Math.max(value, 0);
 		if (this._throughputCheck == value)
 			return;
 		this._throughputCheck = value;
@@ -155,15 +161,17 @@ export class CoreConfig {
 	/* grace period before the throughput is started to be measured [in milliseconds] */
 	public get throughputStartup(): number { return this._throughputStartup; }
 	public set throughputStartup(value: number) {
+		value = Math.max(value, 0);
 		if (this._throughputStartup == value)
 			return;
 		this._throughputStartup = value;
 		this.changed('Throughput startup', value);
 	}
 
-	/* throughput required for sending/receiving bodies of requests [in bytes/second] */
+	/* throughput required for sending/receiving bodies of requests [0 disables the throughput check, in bytes/second] */
 	public get throughputThreshold(): number { return this._throughputThreshold; }
 	public set throughputThreshold(value: number) {
+		value = Math.max(value, 0);
 		if (this._throughputThreshold == value)
 			return;
 		this._throughputThreshold = value;
@@ -182,8 +190,8 @@ export const Config: CoreConfig = new CoreConfig();
 export function Initialize(): void {
 	Config.serverName = 'modular-web-server';
 	Config.webSocketTimeout = 60_000;
-	Config.headerTimeout = 45_000;
-	Config.connectionTimeout = 300_000;
+	Config.headerTimeout = 30_000;
+	Config.connectionTimeout = 60_000;
 	Config.keepAliveTimeout = 10_000;
 	Config.cacheSize = 50_000_000;
 	Config.cacheAllowStable = true;

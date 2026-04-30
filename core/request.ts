@@ -153,30 +153,14 @@ export function ETagMatchesList(etag: string, header: string | null): boolean {
 	if (header == null)
 		return false;
 
-	/* parse comma-separated list while respecting quoted strings */
-	const list: string[] = [];
-	let current = '', inQuote = false;
-	for (const c of header) {
-		if (c == ',' && !inQuote) {
-			list.push(current);
-			current = '';
-		}
-		else {
-			if (c == '"')
-				inQuote = !inQuote;
-			current += c;
-		}
-	}
-	list.push(current);
-
-	if (list.length == 1 && list[0].trim() == '*')
+	const list: string[] = SplitAndTrimList(header, ',', true);
+	if (list.length == 1 && list[0] == '*')
 		return true;
 
 	/* check if its a weak comparison and strip W/ prefix and compare opaque-tags */
 	const target = etag.startsWith('W/') ? etag.substring(2) : etag;
 	for (const entry of list) {
-		const trimmed = entry.trim();
-		if (target == (trimmed.startsWith('W/') ? trimmed.substring(2) : trimmed))
+		if (target == (entry.startsWith('W/') ? entry.substring(2) : entry))
 			return true;
 	}
 	return false;
@@ -220,19 +204,25 @@ export function BuildMediaTypeIdentifier(media: MediaType): string {
 	return `${media.mediaType}; ${media.encoding}`;
 }
 
-/* does not respect 'no-identity' encoding requests */
+/* an unknown at-least-size is considered valid */
 export const MIN_ENCODING_SIZE: number = 1_000;
-export function EncodingOption(accept: string | null, atLeastSize: number, mediaType: MediaType): EncodingType | null {
-	/* check if any accepted encodings can be found or if the type/size does not make sense */
-	if (accept == null || atLeastSize < MIN_ENCODING_SIZE || !mediaType.compressible)
+export function ShouldEncode(atLeastSize: number | null, media: MediaType): boolean {
+	if (!media.compressible)
+		return false;
+	return (atLeastSize == null || atLeastSize >= MIN_ENCODING_SIZE);
+}
+
+/* does not respect 'no-identity' encoding requests */
+export function SelectEncoding(accept: string | null): EncodingType | null {
+	if (accept == null)
 		return null;
 
 	/* parse the encoding types and their score */
 	const scores: Record<string, number> = {};
 	let bestScore: string | null = null;
-	for (const part of accept.split(',')) {
-		const segments = part.split(';');
-		const name = segments[0].trim().toLowerCase();
+	for (const part of SplitAndTrimList(accept, ',', false)) {
+		const segments = SplitAndTrimList(part, ';', false);
+		const name = segments[0].toLowerCase();
 
 		/* check if the name is even supported and otherwise drop it */
 		if (!(name in EncodingNameToEncodingTypeMapping) && name != '*')
@@ -270,8 +260,30 @@ export function EncodingOption(accept: string | null, atLeastSize: number, media
 	return null;
 }
 export function LookupEncoding(name: string): EncodingType | null {
-	return EncodingNameToEncodingTypeMapping[name.trim().toLowerCase()] ?? null;
+	return EncodingNameToEncodingTypeMapping[name.toLowerCase()] ?? null;
 }
 export function SupportedEncodingNames(): string[] {
 	return Object.keys(EncodingNameToEncodingTypeMapping);
+}
+
+/* split a list value while removing whitespace and optionally respecting quotes (returns empty list on validly quoted strings) */
+export function SplitAndTrimList(content: string | null, separator: string, quotesAware: boolean): string[] {
+	if (content == null)
+		return [];
+
+	let output: string[] = [], current = '', inQuote = false;
+	for (const c of content) {
+		if (c == '"' && quotesAware)
+			inQuote = !inQuote, current += c;
+		else if (c != separator || inQuote)
+			current += c
+		else
+			output.push(current.trim()), current = '';
+	}
+
+	if (inQuote)
+		return [];
+	output.push(current.trim());
+
+	return output;
 }

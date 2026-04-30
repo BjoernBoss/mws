@@ -9,7 +9,7 @@ import * as libCrypto from "crypto";
 
 const logger = libLog.Logger('cache');
 
-const ID_EXTENSION_REGEX: RegExp = /^\\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const ID_EXTENSION_REGEX: RegExp = /^\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function ReadStats(path: string): null | [number, number] {
 	try {

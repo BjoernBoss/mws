@@ -10,15 +10,21 @@ import * as libHttp from "http";
 import * as libFs from "fs";
 import * as libStream from "stream";
 import * as libNet from "net";
+import * as libWs from "ws";
 
 const logger = libLog.Logger('server');
 
+const DEFAULT_SERVER_TIMEOUT_CHECK: number = 10_000;
+const DEFAULT_SERVER_STOP_KILL_IDLE_REPEAT: number = 500;
+
 export class Server {
 	private stopList: ((forceShutdown: boolean) => Promise<void>)[];
+	private wss: libWs.WebSocketServer;
 
 	constructor() {
 		logger.info(`Server object created`);
 		this.stopList = [];
+		this.wss = new libWs.WebSocketServer({ noServer: true });
 	}
 
 	private respondBadEndpoint(request: libHttp.IncomingMessage, client: libClient.HttpRequest | libClient.HttpUpgrade): void {
@@ -83,19 +89,19 @@ export class Server {
 	}
 	private handleUpgrade(request: libHttp.IncomingMessage, socket: libStream.Duplex, head: Buffer, check: libInterface.CheckHost, handler: libInterface.ModuleInterface, port: number, secure: boolean): void {
 		this.handleWrapper(false, request, check, handler, port, (host: string): libClient.HttpUpgrade => {
-			return new libClient.HttpUpgrade(request, socket, head, host, (secure ? 'https:' : 'http:'));
+			return new libClient.HttpUpgrade(request, socket, head, host, (secure ? 'https:' : 'http:'), this.wss);
 		}).catch((err: any) => {
 			logger.error(`Fatal error in upgrade handler: ${err.message}`);
 			request.destroy(new Error('Unhandled exception'));
 		});
 	}
 	private applyConfig(server: libHttp.Server | libHttps.Server): void {
-		if (libConfig.headerTimeout > 0)
-			server.headersTimeout = libConfig.headerTimeout;
-		if (libConfig.connectionTimeout > 0)
-			server.timeout = libConfig.connectionTimeout;
-		if (libConfig.keepAliveTimeout > 0)
-			server.keepAliveTimeout = libConfig.keepAliveTimeout;
+		/* configure the server to have a minimum header receive timeout, overall connection-loss timeout,
+		*	and keep-alive timeout (no request-timeout, as this is handled manually by the throughput control) */
+		server.headersTimeout = libConfig.headerTimeout;
+		server.requestTimeout = 0;
+		server.timeout = libConfig.connectionTimeout;
+		server.keepAliveTimeout = libConfig.keepAliveTimeout;
 	}
 	private setupListener(server: libHttp.Server | libHttps.Server, port: number, protocol: string, handler: libInterface.ModuleInterface): void {
 		/* register the config listener and initialize the configuration */
@@ -103,14 +109,31 @@ export class Server {
 		updateTimeouts();
 		libConfig.subscribe(updateTimeouts);
 
-		/* register the stop-function */
+		/* register the stop-function (stop accepting new connections, close active WebSocket
+		*	connections, then periodically drain idle HTTP connections during graceful shutdown) */
 		this.stopList.push((forceShutdown: boolean) => new Promise((resolve) => {
 			libConfig.unsubscribe(updateTimeouts);
+
+			let idleCheck: NodeJS.Timeout | null = null;
+			if (!forceShutdown)
+				idleCheck = setInterval(() => server.closeIdleConnections(), DEFAULT_SERVER_STOP_KILL_IDLE_REPEAT);
+
+			server.close(() => {
+				if (idleCheck != null)
+					clearInterval(idleCheck);
+				resolve();
+			});
+
+			for (const ws of this.wss.clients) {
+				if (forceShutdown)
+					ws.terminate();
+				else
+					ws.close();
+			}
 			if (forceShutdown)
 				server.closeAllConnections();
 			else
 				server.closeIdleConnections();
-			server.close(() => resolve());
 		}));
 
 		/* log the established listener once the port is actually bound */
@@ -123,7 +146,11 @@ export class Server {
 
 	public listenHttp(port: number, handler: libInterface.ModuleInterface, checkHost: libInterface.CheckHost): void {
 		try {
-			const server = libHttp.createServer({ requireHostHeader: true }, (req, resp) => this.handleRequest(req, resp, checkHost, handler, port, false));
+			const config = {
+				requireHostHeader: true,
+				connectionsCheckingInterval: DEFAULT_SERVER_TIMEOUT_CHECK
+			};
+			const server = libHttp.createServer(config, (req, resp) => this.handleRequest(req, resp, checkHost, handler, port, false));
 			server.on('error', (err) => logger.error(`While listening to port ${port} using http: ${err.message}`));
 			server.on('upgrade', (req, sock, head) => this.handleUpgrade(req, sock, head, checkHost, handler, port, false));
 			this.setupListener(server, port, 'Http', handler);
@@ -136,7 +163,8 @@ export class Server {
 			const config = {
 				requireHostHeader: true,
 				key: libFs.readFileSync(key),
-				cert: libFs.readFileSync(cert)
+				cert: libFs.readFileSync(cert),
+				connectionsCheckingInterval: DEFAULT_SERVER_TIMEOUT_CHECK
 			};
 			const server = libHttps.createServer(config, (req, resp) => this.handleRequest(req, resp, checkHost, handler, port, true));
 			server.on('error', (err) => logger.error(`While listening to port ${port} using https: ${err.message}`));
