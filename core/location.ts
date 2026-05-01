@@ -95,8 +95,9 @@ export function MakeSelfPath(urlFilePath: string, path: string | null = null): (
 	return MakeLocation(dirName);
 }
 
-/* get the file extension of the path (returns the last dot and continuing, if there is more to the name before the dot; otherwise the empty string) */
-export function SplitFileName(path: string): [string, string] {
+/* split the path in three components ['/base/', 'name', '.extension'] (extension will be empty if the path
+*	does not contain a distinct extension; path will be empty if the path does not contain a distinct path) */
+export function SplitFilePath(path: string): [string, string, string] {
 	let dot: number | null = null;
 	let name = path.length - 1;
 
@@ -107,7 +108,7 @@ export function SplitFileName(path: string): [string, string] {
 
 	if (dot == null || dot == name + 1)
 		dot = path.length;
-	return [path.substring(name + 1, dot), path.substring(dot)];
+	return [path.substring(0, name + 1), path.substring(name + 1, dot), path.substring(dot)];
 }
 
 /* perform an atomic write by first writing the file to [path.temp] and then replacing it (logs on failures and returns false, encoded as utf-8) */

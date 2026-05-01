@@ -142,8 +142,8 @@ class ImmutableManager {
 
 		/* allocate the new id and patch the state up to contain the new id */
 		const id = libCrypto.randomUUID();
-		const [name, extension] = libLocation.SplitFileName(path);
-		const idPath = `${path.substring(0, path.length - name.length - extension.length)}${name}.${id}${extension}`;
+		const [base, name, extension] = libLocation.SplitFilePath(path);
+		const idPath = `${base}${name}.${id}${extension}`;
 		logger.trace(`Allocated immutable id [${id}] for [${path}]`);
 
 		entry.immutable = idPath;
@@ -242,8 +242,8 @@ class ImmutableManager {
 			return [null, false];
 
 		/* check if it might be an immutable-id */
-		const [temp, extension] = libLocation.SplitFileName(path);
-		const [name, tempId] = libLocation.SplitFileName(temp);
+		const [base, temp, extension] = libLocation.SplitFilePath(path);
+		const [_, name, tempId] = libLocation.SplitFilePath(temp);
 		if (!tempId.match(ID_EXTENSION_REGEX))
 			return [null, false];
 		const id = tempId.substring(1);
@@ -253,7 +253,7 @@ class ImmutableManager {
 		*	the entries, looking for the actual object, thereby recovering the most recent immutable path */
 		let srcPath = this.reverse[id] ?? null;
 		if (srcPath == null) {
-			const actualPath = `${path.substring(0, path.length - temp.length - extension.length)}${name}${extension}`;
+			const actualPath = `${base}${name}${extension}`;
 			for (const tempPath in this.map) {
 				if (this.map[tempPath].actual != actualPath)
 					continue;
@@ -265,7 +265,7 @@ class ImmutableManager {
 		}
 		const entry = this.map[srcPath]!, firstFetch = (entry.actual == null);
 		if (entry.actual == null)
-			entry.actual = `${path.substring(0, path.length - temp.length - extension.length)}${name}${extension}`;
+			entry.actual = `${base}${name}${extension}`;
 
 		/* check if the entry can just be served (id might still be oudated) and otherwise fetch the initial stats */
 		if (entry.fetched && stable)
@@ -316,9 +316,9 @@ class ImmutableManager {
 				continue;
 			logger.trace(`Recovering immutable id [${state.id}] for [${state.src}]`);
 
-			const [name, extension] = libLocation.SplitFileName(state.src);
+			const [base, name, extension] = libLocation.SplitFilePath(state.src);
 			this.map[state.src] = {
-				immutable: `${name}.${state.id}${extension}`,
+				immutable: `${base}${name}.${state.id}${extension}`,
 				actual: state.dst,
 				size: state.size,
 				mtime: state.mtime,

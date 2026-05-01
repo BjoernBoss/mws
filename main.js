@@ -6,17 +6,17 @@ import * as libLog from "core/log.js";
 
 const logger = libLog.Logger('main');
 
-async function Setup(setupModule) {
-	if (setupModule == null || setupModule.Run === undefined) {
-		logger.error('Unable to load local module [module/setup.js:Run]');
-		return;
-	}
+async function Setup(module, err) {
+	if (err != null)
+		return logger.error(`Unable to load local module [module/setup.js]: ${err.message}`);
+	if (module == null || module.Run == null)
+		return logger.error('Unable to run local module [module/setup.js:Run]');
 	logger.info('Local module loaded');
 
 	/* load the server and configure it */
 	const server = new libServer.Server();
 	try {
-		await setupModule.Run(server);
+		await module.Run(server);
 	}
 	catch (e) {
 		logger.error(`Failed to setup the application: ${e.message}`);
@@ -29,5 +29,5 @@ libConfig.Initialize();
 
 /* try to load the local configuration and otherwise perform the default-setup */
 import("./modules/setup.js")
-	.then(setupModule => Setup(setupModule))
-	.catch(() => Setup(null));
+	.then((module) => Setup(module, null))
+	.catch((err) => Setup(null, err));

@@ -280,6 +280,25 @@ export abstract class IncomingBase extends ClientBase {
 		return (this.request.method == 'HEAD');
 	}
 
+	/* ensure the method is one of the list and otherwise return null and auto-respond with [method-not-allowed]
+	*	if [headExplicit] is false, method will substitute HEAD for GET, framework will consume the remaining body */
+	public checkMethod(methods: string[] | string, options?: { headExplicit?: boolean, error?: boolean, headers?: Record<string, string> }): string | null {
+		if (!Array.isArray(methods))
+			methods = [methods];
+
+		if (methods.indexOf(this.method) >= 0)
+			return this.method;
+
+		/* check if the HEAD can be converted to a GET */
+		const swapAllowed = (options?.headExplicit !== true && methods.indexOf('GET') >= 0 && methods.indexOf('HEAD') < 0);
+		if (this.isHead && swapAllowed)
+			return 'GET';
+
+		const allowed = methods.join(',') + (swapAllowed ? ',HEAD' : '');
+		this.respondMethodNotAllowed(this.method, allowed, options);
+		return null;
+	}
+
 	/* register a callback to be invoked once the response is sent, to adjust the headers to be sent */
 	public patchHeaders(cb: HeaderPatch): void {
 		this.headerPatchers.push(cb);
@@ -820,33 +839,10 @@ export class HttpRequest extends IncomingBase {
 		return response;
 	}
 
-	/* ensure the method is one of the list and otherwise return null and auto-respond with [method-not-allowed]
-	*	if [headExplicit] is false, method will substitute HEAD for GET, framework will consume the remaining body */
-	public ensureMethod(methods: string[], headExplicit?: boolean): string | null {
-		if (methods.indexOf(this.method) >= 0)
-			return this.method;
-
-		/* check if the HEAD can be converted to a GET */
-		const swapAllowed = (headExplicit !== true && methods.indexOf('GET') >= 0 && methods.indexOf('HEAD') < 0);
-		if (this.isHead && swapAllowed)
-			return 'GET';
-
-		const allowed = methods.join(',') + (swapAllowed ? ',HEAD' : '');
-		this.respondMethodNotAllowed(this.method, allowed);
-		return null;
-	}
-
-	/* ensure the media-type is one of the list and otherwise return null and auto-respond with [unsupported-media-type] (defaults to first type) */
-	public ensureMediaType(types: libRequest.MediaType[]): libRequest.MediaType | null {
+	/* return the string formatted media-type (or empty string for no media type) */
+	public getMediaType(): string {
 		const type = libRequest.SplitAndTrimList(this.requestHeaders['content-type'] ?? null, ';', true)[0] ?? null;
-		if (type == null)
-			return types[0];
-		for (let i = 0; i < types.length; ++i) {
-			if (type === types[i].mediaType)
-				return types[i];
-		}
-		this.respondUnsupported(type, types.map(t => t.mediaType).join(','));
-		return null;
+		return type.toLowerCase();
 	}
 
 	/* check the content-type for a media-type and otherwise return the default type */
@@ -873,6 +869,23 @@ export class HttpRequest extends IncomingBase {
 			return value.trim().toLowerCase();
 		}
 		return defEncoding;
+	}
+
+	/* ensure the media-type is one of the list and otherwise return null and auto-respond with [unsupported-media-type] (defaults to first type, if [noneIsFirst]) */
+	public checkMediaType(types: libRequest.MediaType[] | libRequest.MediaType, options?: { noneIsFirst?: boolean, error?: boolean, headers?: Record<string, string> }): libRequest.MediaType | null {
+		if (!Array.isArray(types))
+			types = [types];
+
+		const type = this.getMediaType();
+		if (type == '' && options?.noneIsFirst === true)
+			return types[0];
+
+		for (let i = 0; i < types.length; ++i) {
+			if (type === types[i].mediaType)
+				return types[i];
+		}
+		this.respondUnsupported(type, types.map(t => t.mediaType).join(','), options);
+		return null;
 	}
 
 	/* [no-throw but errors] receive the payload of given max length as a readable stream

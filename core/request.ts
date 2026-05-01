@@ -190,7 +190,7 @@ for (const encoding of Object.values(Encoding))
 
 /* map extension of file-path/file-name to media type (defaults to Unknown) */
 export function LookupMediaTypeFromFile(filePath: string): MediaType {
-	const fileExtension = libLocation.SplitFileName(filePath)[1];
+	const fileExtension = libLocation.SplitFilePath(filePath)[2];
 	if (fileExtension != '') {
 		const type = FileEndingToMediaTypeMapping[fileExtension.substring(1).toLowerCase()] ?? null;
 		if (type != null)
