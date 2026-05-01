@@ -15,25 +15,22 @@ function MakeActualLog(level: LogLevel, identity: string, msg: string): void {
 export type LogCallback = (level: LogLevel | null, date: string, identity: string, msg: string) => void;
 
 /* format the parameter into a well known style */
-export function FormatLine(level: LogLevel, date: string, identity: string, msg: string, lineBreak: boolean): string {
-	let printLevel: string = '';
+export function FormatLevel(level: LogLevel): string {
 	switch (level) {
 		case 'log':
-			printLevel = 'Log  ';
-			break;
+			return 'Log  ';
 		case 'trace':
-			printLevel = 'Trace';
-			break;
+			return 'Trace';
 		case 'error':
-			printLevel = 'Error';
-			break;
+			return 'Error';
 		case 'info':
-			printLevel = 'Info ';
-			break;
+			return 'Info ';
 		case 'warning':
-			printLevel = 'Warn ';
-			break;
+			return 'Warn ';
 	}
+}
+export function FormatLine(level: LogLevel, date: string, identity: string, msg: string, lineBreak: boolean): string {
+	let printLevel: string = FormatLevel(level);
 	if (lineBreak)
 		return `[${date}] ${printLevel}: [${identity}] ${msg}\n`;
 	return `[${date}] ${printLevel}: [${identity}] ${msg}`;
@@ -42,8 +39,32 @@ export function FormatLine(level: LogLevel, date: string, identity: string, msg:
 /* implementation of a console logger */
 export function ConsoleLogger(): LogCallback {
 	return (level: LogLevel | null, date: string, identity: string, msg: string) => {
-		if (level != null)
-			console.log(FormatLine(level, date, identity, msg, false));
+		if (level == null)
+			return;
+		let levelPrint: string = FormatLevel(level);
+		if (process.stdout?.hasColors == null || !process.stdout.hasColors())
+			return console.log(FormatLine(level, date, identity, msg, false));
+
+		let levelColor = '';
+		switch (level) {
+			case 'log':
+				levelColor = '\x1b[37m';
+				break;
+			case 'trace':
+				levelColor = '\x1b[94m';
+				break;
+			case 'error':
+				levelColor = '\x1b[31m';
+				break;
+			case 'info':
+				levelColor = '\x1b[92m';
+				break;
+			case 'warning':
+				levelColor = '\x1b[33m';
+				break;
+		}
+
+		console.log(`\x1b[90m[${date}] ${levelColor}${levelPrint}\x1b[0m: [\x1b[93m${identity}\x1b[0m] ${msg}`);
 	};
 }
 
@@ -51,17 +72,24 @@ const DEFAULT_FILE_FLUSHING_DELAY: number = 1_500;
 const DEFAULT_FILE_BUF_MAXIMUM_LINES = 1_500;
 const DEFAULT_FILE_SIZE_SWAP_FILE = 10_000_000;
 
-/* implementation of a file logger, which logs into the file-path and preserves into filePath + '.old' */
-export function FileLogger(filePath: string, options?: { flushingDelayMs?: number, bufMaxLineCount?: number, sizeSwapFile?: number }): LogCallback {
-	/* setup the two paths */
-	const logFilePath: string = filePath;
-	const oldFilePath: string = `${filePath}.log`;
+export enum PreserveMode {
+	/* simply clear the log file once full */
+	none,
 
+	/* preserve the last log file to 'filePath.old' */
+	last,
+
+	/* preserve all last log files to 'filePath.%time%.old */
+	all
+}
+
+/* implementation of a file logger, which logs into the file-path and optionally preserves old logs */
+export function FileLogger(filePath: string, options?: { flushingDelayMs?: number, bufMaxLineCount?: number, sizeSwapFile?: number, preserve?: PreserveMode }): LogCallback {
 	/* setup the logging state (ignore any errors, as they cannot be logged) */
 	let fileHandle: number | null = null;
 	let logFileSize: number = 0;
 	try {
-		fileHandle = libFs.openSync(logFilePath, 'a');
+		fileHandle = libFs.openSync(filePath, 'a');
 		logFileSize = libFs.fstatSync(fileHandle).size;
 	}
 	catch (_) { }
@@ -90,7 +118,7 @@ export function FileLogger(filePath: string, options?: { flushingDelayMs?: numbe
 
 	/* setup the actual closure handler */
 	return (level: LogLevel | null, date: string, identity: string, msg: string) => {
-		/* check if the logger is being disabled and clear  */
+		/* check if the logger is being disabled and reset the file state */
 		if (level == null) {
 			flushToFile();
 			if (fileHandle != null)
@@ -113,18 +141,22 @@ export function FileLogger(filePath: string, options?: { flushingDelayMs?: numbe
 		if (logFileSize < sizeSwapFile)
 			return;
 
-		/* flush the buffered entries */
+		/* flush the buffered entries and close the current file */
 		flushToFile();
-
-		/* close the current file */
 		if (fileHandle != null) {
 			try { libFs.closeSync(fileHandle); } catch (_) { }
 			fileHandle = null;
 		}
 
-		/* move it to the old-slot and open the new file */
-		try { libFs.renameSync(logFilePath, oldFilePath); } catch (_) { }
-		try { fileHandle = libFs.openSync(logFilePath, 'w'); } catch (_) { }
+		/* preserve the old file to be used or remove it */
+		if (options?.preserve == PreserveMode.all)
+			try { libFs.renameSync(filePath, `${filePath}.${Date.now()}.old`); } catch (_) { }
+		else if (options?.preserve == PreserveMode.last)
+			try { libFs.renameSync(filePath, `${filePath}.old`); } catch (_) { }
+		else
+			try { libFs.unlinkSync(filePath); } catch (_) { }
+
+		try { fileHandle = libFs.openSync(filePath, 'w'); } catch (_) { }
 		logFileSize = 0;
 	};
 }

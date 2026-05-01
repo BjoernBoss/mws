@@ -58,12 +58,12 @@ export class ClientBase extends libLog.LogIdentity {
 	/* unique id to identify client in logs */
 	readonly id: number;
 
-	protected constructor(url: libUrl.URL);
+	protected constructor(url: libUrl.URL, client: boolean);
 	protected constructor(client: ClientBase);
-	protected constructor(arg: libUrl.URL | ClientBase) {
+	protected constructor(arg: libUrl.URL | ClientBase, client?: boolean) {
 		if (arg instanceof libUrl.URL) {
 			const thisClientId = ++NextClientId;
-			super(`client!${thisClientId}`);
+			super(`${client ? 'client' : 'upgrade'}!${thisClientId}`);
 
 			/* decode the string and re-encode it to ensure '/' and '\' and control
 			*	characters are preserved as URI encoding, but the rest is decoded */
@@ -188,8 +188,8 @@ export abstract class IncomingBase extends ClientBase {
 	/* finish handling the request (if ends on 'broken', must close the connection) */
 	protected abstract finishSelfHandling(): Promise<void>;
 
-	constructor(request: libHttp.IncomingMessage, host: string, protocol: string) {
-		super(new libUrl.URL(`${protocol}//${host == '' ? '_' : host}${request.url}`));
+	constructor(request: libHttp.IncomingMessage, host: string, protocol: string, client: boolean) {
+		super(new libUrl.URL(`${protocol}//${host == '' ? '_' : host}${request.url}`), client);
 		this.request = request;
 		this.state = ResponseState.none;
 		this.headerPatchers = [];
@@ -207,13 +207,17 @@ export abstract class IncomingBase extends ClientBase {
 		const throughput = 1000.0 * (this.throughput.processed / Math.max(1, Date.now() - this.throughput.start));
 		this.throughput.timer = setTimeout(() => this.checkThroughput(), libConfig.throughputCheck);
 
-		/* check if the connection should be closed (if this is the first response, give it one check cycle grace to process the response) */
+		/* check if the connection should be closed (if this is the first response, give it one check
+		*	cycle grace to process the response, but mark it as broken to ensure it will be closed) */
 		if (throughput >= libConfig.throughputThreshold)
 			return;
 		if (this.state != ResponseState.completed && this.state != ResponseState.broken)
 			this.respondRequestTimeout(`too low throughput of [${Math.round(throughput)}] bytes/sec`, { error: true });
-		else
+		else {
+			this.error(`Closing connection due to too low throughput of [${Math.round(throughput)}] bytes/sec`);
 			this.request.destroy(new Error('Throughput too low'));
+		}
+		this.state = ResponseState.broken;
 	}
 	protected updateThroughput(delta: number): void {
 		this.throughput.processed += delta;
@@ -457,7 +461,7 @@ export class HttpRequest extends IncomingBase {
 	private htmlPatcher: HtmlPatch[];
 
 	constructor(request: libHttp.IncomingMessage, response: libHttp.ServerResponse, host: string, protocol: string) {
-		super(request, host, protocol);
+		super(request, host, protocol, true);
 		this.response = response;
 		this.receive = ReceiveState.none;
 		this.htmlPatcher = [];
@@ -510,21 +514,25 @@ export class HttpRequest extends IncomingBase {
 		}
 
 		/* ensure that the response was properly sent */
-		if (this.state != ResponseState.completed)
+		if (this.state != ResponseState.completed && this.state != ResponseState.broken)
 			this.respondBadInternalUsage();
 
-		/* check if the connection is considered broken, in which case the
-		*	data on it are not reliable anymore and it must be destroyed */
+		/* check if the connection is considered broken, in which case the data on it are not reliable anymore
+		*	and it must be destroyed (give it a grace timeout to receive any potential final response data) */
 		if (this.state != ResponseState.broken)
 			return;
-		if (this.response.writableFinished) {
+
+		const closeConnection = () => {
+			this.trace('closing connection');
+			clearTimeout(forceDestroy);
 			this.request.destroy();
 			this.response.destroy();
-		}
-		else this.response.on('finish', () => {
-			this.request.destroy();
-			this.response.destroy();
-		});
+		};
+		const forceDestroy = setTimeout(() => closeConnection(), libConfig.brokenGraceTimeout);
+		if (this.response.writableFinished)
+			closeConnection();
+		else
+			this.response.on('finish', () => closeConnection());
 	}
 	private closeHeader(status: libRequest.StatusType, media: libRequest.MediaType | null, contentSize: number | null, updateState: boolean, encoding: string, headers: Record<string, string>, error: boolean): void {
 		this.trace(`Sending ${this.isHead ? 'HEAD' : 'content'} [${media?.mediaType ?? 'none'}] of size [${contentSize ?? 'unknown'}] ${encoding.length == 0 ? 'not encoded' : `encoded using [${encoding}]`}`);
@@ -1024,7 +1032,7 @@ export class HttpRequest extends IncomingBase {
 		/* read the entry from the cache and check if it has been permanently moved and apply the move */
 		let cached: libCache.Cached | string | null = null;
 		try {
-			cached = libCache.Get(filePath, stable);
+			cached = libCache.GetImmutable(filePath, stable);
 			if (cached == null)
 				return false;
 		}
@@ -1175,7 +1183,7 @@ export class HttpUpgrade extends IncomingBase {
 	private wss: libWs.WebSocketServer;
 
 	constructor(request: libHttp.IncomingMessage, socket: libStream.Duplex, head: Buffer, host: string, protocol: string, wss: libWs.WebSocketServer) {
-		super(request, host, protocol);
+		super(request, host, protocol, false);
 		this.socket = socket;
 		this.head = head;
 		this.wss = wss;
@@ -1223,14 +1231,18 @@ export class HttpUpgrade extends IncomingBase {
 		if (this.state != ResponseState.completed)
 			this.respondBadInternalUsage();
 
-		if (this.socket.writableFinished) {
-			this.socket.destroy();
+		/* close the connection but give it a grace timeout to properly send any final queued data */
+		const closeConnection = () => {
+			this.trace('closing connection');
+			clearTimeout(forceDestroy);
 			this.request.destroy();
-		}
-		else this.socket.on('finish', () => {
 			this.socket.destroy();
-			this.request.destroy();
-		});
+		};
+		const forceDestroy = setTimeout(() => closeConnection(), libConfig.brokenGraceTimeout);
+		if (this.socket.writableFinished)
+			closeConnection();
+		else
+			this.socket.on('finish', () => closeConnection());
 	}
 
 	/* marks the object as having been handled (return false, if connection is not a valid websocket upgrade request) */

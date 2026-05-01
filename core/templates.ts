@@ -10,7 +10,7 @@ const logger = libLog.Logger('template');
 const TemplateDirectory = libLocation.MakeSelfPath(import.meta.url, 'templates');
 function LoadRelative(name: string): string {
 	try {
-		const data: Buffer | null = libCache.GetCached(TemplateDirectory(name), true)?.readSync() ?? null;
+		const data: Buffer | null = libCache.GetActual(TemplateDirectory(name), true)?.readSync() ?? null;
 		if (data != null)
 			return data.toString('utf-8');
 	} catch (err: any) {

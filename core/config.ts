@@ -11,8 +11,10 @@ export class CoreConfig {
 	private _headerTimeout: number = 0;
 	private _connectionTimeout: number = 0;
 	private _keepAliveTimeout: number = 0;
+	private _brokenGraceTimeout: number = 0;
 	private _cacheSize: number = 0;
 	private _cacheAllowStable: boolean = false;
+	private _cacheAllowImmutable: boolean = false;
 	private _cacheFileSizeLimit: number = 0;
 	private _fileCacheControl: string = '';
 	private _immutableCacheControl: string = '';
@@ -96,6 +98,16 @@ export class CoreConfig {
 		this.changed('Keep-alive timeout', value);
 	}
 
+	/* time for a broken connection to receive the response before force-closing it [0 results in immediate close; in milliseconds] */
+	public get brokenGraceTimeout(): number { return this._brokenGraceTimeout; }
+	public set brokenGraceTimeout(value: number) {
+		value = Math.max(value, 0);
+		if (this._brokenGraceTimeout == value)
+			return;
+		this._brokenGraceTimeout = value;
+		this.changed('Broken grace timeout', value);
+	}
+
 	/* maximum sum of data cached before evicting old cache entries [in bytes] */
 	public get cacheSize(): number { return this._cacheSize; }
 	public set cacheSize(value: number) {
@@ -105,7 +117,16 @@ export class CoreConfig {
 		this.changed('Cache size', value);
 	}
 
-	/* allow the usage of stable caches, otherwise all cached entries will re-validate cached entries before serving */
+	/* maximum file size of files considered to be cached, larger files will not be cached [in bytes] */
+	public get cacheFileSizeLimit(): number { return this._cacheFileSizeLimit; }
+	public set cacheFileSizeLimit(value: number) {
+		if (this._cacheFileSizeLimit == value)
+			return;
+		this._cacheFileSizeLimit = value;
+		this.changed('Cache file size limit', value);
+	}
+
+	/* allow the usage of stable caches, otherwise all cached entries will be re-validated before serving */
 	public get cacheAllowStable(): boolean { return this._cacheAllowStable; }
 	public set cacheAllowStable(value: boolean) {
 		if (this._cacheAllowStable == value)
@@ -114,13 +135,13 @@ export class CoreConfig {
 		this.changed('Cache allow stable', value);
 	}
 
-	/* maximum file size of files considered to be cached, larger files will not be cached [in bytes] */
-	public get cacheFileSizeLimit(): number { return this._cacheFileSizeLimit; }
-	public set cacheFileSizeLimit(value: number) {
-		if (this._cacheFileSizeLimit == value)
+	/* allow the usage of immutable ids, otherwise the normal files will just be served - as mutable */
+	public get cacheAllowImmutable(): boolean { return this._cacheAllowImmutable; }
+	public set cacheAllowImmutable(value: boolean) {
+		if (this._cacheAllowImmutable == value)
 			return;
-		this._cacheFileSizeLimit = value;
-		this.changed('Cache file size limit', value);
+		this._cacheAllowImmutable = value;
+		this.changed('Cache allow immutable', value);
 	}
 
 	/* default cache-control value for normal cache reads [empty string does not set any cache-control] */
@@ -210,11 +231,13 @@ export function Initialize(): void {
 	Config.commonHeaders = { 'X-Content-Type-Options': 'nosniff' };
 	Config.webSocketTimeout = 60_000;
 	Config.headerTimeout = 30_000;
-	Config.connectionTimeout = 60_000;
+	Config.connectionTimeout = 90_000;
 	Config.keepAliveTimeout = 10_000;
+	Config.brokenGraceTimeout = 1_000;
 	Config.cacheSize = 50_000_000;
-	Config.cacheAllowStable = true;
 	Config.cacheFileSizeLimit = 10_000_000;
+	Config.cacheAllowStable = true;
+	Config.cacheAllowImmutable = true;
 	Config.errorCacheControl = 'no-store';
 	Config.responseCacheControl = 'no-cache';
 	Config.throughputCheck = 5_000;

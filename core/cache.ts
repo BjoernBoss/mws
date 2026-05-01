@@ -223,6 +223,11 @@ class ImmutableManager {
 	}
 
 	public make(path: string): string {
+		if (!libConfig.cacheAllowImmutable)
+			return path;
+
+		/* check if the entry already exists and otherwise create the
+		*	new immutable entry and return the id-tagged path */
 		let entry = this.map[path] ?? null;
 		if (entry != null)
 			return entry.immutable;
@@ -233,10 +238,12 @@ class ImmutableManager {
 		return entry.immutable;
 	}
 	public get(path: string, stable: boolean): [ImmutableEntry | null, boolean] {
-		const [temp, extension] = libLocation.SplitFileName(path);
-		const [name, tempId] = libLocation.SplitFileName(temp);
+		if (!libConfig.cacheAllowImmutable)
+			return [null, false];
 
 		/* check if it might be an immutable-id */
+		const [temp, extension] = libLocation.SplitFileName(path);
+		const [name, tempId] = libLocation.SplitFileName(temp);
 		if (!tempId.match(ID_EXTENSION_REGEX))
 			return [null, false];
 		const id = tempId.substring(1);
@@ -505,33 +512,34 @@ function ResolveCache(path: string, stable: boolean, checkImmutable: boolean): C
 	return new Cached(path, fileSize, null, mtime, age, isImmutable);
 }
 
-/* [stable]: if cached as stable, dont re-validate the file stats before serving from cache; resolve immutable ids automatically (Cached to interact
-*	with cache; null, if it does not exist, string if the immutable path has been permanently moved to the new path in source space) */
-export function Get(path: string, stable: boolean): Cached | string | null {
+/* [stable]: if cached as stable, dont re-validate the file stats before serving from cache; resolve immutable ids automatically (Cached to
+*	interact with cache; null, if it does not exist, string if the immutable path has been permanently moved to the new path in source space) */
+export function GetImmutable(path: string, stable: boolean): Cached | string | null {
 	return ResolveCache(path, stable, true);
 }
 
 /* [stable]: if cached as stable, dont re-validate the file stats before serving from cache;
 *	no immutable ids are resolved (Cached to interact with cache; null, if it does not exist) */
-export function GetCached(path: string, stable: boolean): Cached | null {
+export function GetActual(path: string, stable: boolean): Cached | null {
 	return ResolveCache(path, stable, false) as (Cached | null);
 }
 
 /* generate a unique tagged path for the given query path, which will change whenever the underlying file changes (creates
 *	a path to a file, which looks similar to the source, except that the name includes a UUID, which will be used to identity
 *	the given file state; will be removed from the final target path to be served, to identify the actual source) */
-export function Immutable(path: string): string {
+export function MakeImmutable(path: string): string {
 	return immutableManager.make(path);
 }
 
 /* flush all cached data and invalidate immutable stats so they are re-checked on next access */
-export function Flush(): void {
+export function FlushCache(): void {
 	logger.info('Flushing cache and invalidating immutable entries');
 	cacheManager.flush();
 	immutableManager.invalidate();
 }
 
-/* configure the write back of the immutable state to ensure persistent ids across restarts (will be read upon configuration) */
+/* configure the write back of the immutable state to ensure persistent ids across restarts
+*	(will be read upon configuring; if not configured, ids will be lost after a server restart) */
 export async function ConfigureWriteBack(path: string | null): Promise<void> {
 	await immutableManager.setWriteBack(path ?? '');
 }
