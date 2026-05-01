@@ -95,7 +95,7 @@ export class DispatchModule implements ModuleInterface {
 		if (match == null)
 			return;
 
-		const snapshot = client.translate(match[1], match[0].name)!;
+		const snapshot = client.pushPath(match[1], match[0].name)!;
 		await match[0].request(client);
 		client.restore(snapshot);
 	}
@@ -104,7 +104,7 @@ export class DispatchModule implements ModuleInterface {
 		if (match == null)
 			return;
 
-		const snapshot = client.translate(match[1], match[0].name)!;
+		const snapshot = client.pushPath(match[1], match[0].name)!;
 		await match[0].upgrade(client);
 		client.restore(snapshot);
 	}
@@ -127,7 +127,7 @@ export class UnhandledModule implements ModuleInterface {
 	}
 
 	public async request(client: libClient.HttpRequest): Promise<void> {
-		const snapshot = client.shiftLog(this.handler.name);
+		const snapshot = client.pushLog(this.handler.name);
 
 		await this.handler.request(client);
 		if (client.unhandled && this.requestLambda != null)
@@ -137,7 +137,7 @@ export class UnhandledModule implements ModuleInterface {
 	}
 
 	public async upgrade(client: libClient.HttpUpgrade): Promise<void> {
-		const snapshot = client.shiftLog(this.handler.name);
+		const snapshot = client.pushLog(this.handler.name);
 
 		await this.handler.upgrade(client);
 		if (client.unhandled && this.upgradeLambda != null)
@@ -164,7 +164,7 @@ export class WrapModule implements ModuleInterface {
 	}
 
 	public async request(client: libClient.HttpRequest): Promise<void> {
-		const snapshot = client.shiftLog(this.handler.name);
+		const snapshot = client.pushLog(this.handler.name);
 
 		if (this.requestWrap != null)
 			await this.requestWrap(client, () => this.handler.request(client));
@@ -175,7 +175,7 @@ export class WrapModule implements ModuleInterface {
 	}
 
 	public async upgrade(client: libClient.HttpUpgrade): Promise<void> {
-		const snapshot = client.shiftLog(this.handler.name);
+		const snapshot = client.pushLog(this.handler.name);
 
 		if (this.upgradeWrap != null)
 			await this.upgradeWrap(client, () => this.handler.upgrade(client));
