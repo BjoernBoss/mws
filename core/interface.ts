@@ -9,11 +9,13 @@ import * as libLocation from "./location.js";
 *	If the returned promise resolves, and the client has not yet been handled,
 *	it is expected to not be handled anymore by the given client.
 *	Modules expect clients to be completely unhandled when being passed to the module.
+*	Stop should cleanup the module resources and any timers (no new active connections will be incoming anymore, may be called multiple times).
 */
 export interface ModuleInterface {
 	name: string;
 	request(client: libClient.HttpRequest): Promise<void>;
 	upgrade(client: libClient.HttpUpgrade): Promise<void>;
+	stop(): Promise<void>;
 }
 
 /*
@@ -26,6 +28,7 @@ export type CheckHost = (host: string) => boolean;
 
 export type RequestLambda = (client: libClient.HttpRequest) => Promise<void>;
 export type UpgradeLambda = (client: libClient.HttpUpgrade) => Promise<void>;
+export type StopLambda = () => Promise<void>;
 export type RequestWrap = (client: libClient.HttpRequest, handle: () => Promise<void>) => Promise<void>;
 export type UpgradeWrap = (client: libClient.HttpUpgrade, handle: () => Promise<void>) => Promise<void>;
 
@@ -35,21 +38,26 @@ export type UpgradeWrap = (client: libClient.HttpUpgrade, handle: () => Promise<
 export class LambdaModule implements ModuleInterface {
 	private requestLambda?: RequestLambda;
 	private upgradeLambda?: UpgradeLambda;
+	private stopLambda?: StopLambda;
 
 	public name: string = 'lambda';
-	constructor(options?: { request?: RequestLambda, upgrade?: UpgradeLambda }) {
+	constructor(options?: { request?: RequestLambda, upgrade?: UpgradeLambda, stop?: StopLambda }) {
 		this.requestLambda = options?.request;
 		this.upgradeLambda = options?.upgrade;
+		this.stopLambda = options?.stop;
 	}
 
 	public async request(client: libClient.HttpRequest): Promise<void> {
 		if (this.requestLambda != null)
 			await this.requestLambda(client);
 	}
-
 	public async upgrade(client: libClient.HttpUpgrade): Promise<void> {
 		if (this.upgradeLambda != null)
 			await this.upgradeLambda(client);
+	}
+	public async stop(): Promise<void> {
+		if (this.stopLambda != null)
+			await this.stopLambda();
 	}
 }
 
@@ -64,8 +72,7 @@ export class DispatchModule implements ModuleInterface {
 		const logger = libLog.Logger(this.name);
 
 		this.mapping = {};
-		for (const key in map) {
-			const handler = map[key];
+		for (const [key, handler] of Object.entries(map)) {
 			logger.info(`Binding [${key}] to child [${handler.name}]`);
 			this.mapping[key] = handler;
 		}
@@ -108,6 +115,12 @@ export class DispatchModule implements ModuleInterface {
 		await match[0].upgrade(client);
 		client.restore(snapshot);
 	}
+	public async stop(): Promise<void> {
+		const list: Promise<void>[] = [];
+		for (const handler of Object.values(this.mapping))
+			list.push(handler.stop());
+		await Promise.all(list);
+	}
 }
 
 /*
@@ -135,7 +148,6 @@ export class UnhandledModule implements ModuleInterface {
 
 		client.restore(snapshot);
 	}
-
 	public async upgrade(client: libClient.HttpUpgrade): Promise<void> {
 		const snapshot = client.pushLog(this.handler.name);
 
@@ -144,6 +156,9 @@ export class UnhandledModule implements ModuleInterface {
 			await this.upgradeLambda(client);
 
 		client.restore(snapshot);
+	}
+	public async stop(): Promise<void> {
+		await this.handler.stop();
 	}
 }
 
@@ -183,5 +198,8 @@ export class WrapModule implements ModuleInterface {
 			await this.handler.upgrade(client);
 
 		client.restore(snapshot);
+	}
+	public async stop(): Promise<void> {
+		await this.handler.stop();
 	}
 }

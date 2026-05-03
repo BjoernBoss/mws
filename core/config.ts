@@ -212,6 +212,8 @@ export class CoreConfig {
 
 	/* directly forwarded to cache [ConfigureWriteBack] but for consistency also here [cannot be subscribed to] */
 	public async cacheWriteBack(path: string | null): Promise<void> {
+		logger.info(`Configuring cache writeback to [${path ?? ''}]`);
+
 		/* defer, as the cache initialization imports this module again and interacts with it at initialization */
 		const config = await import("./cache.js");
 		return config.ConfigureWriteBack(path);
@@ -229,7 +231,7 @@ export const Config: CoreConfig = new CoreConfig();
 export function Initialize(): void {
 	Config.serverName = 'modular-web-server';
 	Config.commonHeaders = { 'X-Content-Type-Options': 'nosniff' };
-	Config.webSocketTimeout = 60_000;
+	Config.webSocketTimeout = 120_000;
 	Config.headerTimeout = 30_000;
 	Config.connectionTimeout = 90_000;
 	Config.keepAliveTimeout = 10_000;

@@ -68,8 +68,8 @@ export function ConsoleLogger(): LogCallback {
 	};
 }
 
-const DEFAULT_FILE_FLUSHING_DELAY: number = 1_500;
-const DEFAULT_FILE_BUF_MAXIMUM_LINES = 1_500;
+const DEFAULT_FILE_FLUSHING_DELAY: number = 2_000;
+const DEFAULT_FILE_BUF_MAXIMUM_LINES = 1_000;
 const DEFAULT_FILE_SIZE_SWAP_FILE = 10_000_000;
 
 export enum PreserveMode {
@@ -83,7 +83,8 @@ export enum PreserveMode {
 	all
 }
 
-/* implementation of a file logger, which logs into the file-path and optionally preserves old logs */
+/* implementation of a file logger, which logs into the file-path and optionally preserves old logs
+*	(Note: contains a timer, server shutdown should clear all loggers to ensure fast shutdown) */
 export function FileLogger(filePath: string, options?: { flushingDelayMs?: number, bufMaxLineCount?: number, sizeSwapFile?: number, preserve?: PreserveMode }): LogCallback {
 	/* setup the logging state (ignore any errors, as they cannot be logged) */
 	let fileHandle: number | null = null;

@@ -57,6 +57,7 @@ export class MyModule implements libInterface.ModuleInterface {
     public async upgrade(client: libClient.HttpUpgrade): Promise<void> {
         /* handle WebSocket upgrades */
     }
+    public async stop(): Promise<void> {}
 }
 ```
 Any requests not handled by a module, may be handled by parent modules, should they host child modules. If no module handles a request, a default `404 Not Found` is sent.

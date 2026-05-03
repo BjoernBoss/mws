@@ -43,7 +43,8 @@ export class ClientContext {
 }
 
 export class ClientBase extends libLog.LogIdentity {
-	/* contextual data attached to the client (affected by translation/snapshots) */
+	/* contextual data attached to the client (affected by translation/snapshots; content
+	*	preserved but object might be changed, should therefore not be held directly) */
 	public context: Record<string, unknown>;
 
 	/* path relative to current module base-path */
@@ -86,7 +87,7 @@ export class ClientBase extends libLog.LogIdentity {
 		}
 		else {
 			super(arg.logIdentity);
-			this.context = arg.context;
+			this.context = { ...arg.context };
 			this.path = arg.path;
 			this.fullPath = arg.fullPath;
 			this.basePath = arg.basePath;
@@ -99,8 +100,9 @@ export class ClientBase extends libLog.LogIdentity {
 		return libLocation.JoinSanitized(this.basePath, path);
 	}
 
-	/* check if path is a substring of the current path, and if so, shift the path and identity and return
-	*	a snapshot of the old context (to be able to recover the old state), otherwise it returns null */
+	/* check if path is a substring of the current path, and if so, shift the path and identity
+	*	and return a snapshot of the old context (to be able to recover the old state), otherwise
+	*	it returns null (changes to context object will be discarded upon context restore) */
 	public pushPath(path: string, identity?: string): ClientContext | null {
 		if (!libLocation.IsSubDirectory(path, this.path))
 			return null;
@@ -118,7 +120,8 @@ export class ClientBase extends libLog.LogIdentity {
 	}
 
 	/* preserve the current logging and translation and context and shift
-	*	onto the logging identity and return a snapshot of the old context */
+	*	onto the logging identity and return a snapshot of the old context
+	*	(changes to context object will be discarded upon context restore) */
 	public pushLog(identity: string): ClientContext {
 		const current = new ClientContext(this.logIdentity, this.context, this.basePath, this.path);
 		this.logIdentity = `${this.logIdentity}.${identity}`;
@@ -126,18 +129,17 @@ export class ClientBase extends libLog.LogIdentity {
 		return current;
 	}
 
-	/* preserve the current logging and translation and context and return a snapshot of the old context */
+	/* preserve the current logging and translation and context and return a
+	*	snapshot of it (changes to context object will not be reverted) */
 	public snapshot(): ClientContext {
-		const current = new ClientContext(this.logIdentity, this.context, this.basePath, this.path);
-		this.context = { ...this.context };
-		return current;
+		return new ClientContext(this.logIdentity, this.context, this.basePath, this.path);
 	}
 
 	/* restore a client log and translation and context and return the previous context */
 	public restore(snapshot: ClientContext): ClientContext {
 		const current = new ClientContext(this.logIdentity, this.context, this.basePath, this.path);
 		this.logIdentity = snapshot.logIdentity;
-		this.context = { ...snapshot.context };
+		this.context = snapshot.context;
 		this.basePath = snapshot.basePath;
 		this.path = snapshot.path;
 		return current;
@@ -183,6 +185,7 @@ export abstract class IncomingBase extends ClientBase {
 	protected headerPatchers: HeaderPatch[];
 	protected state: ResponseState;
 	protected throughput: { timer: NodeJS.Timeout, processed: number, start: number };
+	protected processed: { promise: Promise<void>, resolve?: () => void };
 
 	/* write the given header and content out (no need to update state; body may be null for HEAD responses of unknown size) */
 	protected abstract finalizeBufferHeader(status: libRequest.StatusType, error: boolean, headers: Record<string, string>, content: { media: libRequest.MediaType, body: Buffer | null } | null): void;
@@ -195,6 +198,10 @@ export abstract class IncomingBase extends ClientBase {
 		this.request = request;
 		this.state = ResponseState.none;
 		this.headerPatchers = [];
+
+		let resolver: any = null;
+		this.processed = { promise: new Promise<void>((resolve) => resolver = resolve) };
+		this.processed.resolve = resolver;
 
 		/* setup the throughput measurement to detect any stalling connections (offset the processed
 		*	count by the startup time to ensure the connection has time before the throughput is enforced) */
@@ -280,6 +287,11 @@ export abstract class IncomingBase extends ClientBase {
 		return (this.request.method == 'HEAD');
 	}
 
+	/* promise, which resolves once the client has been fully processed by all modules */
+	public get awaitCompletion(): Promise<void> {
+		return this.processed.promise;
+	}
+
 	/* ensure the method is one of the list and otherwise return null and auto-respond with [method-not-allowed]
 	*	if [headExplicit] is false, method will substitute HEAD for GET, framework will consume the remaining body */
 	public checkMethod(methods: string[] | string, options?: { headExplicit?: boolean, error?: boolean, headers?: Record<string, string> }): string | null {
@@ -312,6 +324,7 @@ export abstract class IncomingBase extends ClientBase {
 			await this.finishSelfHandling();
 		} finally {
 			clearTimeout(this.throughput.timer);
+			this.processed.resolve!();
 		}
 	}
 
@@ -1307,6 +1320,7 @@ export class ClientSocket extends ClientBase {
 	private ws: libWs.WebSocket;
 	private aliveTimer: null | NodeJS.Timeout;
 	private isAlive: boolean;
+	private wsLogger: libLog.LogIdentity;
 
 	public ondata?: (data: libWs.RawData, isBinary: boolean) => void;
 	public onclose?: () => void;
@@ -1316,9 +1330,10 @@ export class ClientSocket extends ClientBase {
 		this.ws = ws;
 		this.aliveTimer = null;
 		this.isAlive = true;
+		this.wsLogger = libLog.Logger(base.snapshot().logIdentity);
 
 		this.ws.on('pong', () => {
-			this.trace(`Alive check pong received`);
+			this.wsLogger.trace(`Alive check pong received`);
 			this.selfIsAlive();
 		});
 		this.ws.on('message', (data, isBinary) => {
@@ -1327,6 +1342,7 @@ export class ClientSocket extends ClientBase {
 				this.ondata(data, isBinary);
 		});
 		this.ws.on('close', () => {
+			this.wsLogger.trace('Socket connection closed');
 			if (this.aliveTimer != null)
 				clearTimeout(this.aliveTimer);
 			this.aliveTimer = null;
@@ -1335,8 +1351,8 @@ export class ClientSocket extends ClientBase {
 				this.onclose();
 		});
 		this.ws.on('error', (err: any) => {
-			this.error(`WebSocket error: ${err.message}`);
-			this.closeSelf();
+			this.wsLogger.error(`WebSocket error: ${err.message}`);
+			this.terminateSelf();
 		});
 
 		/* start the first alive check */
@@ -1350,17 +1366,17 @@ export class ClientSocket extends ClientBase {
 
 		/* cycle through the alive state and check again */
 		if (!this.isAlive)
-			return this.closeSelf();
+			return this.terminateSelf();
 		this.isAlive = false;
 		this.aliveTimer = setTimeout(() => this.checkIsAlive(), libConfig.webSocketTimeout);
 
 		/* try to ping the remote to check the liveliness */
 		try {
-			this.trace(`Sending ping to determine if connection is alive`);
+			this.wsLogger.trace(`Sending ping to determine if connection is alive`);
 			this.ws.ping();
 		} catch (err: any) {
-			this.error(`WebSocket error while pinging: ${err.message}`);
-			this.closeSelf();
+			this.wsLogger.error(`WebSocket error while pinging: ${err.message}`);
+			this.terminateSelf();
 		}
 	}
 	private selfIsAlive(): void {
@@ -1369,20 +1385,21 @@ export class ClientSocket extends ClientBase {
 			clearTimeout(this.aliveTimer);
 		this.aliveTimer = (libConfig.webSocketTimeout == 0 ? null : setTimeout(() => this.checkIsAlive(), libConfig.webSocketTimeout));
 	}
-	private closeSelf(): void {
+	private terminateSelf(): void {
 		if (this.ws.readyState != libWs.WebSocket.CLOSED)
-			this.ws.close();
+			this.ws.terminate();
 	}
 
 	public send(data: string | Buffer): void {
 		try {
 			this.ws.send(data);
 		} catch (err: any) {
-			this.error(`WebSocket error while sending data: ${err.message}`);
-			this.closeSelf();
+			this.wsLogger.error(`WebSocket error while sending data: ${err.message}`);
+			this.terminateSelf();
 		}
 	}
 	public close(): void {
-		this.closeSelf();
+		if (this.ws.readyState != libWs.WebSocket.CLOSED)
+			this.ws.close();
 	}
 }

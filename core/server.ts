@@ -15,15 +15,16 @@ import * as libWs from "ws";
 const logger = libLog.Logger('server');
 
 const DEFAULT_SERVER_TIMEOUT_CHECK: number = 10_000;
-const DEFAULT_SERVER_STOP_KILL_IDLE_REPEAT: number = 500;
 
 export class Server {
-	private stopList: ((forceShutdown: boolean) => Promise<void>)[];
+	private serverStopList: (() => Promise<void>)[];
+	private moduleStopList: (() => Promise<void>)[];
 	private wss: libWs.WebSocketServer;
 
 	constructor() {
 		logger.info(`Server object created`);
-		this.stopList = [];
+		this.serverStopList = [];
+		this.moduleStopList = [];
 		this.wss = new libWs.WebSocketServer({ noServer: true });
 	}
 
@@ -109,32 +110,13 @@ export class Server {
 		updateTimeouts();
 		libConfig.subscribe(updateTimeouts);
 
-		/* register the stop-function (stop accepting new connections, close active WebSocket
-		*	connections, then periodically drain idle HTTP connections during graceful shutdown) */
-		this.stopList.push((forceShutdown: boolean) => new Promise((resolve) => {
+		/* register the stop-function for the server and the module */
+		this.serverStopList.push(() => new Promise((resolve) => {
 			libConfig.unsubscribe(updateTimeouts);
-
-			let idleCheck: NodeJS.Timeout | null = null;
-			if (!forceShutdown)
-				idleCheck = setInterval(() => server.closeIdleConnections(), DEFAULT_SERVER_STOP_KILL_IDLE_REPEAT);
-
-			server.close(() => {
-				if (idleCheck != null)
-					clearInterval(idleCheck);
-				resolve();
-			});
-
-			for (const ws of this.wss.clients) {
-				if (forceShutdown)
-					ws.terminate();
-				else
-					ws.close();
-			}
-			if (forceShutdown)
-				server.closeAllConnections();
-			else
-				server.closeIdleConnections();
+			server.close(() => resolve());
+			server.closeAllConnections();
 		}));
+		this.moduleStopList.push(() => handler.stop());
 
 		/* log the established listener once the port is actually bound */
 		server.on('listening', () => {
@@ -175,9 +157,27 @@ export class Server {
 		}
 	}
 
-	/* force-shutdown kills all currently open and used connections */
-	public async stop(forceShutdown: boolean): Promise<void> {
-		for (const cb of this.stopList)
-			await cb(forceShutdown);
+	/* shutdown the server and all modules (immediately kills all open connections and listener, can be called multiple times) */
+	public async stop(): Promise<void> {
+		let list: Promise<void>[] = [];
+
+		/* kill all open connections (also stops new incoming connections) and kill all web-sockets (after the sockets have been stopped
+		*	to ensure no new sockets connect; duplicate the sockets to ensure the iteration order is not broken due to in-place removal) */
+		for (const cb of this.serverStopList)
+			list.push(cb());
+		for (const ws of [...this.wss.clients]) {
+			list.push(new Promise<void>((resolve) => ws.on('close', () => resolve())));
+			ws.terminate();
+		}
+		logger.info('Stopping server and websocket connections');
+		await Promise.all(list);
+
+		/* kill all modules (after the connections to ensure
+		*	no state change occurs in the modules anymore) */
+		logger.info('Stopping all modules');
+		list = [];
+		for (const cb of this.moduleStopList)
+			list.push(cb());
+		await Promise.all(list);
 	}
 }
