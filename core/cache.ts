@@ -221,20 +221,50 @@ class ImmutableManager {
 			logger.error(`Immutable loaded state [${path}] contained [${corrupted}] malformed entires`);
 		return output;
 	}
+	private updateEntry(path: string, entry: ImmutableEntry, stable: boolean, firstAssign: boolean): boolean {
+		/* check if the entry can just be served (id might still be oudated) and otherwise fetch the initial stats */
+		if (entry.fetched && stable && libConfig.cacheAllowStable)
+			return true;
+		const stats = ReadStats(entry.actual!);
+		if (stats == null) {
+			logger.warning(`Immutable path [${entry.actual}] does not exist`);
+			delete this.map[path];
+			delete this.reverse[entry.id];
+			this.storeState();
+			return false;
+		}
+		const [fileSize, mtime] = stats;
 
-	public make(path: string): string {
+		/* check if the stats have changed, in which case a new id needs to be assigned (thus binding the id to the stats) */
+		if (!entry.fetched || entry.size != fileSize || entry.mtime != mtime) {
+			if (!firstAssign)
+				this.assignId(path, entry);
+			entry.size = fileSize;
+			entry.mtime = mtime;
+			entry.fetched = true;
+			this.storeState();
+		}
+		return true;
+	}
+
+	public make(path: string, stable: boolean): string {
 		if (!libConfig.cacheAllowImmutable)
 			return path;
 
-		/* check if the entry already exists and otherwise create the
-		*	new immutable entry and return the id-tagged path */
+		/* check if the entry does not yet exist and the id-tagged path needs to be created */
 		let entry = this.map[path] ?? null;
-		if (entry != null)
+		if (entry == null) {
+			entry = (this.map[path] = { immutable: '', id: '', actual: null, size: 0, mtime: 0, fetched: false });
+			this.assignId(path, entry);
+			this.storeState();
 			return entry.immutable;
+		}
 
-		entry = (this.map[path] = { immutable: '', id: '', actual: null, size: 0, mtime: 0, fetched: false });
-		this.assignId(path, entry);
-
+		/* check if the stats can actually be validated or if the entry should just be served */
+		if (entry.actual == null)
+			return entry.immutable;
+		if (!this.updateEntry(path, entry, stable, false))
+			return path;
 		return entry.immutable;
 	}
 	public get(path: string, stable: boolean): [ImmutableEntry | null, boolean] {
@@ -263,33 +293,13 @@ class ImmutableManager {
 			if (srcPath == null)
 				return [null, false];
 		}
-		const entry = this.map[srcPath]!, firstFetch = (entry.actual == null);
+		const entry = this.map[srcPath]!, firstAssign = (entry.actual == null);
 		if (entry.actual == null)
 			entry.actual = `${base}${name}${extension}`;
 
-		/* check if the entry can just be served (id might still be oudated) and otherwise fetch the initial stats */
-		if (entry.fetched && stable)
-			return [entry, entry.id != id];
-		const stats = ReadStats(entry.actual);
-		if (stats == null) {
-			logger.warning(`Immutable path [${entry.actual}] does not exist`);
-			delete this.map[srcPath];
-			delete this.reverse[id];
-			this.storeState();
+		/* update the entry and return the final stats/if the id changed */
+		if (!this.updateEntry(srcPath, entry, stable, firstAssign))
 			return [null, false];
-		}
-		const [fileSize, mtime] = stats;
-
-		/* check if the stats have changed, in which case a new id needs to be assigned (thus binding the id to the stats) */
-		const statsChanged = (entry.size != fileSize || entry.mtime != mtime);
-		if (!firstFetch && statsChanged)
-			this.assignId(srcPath, entry);
-		entry.size = fileSize;
-		entry.mtime = mtime;
-		entry.fetched = true;
-
-		if (firstFetch || statsChanged)
-			this.storeState();
 		return [entry, entry.id != id];
 	}
 	public invalidate(): void {
@@ -480,8 +490,6 @@ export class Cached {
 }
 
 function ResolveCache(path: string, stable: boolean, checkImmutable: boolean): Cached | string | null {
-	stable = (stable && libConfig.cacheAllowStable);
-
 	/* check if the entry is immutable and fetch its actual path or
 	*	if it has been moved (due to the id having been invalidated) */
 	const [immutable, immutableMoved] = (checkImmutable ? immutableManager.get(path, stable) : [null, false]);
@@ -493,7 +501,7 @@ function ResolveCache(path: string, stable: boolean, checkImmutable: boolean): C
 	const isImmutable = (immutable != null);
 
 	/* check if the entry is stable and already in the cache, in which case the file doesn't even need to be checked */
-	let entry = (stable ? cacheManager.find(path, null) : null);
+	let entry = ((stable && libConfig.cacheAllowStable) ? cacheManager.find(path, null) : null);
 	if (entry != null && (immutable == null || (immutable.size == entry.data.byteLength && immutable.mtime == entry.mtime)))
 		return new Cached(path, entry.data.byteLength, entry.data, entry.mtime, entry.age, isImmutable);
 
@@ -512,8 +520,9 @@ function ResolveCache(path: string, stable: boolean, checkImmutable: boolean): C
 	return new Cached(path, fileSize, null, mtime, age, isImmutable);
 }
 
-/* [stable]: if cached as stable, dont re-validate the file stats before serving from cache; resolve immutable ids automatically (Cached to
-*	interact with cache; null, if it does not exist, string if the immutable path has been permanently moved to the new path in source space) */
+/* [stable]: if cached as stable, dont re-validate the file stats before serving from cache; resolve
+*	immutable ids automatically (Cached to interact with cache; null, if it does not exist, string if
+*	the immutable path has been permanently moved to the new path in source space) */
 export function GetImmutable(path: string, stable: boolean): Cached | string | null {
 	return ResolveCache(path, stable, true);
 }
@@ -524,11 +533,12 @@ export function GetActual(path: string, stable: boolean): Cached | null {
 	return ResolveCache(path, stable, false) as (Cached | null);
 }
 
-/* generate a unique tagged path for the given query path, which will change whenever the underlying file changes (creates
-*	a path to a file, which looks similar to the source, except that the name includes a UUID, which will be used to identity
-*	the given file state; will be removed from the final target path to be served, to identify the actual source) */
-export function MakeImmutable(path: string): string {
-	return immutableManager.make(path);
+/* generate a unique tagged path for the given query path, which will change whenever the underlying file changes; [stable]: if
+*	created as stable, dont re-validate the file stats to detect changes (creates a path to a file, which looks similar to the
+*	source, except that the name includes a UUID, which will be used to identity the given file state; will be removed from the
+*	final target path to be served, to identify the actual source) */
+export function MakeImmutable(path: string, stable: boolean): string {
+	return immutableManager.make(path, stable);
 }
 
 /* flush all cached data and invalidate immutable stats so they are re-checked on next access */
