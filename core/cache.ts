@@ -157,8 +157,8 @@ class ImmutableManager {
 		if (this.writeBack.writing != null)
 			return;
 
-		let resolve: null | (() => void) = null;
-		this.writeBack.writing = new Promise((res) => resolve = res);
+		let resolver = () => { };
+		this.writeBack.writing = new Promise((res) => resolver = res);
 
 		/* check if the state is dirty and perform the write backs */
 		while (this.writeBack.dirty) {
@@ -178,7 +178,7 @@ class ImmutableManager {
 		}
 
 		this.writeBack.writing = null;
-		resolve!();
+		resolver();
 	}
 	private async loadState(path: string): Promise<ImmutableSerialized[]> {
 		logger.trace(`Loading immutable state from [${path}]`);

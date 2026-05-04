@@ -532,9 +532,15 @@ export class HttpRequest extends IncomingBase {
 		}
 	}
 	protected override async finishSelfHandling(): Promise<void> {
-		/* ensure that all data have been fully received or drain them */
-		if (this.receive == ReceiveState.receiving)
+		if (this.receive == ReceiveState.receiving) {
+			/* check if the response is already completed, in which case it can be silently
+			*	reset to 'header-sent' to ensure the connection is properly marked as broken */
+			if (this.state == ResponseState.completed)
+				this.state = ResponseState.headerSent;
 			this.respondBadInternalUsage();
+		}
+
+		/* drain any remaining data in the pipeline */
 		if (!this.request.readableEnded && !this.request.destroyed) {
 			this.request.unpipe();
 			await new Promise<void>((resolve) => {
@@ -854,7 +860,7 @@ export class HttpRequest extends IncomingBase {
 
 	/* return the string formatted media-type (or empty string for no media type) */
 	public getMediaType(): string {
-		const type = libRequest.SplitAndTrimList(this.requestHeaders['content-type'] ?? null, ';', true)[0] ?? null;
+		const type = libRequest.SplitAndTrimList(this.requestHeaders['content-type'] ?? null, ';', true)[0] ?? '';
 		return type.toLowerCase();
 	}
 
@@ -1282,12 +1288,10 @@ export class HttpUpgrade extends IncomingBase {
 
 		/* check if the connection is a valid upgrade request */
 		let connection = libRequest.SplitAndTrimList(this.requestHeaders.connection?.toLowerCase() ?? null, ',', false);
-		if (connection == null || connection.indexOf('upgrade') == -1)
+		if (connection.indexOf('upgrade') == -1)
 			return false;
 		if (this.requestHeaders?.upgrade?.toLowerCase() != 'websocket' || this.request.method != 'GET')
 			return false;
-
-		this.state = ResponseState.headerSent;
 
 		/* save the current path state so that the ClientSocket receives the correct
 		*	shifted paths even if the caller restores before the async callback fires */
@@ -1295,6 +1299,7 @@ export class HttpUpgrade extends IncomingBase {
 
 		/* perform the upgrade (websocket will automatically send http error responses and close the socket
 		*	on errors in the upgrade process) and restore the context when the accept was performed */
+		this.state = ResponseState.headerSent;
 		this.trace(`Performing upgrade on web socket connection [${this.fullPath}]`);
 		this.wss.handleUpgrade(this.request, this.socket, this.head, async (ws, request) => {
 			const current = this.restore(snapshot);
