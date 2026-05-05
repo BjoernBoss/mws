@@ -114,10 +114,10 @@ export class HtmlPage {
 	private _body: HtmlComponent[];
 	public language: HtmlString;
 
-	constructor(language: HtmlString = 'en', head: HtmlComponent[] | HtmlComponent = [], body: HtmlComponent[] | HtmlComponent = []) {
-		this._head = (Array.isArray(head) ? head : [head]);
-		this._body = (Array.isArray(body) ? body : [body]);
-		this.language = language;
+	constructor(options?: { language?: HtmlString, head?: HtmlComponent[] | HtmlComponent, body?: HtmlComponent[] | HtmlComponent }) {
+		this._head = (Array.isArray(options?.head) ? options?.head : (options?.head == undefined ? [] : [options?.head]));
+		this._body = (Array.isArray(options?.body) ? options?.body : (options?.body == undefined ? [] : [options?.body]));
+		this.language = options?.language ?? Safe('en', true);
 	}
 
 	public get head(): HtmlComponent[] {

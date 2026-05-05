@@ -9,7 +9,9 @@ import * as libLocation from "./location.js";
 *	If the returned promise resolves, and the client has not yet been handled,
 *	it is expected to not be handled anymore by the given client.
 *	Modules expect clients to be completely unhandled when being passed to the module.
-*	Stop should cleanup the module resources and any timers (no new active connections will be incoming anymore, may be called multiple times).
+*	Stop should cleanup the module resources and any timers and close any connections (may be called multiple times,
+*	upon server shutdown, all requests and web-sockets will be disconnected before stopping the module, but it could
+*	also be stopped individually, and could still be served afterwards again).
 */
 export interface ModuleInterface {
 	name: string;

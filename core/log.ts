@@ -183,7 +183,7 @@ export function AddLogger(cb: LogCallback): void {
 }
 
 export class LogIdentity {
-	protected logIdentity: string;
+	public logIdentity: string;
 
 	constructor(identity: string) {
 		this.logIdentity = identity;

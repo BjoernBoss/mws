@@ -30,23 +30,17 @@ let NextClientId: number = 0;
 
 export class ClientContext {
 	public logIdentity: string;
-	public context: Record<string, unknown>;
 	public basePath: string;
 	public path: string;
 
-	constructor(logIdentity: string, context: Record<string, unknown>, basePath: string, path: string) {
+	constructor(logIdentity: string, basePath: string, path: string) {
 		this.logIdentity = logIdentity;
-		this.context = context;
 		this.basePath = basePath;
 		this.path = path;
 	}
 }
 
 export class ClientBase extends libLog.LogIdentity {
-	/* contextual data attached to the client (affected by translation/snapshots; content
-	*	preserved but object might be changed, should therefore not be held directly) */
-	public context: Record<string, unknown>;
-
 	/* path relative to current module base-path */
 	public path: string;
 
@@ -78,7 +72,6 @@ export class ClientBase extends libLog.LogIdentity {
 				return output;
 			}).join('/');
 
-			this.context = {};
 			this.id = thisClientId;
 			this.path = libLocation.Sanitize(cleanPath, false);
 			this.url = arg;
@@ -87,7 +80,6 @@ export class ClientBase extends libLog.LogIdentity {
 		}
 		else {
 			super(arg.logIdentity);
-			this.context = { ...arg.context };
 			this.path = arg.path;
 			this.fullPath = arg.fullPath;
 			this.basePath = arg.basePath;
@@ -100,46 +92,39 @@ export class ClientBase extends libLog.LogIdentity {
 		return libLocation.JoinSanitized(this.basePath, path);
 	}
 
-	/* check if path is a substring of the current path, and if so, shift the path and identity
-	*	and return a snapshot of the old context (to be able to recover the old state), otherwise
-	*	it returns null (changes to context object will be discarded upon context restore) */
+	/* check if path is a substring of the current path, and if so, shift the path and identity and return
+	*	a snapshot of the old context (to be able to recover the old state), otherwise it returns null */
 	public pushPath(path: string, identity?: string): ClientContext | null {
 		if (!libLocation.IsSubDirectory(path, this.path))
 			return null;
-		const current = new ClientContext(this.logIdentity, this.context, this.basePath, this.path);
+		const current = new ClientContext(this.logIdentity, this.basePath, this.path);
 
-		/* shift the paths and the log identity and create the copy of the context */
+		/* shift the paths and the log identity */
 		this.basePath = libLocation.JoinSanitized(this.basePath, path);
 		this.path = this.path.substring(path.endsWith('/') ? path.length - 1 : path.length);
 		if (this.path == '')
 			this.path = '/';
 		if (identity != null && identity != '')
 			this.logIdentity = `${this.logIdentity}.${identity}`;
-		this.context = { ...this.context };
 		return current;
 	}
 
-	/* preserve the current logging and translation and context and shift
-	*	onto the logging identity and return a snapshot of the old context
-	*	(changes to context object will be discarded upon context restore) */
+	/* preserve the current logging and translation and shift onto the logging identity and return a snapshot of the old context */
 	public pushLog(identity: string): ClientContext {
-		const current = new ClientContext(this.logIdentity, this.context, this.basePath, this.path);
+		const current = new ClientContext(this.logIdentity, this.basePath, this.path);
 		this.logIdentity = `${this.logIdentity}.${identity}`;
-		this.context = { ...this.context };
 		return current;
 	}
 
-	/* preserve the current logging and translation and context and return a
-	*	snapshot of it (changes to context object will not be reverted) */
+	/* preserve the current logging and translation and return a snapshot of it */
 	public snapshot(): ClientContext {
-		return new ClientContext(this.logIdentity, this.context, this.basePath, this.path);
+		return new ClientContext(this.logIdentity, this.basePath, this.path);
 	}
 
 	/* restore a client log and translation and context and return the previous context */
 	public restore(snapshot: ClientContext): ClientContext {
-		const current = new ClientContext(this.logIdentity, this.context, this.basePath, this.path);
+		const current = new ClientContext(this.logIdentity, this.basePath, this.path);
 		this.logIdentity = snapshot.logIdentity;
-		this.context = snapshot.context;
 		this.basePath = snapshot.basePath;
 		this.path = snapshot.path;
 		return current;
@@ -1335,7 +1320,7 @@ export class ClientSocket extends ClientBase {
 		this.ws = ws;
 		this.aliveTimer = null;
 		this.isAlive = true;
-		this.wsLogger = libLog.Logger(base.snapshot().logIdentity);
+		this.wsLogger = (base as libLog.LogIdentity);
 
 		this.ws.on('pong', () => {
 			this.wsLogger.trace(`Alive check pong received`);
