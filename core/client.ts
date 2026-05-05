@@ -560,7 +560,11 @@ export class HttpRequest extends IncomingBase {
 			this.response.on('finish', () => closeConnection());
 	}
 	private closeHeader(status: libRequest.StatusType, media: libRequest.MediaType | null, contentSize: number | null, updateState: boolean, encoding: string, headers: Record<string, string>, error: boolean): void {
-		this.trace(`Sending ${this.isHead ? 'HEAD' : 'content'} [${media?.mediaType ?? 'none'}] of size [${contentSize ?? 'unknown'}] ${encoding.length == 0 ? 'not encoded' : `encoded using [${encoding}]`}`);
+		if (media == null)
+			this.trace(`Sending ${this.isHead ? 'HEAD for ' : ''}no content`);
+		else
+			this.trace(`Sending ${this.isHead ? 'HEAD' : 'content'} [${media?.mediaType ?? 'none'}] of size [${contentSize ?? 'unknown'}] ${encoding.length == 0 ? 'not encoded' : `encoded using [${encoding}]`}`);
+
 		if (updateState)
 			this.state = ResponseState.headerSent;
 

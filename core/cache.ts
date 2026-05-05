@@ -234,16 +234,17 @@ class ImmutableManager {
 			return false;
 		}
 		const [fileSize, mtime] = stats;
+		entry.fetched = true;
 
 		/* check if the stats have changed, in which case a new id needs to be assigned (thus binding the id to the stats) */
-		if (!entry.fetched || entry.size != fileSize || entry.mtime != mtime) {
-			if (!firstAssign)
-				this.assignId(path, entry);
-			entry.size = fileSize;
-			entry.mtime = mtime;
-			entry.fetched = true;
-			this.storeState();
+		if (!firstAssign) {
+			if (entry.size == fileSize && entry.mtime == mtime)
+				return true;
+			this.assignId(path, entry);
 		}
+		entry.size = fileSize;
+		entry.mtime = mtime;
+		this.storeState();
 		return true;
 	}
 
