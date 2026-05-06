@@ -266,7 +266,7 @@ export abstract class IncomingBase extends ClientBase {
 	public get isHead(): boolean {
 		return (this.request.method == 'HEAD');
 	}
-	public get completed(): Promise<void> {
+	public get completion(): Promise<void> {
 		return this.processed.promise;
 	}
 

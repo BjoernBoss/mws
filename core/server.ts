@@ -129,7 +129,7 @@ export class Server {
 		/* log the established listener once the port is actually bound */
 		server.on('listening', () => {
 			const address = server.address() as libNet.AddressInfo;
-			logger.info(`${protocol}-server started successfully on [${address.address}]:${address.port} [family: ${address.family}] with handler [${handler.name}]`);
+			logger.info(`${protocol}-server started successfully on [${address.address}]:${address.port} [family: ${address.family}] with handler [${handler.moduleName}]`);
 		});
 		server.listen(port);
 	}

@@ -30,7 +30,7 @@ export abstract class ModuleHandler {
 		this._active = new Set<libClient.IncomingBase>();
 	}
 
-	public get name(): string {
+	public get moduleName(): string {
 		return this._name;
 	}
 
@@ -136,11 +136,11 @@ export class DispatchModule extends ModuleHandler {
 
 	constructor(map: Record<string, ModuleHandler>) {
 		super('dispatch');
-		const logger = libLog.Logger(this.name);
+		const logger = libLog.Logger(this.moduleName);
 
 		this.mapping = {};
 		for (const [key, handler] of Object.entries(map)) {
-			logger.info(`Binding [${key}] to child [${handler.name}]`);
+			logger.info(`Binding [${key}] to child [${handler.moduleName}]`);
 			this.mapping[key] = handler;
 		}
 	}
@@ -157,7 +157,7 @@ export class DispatchModule extends ModuleHandler {
 		}
 
 		if (bestMatch != null) {
-			client.trace(`Client dispatched to handler [${this.mapping[bestMatch].name}] at [${bestMatch}]`);
+			client.trace(`Client dispatched to handler [${this.mapping[bestMatch].moduleName}] at [${bestMatch}]`);
 			return this.mapping[bestMatch].handle(client, bestMatch);
 		}
 		client.trace(`Request cannot be dispatched`);
@@ -185,11 +185,11 @@ export class HostModule extends ModuleHandler {
 
 	constructor(map: Record<string, ModuleHandler>) {
 		super('host');
-		const logger = libLog.Logger(this.name);
+		const logger = libLog.Logger(this.moduleName);
 
 		this.mapping = {};
 		for (const [key, handler] of Object.entries(map)) {
-			logger.info(`Binding [/] with host [${key}] to child [${handler.name}]`);
+			logger.info(`Binding [/] with host [${key}] to child [${handler.moduleName}]`);
 			this.mapping[key] = handler;
 		}
 	}
@@ -215,7 +215,7 @@ export class HostModule extends ModuleHandler {
 		}
 
 		if (bestMatch != null) {
-			client.trace(`Client dispatched to handler [${this.mapping[bestMatch].name}] for host [${bestMatch}]`);
+			client.trace(`Client dispatched to handler [${this.mapping[bestMatch].moduleName}] for host [${bestMatch}]`);
 			return this.mapping[bestMatch].handle(client);
 		}
 		client.trace(`Request cannot be dispatched`);
@@ -247,7 +247,7 @@ export class UnhandledModule extends ModuleHandler {
 		super('unhandler');
 
 		this.handler = handler;
-		libLog.Logger(this.name).info(`Binding [/] to child [${handler.name}]`);
+		libLog.Logger(this.moduleName).info(`Binding [/] to child [${handler.moduleName}]`);
 		this.requestLambda = options?.request;
 		this.upgradeLambda = options?.upgrade;
 	}
@@ -279,7 +279,7 @@ export class WrapModule extends ModuleHandler {
 		super('wrap');
 
 		this.handler = handler;
-		libLog.Logger(this.name).info(`Binding [/] to child [${handler.name}]`);
+		libLog.Logger(this.moduleName).info(`Binding [/] to child [${handler.moduleName}]`);
 		this.requestWrap = options?.request;
 		this.upgradeWrap = options?.upgrade;
 	}
