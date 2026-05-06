@@ -9,7 +9,9 @@ import * as libCrypto from "crypto";
 
 const logger = libLog.Logger('cache');
 
-const ID_EXTENSION_REGEX: RegExp = /^\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const UNIQUE_ID_CHARS = '0123456789abcdefghijklmnopqrstuvwxyz'
+const UNIQUE_ID_LENGTH = 14;
+const ID_EXTENSION_REGEX = RegExp(`^\\.[${UNIQUE_ID_CHARS}]{${UNIQUE_ID_LENGTH}}$`, 'i');
 
 function ReadStats(path: string): null | [number, number] {
 	try {
@@ -118,16 +120,19 @@ class CacheManager {
 
 interface ImmutableEntry {
 	immutable: string;
-	actual: string | null;
+	handler: string;
+	path: string;
+	fileSystem: string | null;
 	size: number;
 	mtime: number;
-	id: string;
+	unique: string;
 	fetched: boolean;
 }
 interface ImmutableSerialized {
-	id: string;
-	src: string;
-	dst: string | null;
+	unique: string;
+	handler: string;
+	path: string;
+	fileSystem: string | null;
 	size: number;
 	mtime: number;
 }
@@ -136,19 +141,21 @@ class ImmutableManager {
 	private reverse: Record<string, string> = {};
 	private writeBack: { path: string, writing: Promise<void> | null, dirty: boolean } | null = null;
 
-	private assignId(path: string, entry: ImmutableEntry): void {
-		if (entry.id.length > 0)
-			delete this.reverse[entry.id];
+	private assignId(identifier: string, entry: ImmutableEntry): void {
+		if (entry.unique.length > 0)
+			delete this.reverse[entry.unique];
 
-		/* allocate the new id and patch the state up to contain the new id */
-		const id = libCrypto.randomUUID();
-		const [base, name, extension] = libLocation.SplitFilePath(path);
-		const idPath = `${base}${name}.${id}${extension}`;
-		logger.trace(`Allocated immutable id [${id}] for [${path}]`);
+		/* setup the new unique id */
+		entry.unique = '';
+		for (let i = 0; i < UNIQUE_ID_LENGTH; ++i)
+			entry.unique += UNIQUE_ID_CHARS[libCrypto.randomInt(UNIQUE_ID_CHARS.length)];
 
-		entry.immutable = idPath;
-		entry.id = id;
-		this.reverse[id] = path;
+		/* patch the state up to contain the new id */
+		const [base, name, extension] = libLocation.SplitFilePath(entry.path);
+		entry.immutable = `${base}${name}.${entry.unique}${extension}`;
+		this.reverse[entry.unique] = identifier;
+
+		logger.trace(`Allocated immutable unique id [${entry.unique}] for [${identifier}]`);
 	}
 	private async storeState(): Promise<void> {
 		if (this.writeBack == null)
@@ -166,10 +173,9 @@ class ImmutableManager {
 
 			/* collect the list of all relevant entries */
 			let output: any[] = [];
-			for (const srcPath in this.map) {
-				const entry = this.map[srcPath];
-				if (entry.actual != null)
-					output.push({ id: entry.id, src: srcPath, dst: entry.actual, size: entry.size, mtime: entry.mtime });
+			for (const identifier in this.map) {
+				const entry = this.map[identifier];
+				output.push({ unique: entry.unique, handler: entry.handler, path: entry.path, fileSystem: entry.fileSystem, size: entry.size, mtime: entry.mtime });
 			}
 			const content: string = JSON.stringify(output);
 
@@ -207,40 +213,43 @@ class ImmutableManager {
 		/* parse all of the values and validate their general structure */
 		let corrupted = 0, output: ImmutableSerialized[] = [];
 		for (const entry of state) {
-			if (typeof entry.id != 'string' || typeof entry.src != 'string' || (typeof entry.dst != 'string' && entry.dst !== null))
+			if (typeof entry.unique != 'string' || typeof entry.handler != 'string' || (typeof entry.fileSystem != 'string' && entry.fileSystem !== null))
 				++corrupted;
-			else if (typeof entry.size != 'number' || !isFinite(entry.size) || entry.size < 0)
+			else if (!`.${entry.unique}`.match(ID_EXTENSION_REGEX) || typeof entry.path != 'string')
 				++corrupted;
 			else if (typeof entry.mtime != 'number' || !isFinite(entry.mtime) || entry.mtime < 0)
 				++corrupted;
+			else if (typeof entry.size != 'number' || !isFinite(entry.size) || entry.size < 0 || Math.floor(entry.size) != entry.size)
+				++corrupted;
 			else
-				output.push({ id: entry.id, src: entry.src, dst: entry.dst, size: entry.size, mtime: entry.mtime });
+				output.push({ unique: entry.unique, handler: entry.handler, path: entry.path, fileSystem: entry.fileSystem, size: entry.size, mtime: entry.mtime });
 		}
 
 		if (corrupted > 0)
 			logger.error(`Immutable loaded state [${path}] contained [${corrupted}] malformed entires`);
 		return output;
 	}
-	private updateEntry(path: string, entry: ImmutableEntry, stable: boolean, firstAssign: boolean): boolean {
-		/* check if the entry can just be served (id might still be oudated) and otherwise fetch the initial stats */
+	private updateEntry(identifier: string, entry: ImmutableEntry, stable: boolean, firstAssign: boolean): boolean {
 		if (entry.fetched && stable && libConfig.cacheAllowStable)
 			return true;
-		const stats = ReadStats(entry.actual!);
+
+		/* fetch the file states of the actual filesystem entry */
+		const stats = ReadStats(entry.fileSystem!);
 		if (stats == null) {
-			logger.warning(`Immutable path [${entry.actual}] does not exist`);
-			delete this.map[path];
-			delete this.reverse[entry.id];
+			logger.warning(`Immutable path [${entry.fileSystem}] does not exist`);
+			delete this.map[identifier];
+			delete this.reverse[entry.unique];
 			this.storeState();
 			return false;
 		}
 		const [fileSize, mtime] = stats;
 		entry.fetched = true;
 
-		/* check if the stats have changed, in which case a new id needs to be assigned (thus binding the id to the stats) */
+		/* check if the stats have changed, in which case a new unique-id needs to be assigned (thus binding the it to the stats) */
 		if (!firstAssign) {
 			if (entry.size == fileSize && entry.mtime == mtime)
 				return true;
-			this.assignId(path, entry);
+			this.assignId(identifier, entry);
 		}
 		entry.size = fileSize;
 		entry.mtime = mtime;
@@ -248,23 +257,24 @@ class ImmutableManager {
 		return true;
 	}
 
-	public make(path: string, stable: boolean): string {
+	public make(path: string, handler: string, stable: boolean): string {
+		const identifier = `${handler}:${path}`;
 		if (!libConfig.cacheAllowImmutable)
 			return path;
 
 		/* check if the entry does not yet exist and the id-tagged path needs to be created */
-		let entry = this.map[path] ?? null;
+		let entry = this.map[identifier] ?? null;
 		if (entry == null) {
-			entry = (this.map[path] = { immutable: '', id: '', actual: null, size: 0, mtime: 0, fetched: false });
-			this.assignId(path, entry);
+			entry = (this.map[identifier] = { immutable: '', handler, path, unique: '', fileSystem: null, size: 0, mtime: 0, fetched: false });
+			this.assignId(identifier, entry);
 			this.storeState();
 			return entry.immutable;
 		}
 
 		/* check if the stats can actually be validated or if the entry should just be served */
-		if (entry.actual == null)
+		if (entry.fileSystem == null)
 			return entry.immutable;
-		if (!this.updateEntry(path, entry, stable, false))
+		if (!this.updateEntry(identifier, entry, stable, false))
 			return path;
 		return entry.immutable;
 	}
@@ -272,40 +282,40 @@ class ImmutableManager {
 		if (!libConfig.cacheAllowImmutable)
 			return [null, false];
 
-		/* check if it might be an immutable-id */
+		/* check if it might be an immutable-tagged path */
 		const [base, temp, extension] = libLocation.SplitFilePath(path);
 		const [_, name, tempId] = libLocation.SplitFilePath(temp);
 		if (!tempId.match(ID_EXTENSION_REGEX))
 			return [null, false];
-		const id = tempId.substring(1);
+		const unique = tempId.substring(1);
 
-		/* check if the entry does not exist in the reverse mapping anymore - indicating that the id is
-		*	old/outdated, in which case it can be recovered by comparing the full actual path to all of
+		/* check if the entry does not exist in the reverse mapping anymore - indicating that the unique-id
+		*	is old/outdated, in which case it can be recovered by comparing the full actual path to all of
 		*	the entries, looking for the actual object, thereby recovering the most recent immutable path */
-		let srcPath = this.reverse[id] ?? null;
-		if (srcPath == null) {
-			const actualPath = `${base}${name}${extension}`;
-			for (const tempPath in this.map) {
-				if (this.map[tempPath].actual != actualPath)
+		let identifier = this.reverse[unique] ?? null;
+		if (identifier == null) {
+			const fileSystemPath = `${base}${name}${extension}`;
+			for (const tempIdentifier in this.map) {
+				if (this.map[tempIdentifier].fileSystem != fileSystemPath)
 					continue;
-				srcPath = tempPath;
+				identifier = tempIdentifier;
 				break;
 			}
-			if (srcPath == null)
+			if (identifier == null)
 				return [null, false];
 		}
-		const entry = this.map[srcPath]!, firstAssign = (entry.actual == null);
-		if (entry.actual == null)
-			entry.actual = `${base}${name}${extension}`;
+		const entry = this.map[identifier]!, firstAssign = (entry.fileSystem == null);
+		if (entry.fileSystem == null)
+			entry.fileSystem = `${base}${name}${extension}`;
 
-		/* update the entry and return the final stats/if the id changed */
-		if (!this.updateEntry(srcPath, entry, stable, firstAssign))
+		/* update the entry and return the final stats/if the unique-id changed */
+		if (!this.updateEntry(identifier, entry, stable, firstAssign))
 			return [null, false];
-		return [entry, entry.id != id];
+		return [entry, entry.unique != unique];
 	}
 	public invalidate(): void {
-		for (const path in this.map)
-			this.map[path].fetched = false;
+		for (const identifier in this.map)
+			this.map[identifier].fetched = false;
 	}
 	public async setWriteBack(path: string): Promise<void> {
 		/* fetch the new state to be written back (before updating the write-back to ensure
@@ -323,20 +333,23 @@ class ImmutableManager {
 
 		/* merge the loaded state into the current state (prefer current state over loaded state) */
 		for (const state of states) {
-			if (state.src in this.map)
+			const identifier = `${state.handler}:${state.path}`;
+			if (identifier in this.map)
 				continue;
-			logger.trace(`Recovering immutable id [${state.id}] for [${state.src}]`);
+			logger.trace(`Recovering immutable unique id [${state.unique}] for [${identifier}]`);
 
-			const [base, name, extension] = libLocation.SplitFilePath(state.src);
-			this.map[state.src] = {
-				immutable: `${base}${name}.${state.id}${extension}`,
-				actual: state.dst,
+			const [base, name, extension] = libLocation.SplitFilePath(state.path);
+			this.map[identifier] = {
+				immutable: `${base}${name}.${state.unique}${extension}`,
+				handler: state.handler,
+				path: state.path,
+				fileSystem: state.fileSystem,
 				size: state.size,
 				mtime: state.mtime,
-				id: state.id,
+				unique: state.unique,
 				fetched: false
 			};
-			this.reverse[state.id] = state.src;
+			this.reverse[state.unique] = identifier;
 		}
 
 		/* check if the writeback should be configured and perform the first write back */
@@ -495,7 +508,7 @@ function ResolveCache(path: string, stable: boolean, checkImmutable: boolean): C
 	*	if it has been moved (due to the id having been invalidated) */
 	const [immutable, immutableMoved] = (checkImmutable ? immutableManager.get(path, stable) : [null, false]);
 	if (immutable != null) {
-		path = immutable.actual!;
+		path = immutable.fileSystem!;
 		if (immutableMoved)
 			return immutable.immutable;
 	}
@@ -538,8 +551,8 @@ export function GetActual(path: string, stable: boolean): Cached | null {
 *	created as stable, dont re-validate the file stats to detect changes (creates a path to a file, which looks similar to the
 *	source, except that the name includes a UUID, which will be used to identity the given file state; will be removed from the
 *	final target path to be served, to identify the actual source) */
-export function MakeImmutable(path: string, stable: boolean): string {
-	return immutableManager.make(path, stable);
+export function MakeImmutable(path: string, handler: string, stable: boolean): string {
+	return immutableManager.make(path, handler, stable);
 }
 
 /* flush all cached data and invalidate immutable stats so they are re-checked on next access */
