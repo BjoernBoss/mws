@@ -41,20 +41,10 @@ export class ClientContext {
 }
 
 export class ClientBase extends libLog.LogIdentity {
-	/* path relative to current module base-path */
-	public path: string;
-
-	/* absolute path on web-server */
-	public fullPath: string;
-
-	/* base path between the fullPath and path */
-	public basePath: string;
-
-	/* raw request origin (no host will result in '_') */
-	public url: libUrl.URL;
-
-	/* unique id to identify client in logs */
-	readonly id: number;
+	protected _url: libUrl.URL;
+	protected _path: string;
+	protected _fullPath: string;
+	protected _basePath: string;
 
 	protected constructor(url: libUrl.URL, client: boolean);
 	protected constructor(client: ClientBase);
@@ -73,60 +63,67 @@ export class ClientBase extends libLog.LogIdentity {
 			}).join('/');
 
 			this.id = thisClientId;
-			this.path = libLocation.Sanitize(cleanPath, false);
-			this.url = arg;
-			this.fullPath = this.path;
-			this.basePath = '/';
+			this._path = libLocation.Sanitize(cleanPath, false);
+			this._url = arg;
+			this._fullPath = this._path;
+			this._basePath = '/';
 		}
 		else {
 			super(arg.logIdentity);
-			this.path = arg.path;
-			this.fullPath = arg.fullPath;
-			this.basePath = arg.basePath;
-			this.url = arg.url;
+			this._path = arg._path;
+			this._url = arg.url;
+			this._fullPath = arg._fullPath;
+			this._basePath = arg._basePath;
 			this.id = arg.id;
 		}
 	}
 
+	/* unique id to identify client in logs */
+	readonly id: number;
+
+	/* path relative to current module base-path */
+	public get path(): string {
+		return this._path;
+	}
+
+	/* absolute path on web-server */
+	public get basePath(): string {
+		return this._basePath;
+	}
+
+	/* base path between the fullPath and path */
+	public get fullPath(): string {
+		return this._fullPath;
+	}
+
+	/* raw request origin (no host will result in '_') */
+	public get url(): libUrl.URL {
+		return this._url;
+	}
+
+	/* create a path relative to the current translation base */
 	public makePath(path: string): string {
-		return libLocation.JoinSanitized(this.basePath, path);
+		return libLocation.JoinSanitized(this._basePath, path);
 	}
 
-	/* check if path is a substring of the current path, and if so, shift the path and identity and return
-	*	a snapshot of the old context (to be able to recover the old state), otherwise it returns null */
-	public pushPath(path: string, identity?: string): ClientContext | null {
-		if (!libLocation.IsSubDirectory(path, this.path))
-			return null;
-		const current = new ClientContext(this.logIdentity, this.basePath, this.path);
-
-		/* shift the paths and the log identity */
-		this.basePath = libLocation.JoinSanitized(this.basePath, path);
-		this.path = this.path.substring(path.endsWith('/') ? path.length - 1 : path.length);
-		if (this.path == '')
-			this.path = '/';
-		if (identity != null && identity != '')
-			this.logIdentity = `${this.logIdentity}.${identity}`;
-		return current;
-	}
-
-	/* preserve the current logging and translation and shift onto the logging identity and return a snapshot of the old context */
-	public pushLog(identity: string): ClientContext {
-		const current = new ClientContext(this.logIdentity, this.basePath, this.path);
+	/* preserve the current logging and translation and tag the logging with the given identity and return a snapshot of the old context */
+	public tagLog(identity: string): ClientContext {
+		const current = new ClientContext(this.logIdentity, this._basePath, this._path);
 		this.logIdentity = `${this.logIdentity}.${identity}`;
 		return current;
 	}
 
 	/* preserve the current logging and translation and return a snapshot of it */
 	public snapshot(): ClientContext {
-		return new ClientContext(this.logIdentity, this.basePath, this.path);
+		return new ClientContext(this.logIdentity, this._basePath, this._path);
 	}
 
 	/* restore a client log and translation and context and return the previous context */
 	public restore(snapshot: ClientContext): ClientContext {
-		const current = new ClientContext(this.logIdentity, this.basePath, this.path);
+		const current = new ClientContext(this.logIdentity, this._basePath, this._path);
 		this.logIdentity = snapshot.logIdentity;
-		this.basePath = snapshot.basePath;
-		this.path = snapshot.path;
+		this._basePath = snapshot.basePath;
+		this._path = snapshot.path;
 		return current;
 	}
 }
@@ -169,14 +166,18 @@ export abstract class IncomingBase extends ClientBase {
 	protected request: libHttp.IncomingMessage;
 	protected headerPatchers: HeaderPatch[];
 	protected state: ResponseState;
-	protected throughput: { timer: NodeJS.Timeout, processed: number, start: number };
-	protected processed: { promise: Promise<void>, resolve?: () => void };
+	private throughput: { timer: NodeJS.Timeout, processed: number, start: number };
+	private processed: { promise: Promise<void>, resolve?: () => void };
 
 	/* write the given header and content out (no need to update state; body may be null for HEAD responses of unknown size) */
 	protected abstract finalizeBufferHeader(status: libRequest.StatusType, error: boolean, headers: Record<string, string>, content: { media: libRequest.MediaType, body: Buffer | null } | null): void;
 
-	/* finish handling the request (if ends on 'broken', must close the connection) */
-	protected abstract finishSelfHandling(): Promise<void>;
+	/* finish handling the request (if an error is returned or the connection is marked
+	*	as broken afterwards, will be killed gracefully, until graceful timeout elapses) */
+	protected abstract handleFinishing(): Promise<Error | null>;
+
+	/* kill the current connection (if graceful, wait for the last queued data to be sent; may be called multiple times) */
+	protected abstract handleKilling(graceful: boolean, reason: Error): Promise<void>;
 
 	constructor(request: libHttp.IncomingMessage, host: string, protocol: string, client: boolean) {
 		super(new libUrl.URL(`${protocol}//${host == '' ? '_' : host}${request.url}`), client);
@@ -209,7 +210,7 @@ export abstract class IncomingBase extends ClientBase {
 			this.respondRequestTimeout(`too low throughput of [${Math.round(throughput)}] bytes/sec`, { error: true });
 		else {
 			this.error(`Closing connection due to too low throughput of [${Math.round(throughput)}] bytes/sec`);
-			this.request.destroy(new Error('Throughput too low'));
+			this.handleKilling(false, new Error('Throughput too low'));
 		}
 		this.state = ResponseState.broken;
 	}
@@ -244,7 +245,7 @@ export abstract class IncomingBase extends ClientBase {
 			this.error(`Silently dropping exception ${this.isHead ? 'for HEAD ' : ''}[${status.msg}]${logReason}`);
 	}
 
-	public get requestHeaders(): libHttp.IncomingHttpHeaders {
+	public get headers(): libHttp.IncomingHttpHeaders {
 		return this.request.headers;
 	}
 	public get unhandled(): boolean {
@@ -256,12 +257,6 @@ export abstract class IncomingBase extends ClientBase {
 	public get headerSent(): boolean {
 		return (this.state != ResponseState.none && this.state != ResponseState.acknowledged);
 	}
-	public get responding(): boolean {
-		return (this.state == ResponseState.acknowledged || this.state == ResponseState.headerSent);
-	}
-	public get completed(): boolean {
-		return (this.state == ResponseState.completed);
-	}
 	public get broken(): boolean {
 		return (this.state == ResponseState.broken);
 	}
@@ -271,10 +266,49 @@ export abstract class IncomingBase extends ClientBase {
 	public get isHead(): boolean {
 		return (this.request.method == 'HEAD');
 	}
-
-	/* promise, which resolves once the client has been fully processed by all modules */
-	public get awaitCompletion(): Promise<void> {
+	public get completed(): Promise<void> {
 		return this.processed.promise;
+	}
+
+	public async _finishConnection(): Promise<void> {
+		let error: Error | null = null;
+		try {
+			if (this.state == ResponseState.none)
+				this.respondNotFound();
+			error = await this.handleFinishing();
+		} catch (_) { }
+
+		/* check if the connection is marked as broken, in which case the
+		*	data on it are not reliable anymore and it must be destroyed */
+		if (this.state == ResponseState.broken)
+			error = new Error('Connection is broken');
+
+		/* check if the connection should be killed (give it a grace timeout to receive any potential final response data) */
+		if (error != null) try {
+			const forceDestroy = setTimeout(() => this.handleKilling(false, error), libConfig.brokenGraceTimeout);
+			await this.handleKilling(true, error);
+			clearTimeout(forceDestroy);
+		} catch (_) { }
+
+		clearTimeout(this.throughput.timer);
+		this.processed.resolve!();
+	}
+	public async _killConnection(): Promise<void> {
+		return this.handleKilling(false, new Error('Closing connection'));
+	}
+	public _pushTranslation(path: string, identity?: string): ClientContext | null {
+		if (!libLocation.IsSubDirectory(path, this._path))
+			return null;
+		const current = new ClientContext(this.logIdentity, this._basePath, this._path);
+
+		/* shift the paths and the log identity */
+		this._basePath = libLocation.JoinSanitized(this._basePath, path);
+		this._path = this._path.substring(path.endsWith('/') ? path.length - 1 : path.length);
+		if (this._path == '')
+			this._path = '/';
+		if (identity != null && identity != '')
+			this.logIdentity = `${this.logIdentity}.${identity}`;
+		return current;
 	}
 
 	/* ensure the method is one of the list and otherwise return null and auto-respond with [method-not-allowed]
@@ -299,18 +333,6 @@ export abstract class IncomingBase extends ClientBase {
 	/* register a callback to be invoked once the response is sent, to adjust the headers to be sent */
 	public patchHeaders(cb: HeaderPatch): void {
 		this.headerPatchers.push(cb);
-	}
-
-	/* called by framework to finish this incoming object (sends queued content, not-found if unhandled, or internal-error if incomplete/broken) */
-	public async finishIncoming(): Promise<void> {
-		try {
-			if (this.state == ResponseState.none)
-				this.respondNotFound();
-			await this.finishSelfHandling();
-		} finally {
-			clearTimeout(this.throughput.timer);
-			this.processed.resolve!();
-		}
 	}
 
 	/* respond with [internal-error] and a pre-defined html template response (always considered an error, clears any other header fields) */
@@ -495,7 +517,7 @@ export class HttpRequest extends IncomingBase {
 			if (libRequest.ShouldEncode(content.body?.byteLength ?? null, content.media)) {
 				headers['Vary'] = 'Accept-Encoding';
 
-				encoding = libRequest.SelectEncoding(this.requestHeaders['accept-encoding'] ?? null);
+				encoding = libRequest.SelectEncoding(this.headers['accept-encoding'] ?? null);
 				if (encoding != null) {
 					if (content.body != null)
 						content.body = encoding.encodeBuffer(content.body);
@@ -516,7 +538,7 @@ export class HttpRequest extends IncomingBase {
 			this.state = ResponseState.broken;
 		}
 	}
-	protected override async finishSelfHandling(): Promise<void> {
+	protected override async handleFinishing(): Promise<Error | null> {
 		if (this.receive == ReceiveState.receiving) {
 			/* check if the response is already completed, in which case it can be silently
 			*	reset to 'header-sent' to ensure the connection is properly marked as broken */
@@ -541,23 +563,33 @@ export class HttpRequest extends IncomingBase {
 		/* ensure that the response was properly sent */
 		if (this.state != ResponseState.completed && this.state != ResponseState.broken)
 			this.respondBadInternalUsage();
-
-		/* check if the connection is considered broken, in which case the data on it are not reliable anymore
-		*	and it must be destroyed (give it a grace timeout to receive any potential final response data) */
-		if (this.state != ResponseState.broken)
-			return;
-
+		return null;
+	}
+	protected override async handleKilling(graceful: boolean, reason: Error): Promise<void> {
 		const closeConnection = () => {
-			this.trace('closing connection');
-			clearTimeout(forceDestroy);
-			this.request.destroy();
-			this.response.destroy();
+			if (this.request.destroyed && this.response.destroyed)
+				return;
+			this.trace(`closing connection: ${reason.message}`);
+			this.request.destroy(reason);
+			this.response.destroy(reason);
 		};
-		const forceDestroy = setTimeout(() => closeConnection(), libConfig.brokenGraceTimeout);
-		if (this.response.writableFinished)
-			closeConnection();
-		else
-			this.response.on('finish', () => closeConnection());
+
+		if (!graceful || this.response.writableFinished)
+			return closeConnection();
+
+		return new Promise<void>((resolve) => {
+			let settled = false;
+			this.response.on('finish', () => {
+				if (settled) return; settled = true;
+				closeConnection();
+				resolve();
+			});
+			this.response.on('error', () => {
+				if (settled) return; settled = true;
+				closeConnection();
+				resolve();
+			})
+		});
 	}
 	private closeHeader(status: libRequest.StatusType, media: libRequest.MediaType | null, contentSize: number | null, updateState: boolean, encoding: string, headers: Record<string, string>, error: boolean): void {
 		if (media == null)
@@ -639,8 +671,8 @@ export class HttpRequest extends IncomingBase {
 
 		/* check if the content is encoded and create the chain of decoders (in reverse to ensure the nesting is correct) */
 		let stream: libStream.Readable = this.request;
-		if (this.requestHeaders['content-encoding'] != null) {
-			const encodings = libRequest.SplitAndTrimList(this.requestHeaders['content-encoding'], ',', false);
+		if (this.headers['content-encoding'] != null) {
+			const encodings = libRequest.SplitAndTrimList(this.headers['content-encoding'], ',', false);
 
 			for (let i = encodings.length - 1; i >= 0; --i) {
 				const encoding = libRequest.LookupEncoding(encodings[i]);
@@ -666,8 +698,8 @@ export class HttpRequest extends IncomingBase {
 		}
 
 		/* check if too many data have been promised (cannot be trusted if content-encoding is enabled) */
-		else if (maxLength != null && this.requestHeaders['content-length'] != null) {
-			const contentSize = parseInt(this.requestHeaders['content-length']);
+		else if (maxLength != null && this.headers['content-length'] != null) {
+			const contentSize = parseInt(this.headers['content-length']);
 
 			/* check if the length is valid and otherwise mark the request as 'consumed' */
 			if (!isFinite(contentSize) || contentSize < 0 || contentSize > maxLength) {
@@ -722,7 +754,7 @@ export class HttpRequest extends IncomingBase {
 		let encoding = null;
 		if (!resp.noEncoding && libRequest.ShouldEncode(fullContentSize ?? chunk?.byteLength ?? null, resp.contentType)) {
 			resp.headers['Vary'] = 'Accept-Encoding';
-			encoding = libRequest.SelectEncoding(this.requestHeaders['accept-encoding'] ?? null);
+			encoding = libRequest.SelectEncoding(this.headers['accept-encoding'] ?? null);
 		}
 		if (encoding == null) {
 			this.closeHeader(resp.status, resp.contentType, fullContentSize, true, '', resp.headers, false);
@@ -849,13 +881,13 @@ export class HttpRequest extends IncomingBase {
 
 	/* return the string formatted media-type (or empty string for no media type) */
 	public getMediaType(): string {
-		const type = libRequest.SplitAndTrimList(this.requestHeaders['content-type'] ?? null, ';', true)[0] ?? '';
+		const type = libRequest.SplitAndTrimList(this.headers['content-type'] ?? null, ';', true)[0] ?? '';
 		return type.toLowerCase();
 	}
 
 	/* check the content-type for a media-type and otherwise return the default type */
 	public getMediaTypeCharset(defEncoding: string): string {
-		const type = this.requestHeaders['content-type'];
+		const type = this.headers['content-type'];
 		if (type == null)
 			return defEncoding;
 
@@ -1069,13 +1101,13 @@ export class HttpRequest extends IncomingBase {
 		}
 
 		/* parse the range and ensure that its well formed */
-		const range = libRequest.ParseRangeHeader(this.requestHeaders.range ?? null, cached.fileSize());
+		const range = libRequest.ParseRangeHeader(this.headers.range ?? null, cached.fileSize());
 		if (range.state == libRequest.RangeState.malformed) {
-			this.respondBadRequest(`Issues while parsing http-header range: [${this.requestHeaders.range}]`, { error: true });
+			this.respondBadRequest(`Issues while parsing http-header range: [${this.headers.range}]`, { error: true });
 			return true;
 		}
 		else if (range.state == libRequest.RangeState.issue) {
-			this.respondRangeIssue(this.requestHeaders.range!, cached.fileSize(), { error: true });
+			this.respondRangeIssue(this.headers.range!, cached.fileSize(), { error: true });
 			return true;
 		}
 
@@ -1097,21 +1129,21 @@ export class HttpRequest extends IncomingBase {
 			headers['Vary'] = 'Accept-Encoding';
 
 		/* validate the conditions */
-		if (this.requestHeaders['if-match'] != null && !libRequest.ETagMatchesList(etag, this.requestHeaders['if-match'])) {
+		if (this.headers['if-match'] != null && !libRequest.ETagMatchesList(etag, this.headers['if-match'])) {
 			this.respondPreconditionFailed(`ETag ${etag} not found`, { headers });
 			return true;
 		}
 
 		/* check if the response can be skipped due to the resource not having been modified since
 		*	the last fetch (etag outweighs last-modified; invalid times are not considered errors) */
-		if (this.requestHeaders['if-none-match'] != null) {
-			if (libRequest.ETagMatchesList(etag, this.requestHeaders['if-none-match'])) {
+		if (this.headers['if-none-match'] != null) {
+			if (libRequest.ETagMatchesList(etag, this.headers['if-none-match'])) {
 				this.respondNotModified({ headers });
 				return true;
 			}
 		}
-		else if (this.requestHeaders['if-modified-since'] != null) {
-			const result = libRequest.TimeStampCompare(cached.lastModified(), this.requestHeaders['if-modified-since']);
+		else if (this.headers['if-modified-since'] != null) {
+			const result = libRequest.TimeStampCompare(cached.lastModified(), this.headers['if-modified-since']);
 			if (result != null && result >= 0) {
 				this.respondNotModified({ headers });
 				return true;
@@ -1246,26 +1278,45 @@ export class HttpUpgrade extends IncomingBase {
 		else
 			this.socket.end(content.body);
 	}
-	protected override async finishSelfHandling(): Promise<void> {
+	protected override async handleFinishing(): Promise<Error | null> {
 		/* check if the connection was accepted (only reason to keep it alive;
 		*	header-sent is only set by the accept web-socket method) */
 		if (this.state == ResponseState.headerSent)
-			return;
-		if (this.state != ResponseState.completed)
-			this.respondBadInternalUsage();
+			return null;
 
-		/* close the connection but give it a grace timeout to properly send any final queued data */
+		/* check if the state is incomplete and break the connection but ensure it is closed
+		*	either way (to ensure the connection is definitely closed, if not upgrade) */
+		if (this.state != ResponseState.completed && this.state != ResponseState.broken)
+			this.respondBadInternalUsage();
+		if (this.state == ResponseState.broken)
+			return null;
+		return new Error('Upgrade was not accepted');
+	}
+	protected override async handleKilling(graceful: boolean, reason: Error): Promise<void> {
 		const closeConnection = () => {
-			this.trace('closing connection');
-			clearTimeout(forceDestroy);
-			this.request.destroy();
-			this.socket.destroy();
+			if (this.request.destroyed && this.socket.destroyed)
+				return;
+			this.trace(`closing connection: ${reason.message}`);
+			this.request.destroy(reason);
+			this.socket.destroy(reason);
 		};
-		const forceDestroy = setTimeout(() => closeConnection(), libConfig.brokenGraceTimeout);
-		if (this.socket.writableFinished)
-			closeConnection();
-		else
-			this.socket.on('finish', () => closeConnection());
+
+		if (!graceful || this.socket.writableFinished)
+			return closeConnection();
+
+		return new Promise<void>((resolve) => {
+			let settled = false;
+			this.socket.on('finish', () => {
+				if (settled) return; settled = true;
+				closeConnection();
+				resolve();
+			});
+			this.socket.on('error', () => {
+				if (settled) return; settled = true;
+				closeConnection();
+				resolve();
+			})
+		});
 	}
 
 	/* marks the object as having been handled (return false, if connection is not a valid websocket upgrade request) */
@@ -1276,10 +1327,10 @@ export class HttpUpgrade extends IncomingBase {
 		}
 
 		/* check if the connection is a valid upgrade request */
-		let connection = libRequest.SplitAndTrimList(this.requestHeaders.connection?.toLowerCase() ?? null, ',', false);
+		let connection = libRequest.SplitAndTrimList(this.headers.connection?.toLowerCase() ?? null, ',', false);
 		if (connection.indexOf('upgrade') == -1)
 			return false;
-		if (this.requestHeaders?.upgrade?.toLowerCase() != 'websocket' || this.request.method != 'GET')
+		if (this.headers?.upgrade?.toLowerCase() != 'websocket' || this.request.method != 'GET')
 			return false;
 
 		/* save the current path state so that the ClientSocket receives the correct
@@ -1289,12 +1340,10 @@ export class HttpUpgrade extends IncomingBase {
 		/* perform the upgrade (websocket will automatically send http error responses and close the socket
 		*	on errors in the upgrade process) and restore the context when the accept was performed */
 		this.state = ResponseState.headerSent;
-		this.trace(`Performing upgrade on web socket connection [${this.fullPath}]`);
-		this.wss.handleUpgrade(this.request, this.socket, this.head, async (ws, request) => {
+		this.trace(`Performing upgrade on web socket connection: [${this._fullPath}]`);
+		this.wss.handleUpgrade(this.request, this.socket, this.head, async (ws, _) => {
 			const current = this.restore(snapshot);
 			try {
-				this.wss.emit('connection', ws, request);
-
 				/* the restored client ensures the websocket object is in the right logging and path context */
 				await cb(new ClientSocket(ws, this));
 			} catch (err: any) {

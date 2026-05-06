@@ -1,5 +1,8 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 /* Copyright (c) 2026 Bjoern Boss Henrichsen */
+import * as libLog from "./log.js";
+
+const logger = libLog.Logger('builder');
 
 /* escape all html-special characters to prevent injection when embedding untrusted values */
 export function EscapeHtml(content: string): string {
@@ -32,7 +35,7 @@ export class HtmlGuard {
 	}
 
 	/* wrap a string for html insertion; if safe is false, it will be html-escaped first */
-	public static make(str: string, safe: boolean = true): HtmlGuard {
+	public static make(str: string, safe: boolean): HtmlGuard {
 		return new HtmlGuard(safe ? str : EscapeHtml(str));
 	}
 }
@@ -42,6 +45,58 @@ export function Safe(content: string, safe: boolean = true): HtmlGuard {
 	return HtmlGuard.make(content, safe);
 }
 
+/* expand the placeholders in the content (format: {#name}, with '{#' being escaped as '{##') */
+export function ExpandPlaceholders(content: string, args: Record<string, HtmlString>): string {
+	let out = '', name = '', placeholder = false;
+	for (let i = 0; i < content.length; ++i) {
+		/* check if this is not the start/end of a placeholder, in which case it can just be added to the current set */
+		if (!content.startsWith(placeholder ? '}' : '{#', i)) {
+			if (placeholder)
+				name += content[i];
+			else
+				out += content[i];
+			continue;
+		}
+
+		/* check if a name is being started and if its potentially just an escape sequence */
+		if (!placeholder) {
+			if (content.startsWith('{##', i))
+				out += '{#', i += 2;
+			else
+				name = '', placeholder = true, ++i;
+			continue;
+		}
+
+		/* validate the completed name */
+		else {
+			placeholder = false;
+			if (name in args)
+				out += HtmlGuard.get(args[name]).content;
+			else
+				logger.warning(`Undefined placeholder [${name}] encountered`);
+		}
+	}
+
+	if (placeholder)
+		logger.warning('Content ends with an incomplete placeholder');
+	return out;
+}
+
+/* escape all placeholders in the content */
+export function EscapePlaceholders(content: string): string {
+	let out = '';
+
+	/* construct the new escaped output content */
+	for (let i = 0; i < content.length; ++i) {
+		if (!content.startsWith('{#', i))
+			out += content[i];
+		else
+			out += '{##', ++i;
+	}
+	return out;
+}
+
+/* html component building interface (simple should return true for small one liners) */
 export interface HtmlComponent {
 	finalize(indent: string): string;
 	simple(): boolean;
@@ -64,7 +119,7 @@ export class EmbeddedContent implements HtmlComponent {
 /* self-closing html tag (e.g. <meta/>, <link/>, <br/>) */
 export class SingleTag implements HtmlComponent {
 	private content: string;
-	public constructor(name: string, properties: Record<string, HtmlString> = {}) {
+	public constructor(name: string, properties: Record<string, HtmlString>) {
 		let details = '';
 		for (const name in properties)
 			details += ` ${name}="${HtmlGuard.get(properties[name]).content}"`;

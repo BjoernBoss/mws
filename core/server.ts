@@ -4,7 +4,7 @@ import { Config as libConfig } from "./config.js";
 import * as libLog from "./log.js";
 import * as libClient from "./client.js";
 import * as libRequest from "./request.js";
-import * as libInterface from "./interface.js";
+import * as libHandler from "./handler.js";
 import * as libHttps from "https";
 import * as libHttp from "http";
 import * as libFs from "fs";
@@ -16,16 +16,26 @@ const logger = libLog.Logger('server');
 
 const DEFAULT_SERVER_TIMEOUT_CHECK: number = 10_000;
 
+/*
+*	Validate the host passed in via the http-parameter.
+*	Host string will be '_' for no or empty host-parameter.
+*	Host strings optional port will have been verified and dropped.
+*		=> Will only contain the lower-case host name.
+*/
+export type CheckHost = (host: string) => boolean;
+
 export class Server {
-	private serverStopList: (() => Promise<void>)[];
-	private moduleStopList: (() => Promise<void>)[];
+	private stopServerList: (() => Promise<void>)[];
+	private stopModuleList: (() => Promise<void>)[];
 	private wss: libWs.WebSocketServer;
+	private stopping: Promise<void> | null;
 
 	constructor() {
 		logger.info(`Server object created`);
-		this.serverStopList = [];
-		this.moduleStopList = [];
+		this.stopServerList = [];
+		this.stopModuleList = [];
 		this.wss = new libWs.WebSocketServer({ noServer: true });
+		this.stopping = null;
 	}
 
 	private respondBadEndpoint(request: libHttp.IncomingMessage, client: libClient.HttpRequest | libClient.HttpUpgrade): void {
@@ -35,13 +45,13 @@ export class Server {
 			headers: { 'Connection': 'close' }
 		});
 	}
-	private async handleWrapper(wasRequest: boolean, request: libHttp.IncomingMessage, checkHost: libInterface.CheckHost, handler: libInterface.ModuleInterface, port: number, establish: (host: string) => libClient.HttpRequest | libClient.HttpUpgrade): Promise<void> {
+	private async handleWrapper(wasRequest: boolean, request: libHttp.IncomingMessage, checkHost: CheckHost, handler: libHandler.ModuleHandler, port: number, establish: (host: string) => libClient.HttpRequest | libClient.HttpUpgrade): Promise<void> {
 		let client = null;
 		try {
 			/* setup the client object */
 			const rawHostName = (request.headers.host ?? '').toLowerCase();
 			client = establish(rawHostName);
-			client.log(`${wasRequest ? 'Request' : 'Upgrade'}:${port} from [${request.socket.remoteAddress}]:${request.socket.remotePort} to [${request.headers.host}]:[${request.url}] (user-agent: [${request.headers['user-agent'] ?? ''}])`);
+			client.log(`${wasRequest ? 'Request' : 'Upgrade'}:${port} [${request.method ?? '_'}] from [${request.socket.remoteAddress}]:${request.socket.remotePort} to [${request.headers.host}]:[${request.url}] (user-agent: [${request.headers['user-agent'] ?? ''}])`);
 
 			/* extract the host to be used and validate its port */
 			const hostNameRegex = rawHostName.match(/^(.*):(\d+)$/);
@@ -54,16 +64,14 @@ export class Server {
 				hostName = hostNameRegex[1];
 			}
 
+			hostName = (hostName.length == 0 ? '_' : hostName);
 			if (!checkHost(hostName)) {
 				client.warning(`Host [${hostName}] not allowed for this endpoint [${port}]`);
 				return this.respondBadEndpoint(request, client);
 			}
 
 			/* handle the actual client request */
-			if (wasRequest)
-				await handler.request(client as libClient.HttpRequest);
-			else
-				await handler.upgrade(client as libClient.HttpUpgrade);
+			await handler.handle(client);
 		} catch (err: any) {
 			logger.error(`Uncaught exception encountered for client!${client != null ? client.id : '#'}: ${err.message}`)
 			if (client != null)
@@ -74,13 +82,13 @@ export class Server {
 		if (client == null)
 			request.destroy();
 		else try {
-			await client.finishIncoming();
+			await client._finishConnection();
 		} catch (err: any) {
 			logger.error(`Failed to complete client!${client.id}: ${err.message}`);
 			client.respondBadInternalUsage();
 		}
 	}
-	private handleRequest(request: libHttp.IncomingMessage, response: libHttp.ServerResponse, check: libInterface.CheckHost, handler: libInterface.ModuleInterface, port: number, secure: boolean): void {
+	private handleRequest(request: libHttp.IncomingMessage, response: libHttp.ServerResponse, check: CheckHost, handler: libHandler.ModuleHandler, port: number, secure: boolean): void {
 		this.handleWrapper(true, request, check, handler, port, (host: string): libClient.HttpRequest => {
 			return new libClient.HttpRequest(request, response, host, (secure ? 'https:' : 'http:'));
 		}).catch((err: any) => {
@@ -88,7 +96,7 @@ export class Server {
 			request.destroy(new Error('Unhandled exception'));
 		});
 	}
-	private handleUpgrade(request: libHttp.IncomingMessage, socket: libStream.Duplex, head: Buffer, check: libInterface.CheckHost, handler: libInterface.ModuleInterface, port: number, secure: boolean): void {
+	private handleUpgrade(request: libHttp.IncomingMessage, socket: libStream.Duplex, head: Buffer, check: CheckHost, handler: libHandler.ModuleHandler, port: number, secure: boolean): void {
 		this.handleWrapper(false, request, check, handler, port, (host: string): libClient.HttpUpgrade => {
 			return new libClient.HttpUpgrade(request, socket, head, host, (secure ? 'https:' : 'http:'), this.wss);
 		}).catch((err: any) => {
@@ -104,19 +112,19 @@ export class Server {
 		server.timeout = libConfig.connectionTimeout;
 		server.keepAliveTimeout = libConfig.keepAliveTimeout;
 	}
-	private setupListener(server: libHttp.Server | libHttps.Server, port: number, protocol: string, handler: libInterface.ModuleInterface): void {
+	private setupListener(server: libHttp.Server | libHttps.Server, port: number, protocol: string, handler: libHandler.ModuleHandler): void {
 		/* register the config listener and initialize the configuration */
 		const updateTimeouts = () => this.applyConfig(server);
 		updateTimeouts();
 		libConfig.subscribe(updateTimeouts);
 
-		/* register the stop-function for the server and the module */
-		this.serverStopList.push(() => new Promise((resolve) => {
+		/* register the separate stop functions */
+		this.stopServerList.push(() => new Promise((resolve) => {
 			libConfig.unsubscribe(updateTimeouts);
 			server.close(() => resolve());
 			server.closeAllConnections();
 		}));
-		this.moduleStopList.push(() => handler.stop());
+		this.stopModuleList.push(() => handler.stop());
 
 		/* log the established listener once the port is actually bound */
 		server.on('listening', () => {
@@ -126,7 +134,7 @@ export class Server {
 		server.listen(port);
 	}
 
-	public listenHttp(port: number, handler: libInterface.ModuleInterface, checkHost: libInterface.CheckHost): void {
+	public listenHttp(port: number, handler: libHandler.ModuleHandler, checkHost: CheckHost): void {
 		try {
 			const config = {
 				requireHostHeader: true,
@@ -140,7 +148,7 @@ export class Server {
 			logger.error(`While listening to port ${port} using http: ${err.message}`);
 		}
 	}
-	public listenHttps(port: number, key: string, cert: string, handler: libInterface.ModuleInterface, checkHost: libInterface.CheckHost): void {
+	public listenHttps(port: number, key: string, cert: string, handler: libHandler.ModuleHandler, checkHost: CheckHost): void {
 		try {
 			const config = {
 				requireHostHeader: true,
@@ -159,25 +167,36 @@ export class Server {
 
 	/* shutdown the server and all modules (immediately kills all open connections and listener, can be called multiple times) */
 	public async stop(): Promise<void> {
-		let list: Promise<void>[] = [];
+		if (this.stopping != null)
+			return this.stopping;
 
-		/* kill all open connections (also stops new incoming connections) and kill all web-sockets (after the sockets have been stopped
-		*	to ensure no new sockets connect; duplicate the sockets to ensure the iteration order is not broken due to in-place removal) */
-		for (const cb of this.serverStopList)
-			list.push(cb());
-		for (const ws of [...this.wss.clients]) {
-			list.push(new Promise<void>((resolve) => ws.on('close', () => resolve())));
-			ws.terminate();
-		}
-		logger.info('Stopping server and websocket connections');
-		await Promise.all(list);
+		this.stopping = new Promise<void>(async (resolve) => {
+			/* stop all servers to prevent new connections from coming in; and close any on-the-fly connections
+			*	(dont await immediately, as this only resolves once all connections have been closed) */
+			logger.info('Stopping server and connections');
+			let promises: Promise<void>[] = [];
+			for (const cb of this.stopServerList)
+				promises.push(cb());
 
-		/* kill all modules (after the connections to ensure
-		*	no state change occurs in the modules anymore) */
-		logger.info('Stopping all modules');
-		list = [];
-		for (const cb of this.moduleStopList)
-			list.push(cb());
-		await Promise.all(list);
+			/* destroy all connections and all modules */
+			logger.info('Stopping all modules');
+			let modules: Promise<void>[] = [];
+			for (const cb of this.stopModuleList)
+				modules.push(cb());
+			await Promise.all(modules);
+
+			/* destroy any remaining web-sockets (to give the modules the chance to clean them up) and await the full termination */
+			logger.info('Stopping all websockets');
+			for (const ws of [...this.wss.clients]) {
+				if (ws.readyState == libWs.WebSocket.CLOSED)
+					continue;
+				promises.push(new Promise<void>((resolve) => ws.on('close', () => resolve())));
+				ws.terminate();
+			}
+			await Promise.all(promises);
+			resolve();
+		});
+
+		return this.stopping;
 	}
 }

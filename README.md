@@ -7,20 +7,20 @@ A lightweight TypeScript web server for hosting independent modules (file server
 ## Getting Started
 Clone the project and install dependencies:
 
-    $ git clone https://github.com/BjoernBoss/mws-base.git
-    $ cd mws-base
-    $ npm install
+	$ git clone https://github.com/BjoernBoss/mws-base.git
+	$ cd mws-base
+	$ npm install
 
 Build and start the server:
 
-    $ npm run start
+	$ npm run start
 
 To build without starting (and optionally executing manually):
 
-    $ npm run build
-    $ node ./main.js
+	$ npm run build
+	$ node ./main.js
 
-This compiles all TypeScript sources and runs `node main.js`, which loads `modules/setup.js` and starts listening on the configured ports. The `Run` method in the `modules/setup.js` script is hereby the primary interface to configure the server and corresponding modules to be loaded.
+This compiles all TypeScript sources and modules and runs `node main.js`, which loads `modules/setup.js` and starts listening on the configured ports. The `Run` method in the `modules/setup.js` script is hereby the primary interface to configure the server and corresponding modules to be loaded.
 
 An example for a `setup.js` could look like:
 
@@ -28,36 +28,38 @@ An example for a `setup.js` could look like:
 import { Config as libConfig } from "core/config.js";
 
 export async function Run(server) {
-    try {
-        libConfig.cacheWriteBack('./some_local_path/immutable.cache');
+	try {
+		libConfig.cacheWriteBack('./some_local_path/immutable.cache');
 
-        const mod = await import("my-module/app.js");
-        server.listenHttp(8080, new mod.MyModule(), (host) => host == 'localhost');
-    } catch (e) {
-        throw new Error(`Failed to load module: ${e.message}`);
-    }
+		const mod = await import("my-module/app.js");
+		server.listenHttp(8080, new mod.MyModule(), (host) => host == 'localhost');
+	} catch (e) {
+		throw new Error(`Failed to load module: ${e.message}`);
+	}
 }
 ```
 
 ## Writing a Module
-Each module lives in `modules/<name>/` with its own `package.json` (private, type: module). The npm workspaces configuration automatically resolves cross-module imports. To write a module, implement the `ModuleInterface` from `core/interface.ts`:
+Each module lives in `modules/<name>/` with its own `package.json`. The npm workspaces configuration automatically resolves cross-module imports. To write a module, extend the abstract `ModuleHandler` from `core/handler.ts`:
 
 ```TypeScript
-import * as libInterface from "core/interface.js";
+import * as libHandler from "core/handler.js";
 import * as libClient from "core/client.js";
 import * as libRequest from "core/request.js";
 
-export class MyModule implements libInterface.ModuleInterface {
-    public name: string = 'my-module';
+export class MyModule extends libHandler.ModuleHandler {
+	public name: string = 'my-module';
 
-    public async request(client: libClient.HttpRequest): Promise<void> {
-        client.respond('Hello from my module!', { media: libRequest.Media.Text });
-    }
+	protected override async handleRequest(client: libClient.HttpRequest): Promise<void> {
+		client.respond('Hello from my module!', { media: libRequest.Media.Text });
+	}
 
-    public async upgrade(client: libClient.HttpUpgrade): Promise<void> {
-        /* handle WebSocket upgrades */
-    }
-    public async stop(): Promise<void> {}
+	protected override async handleUpgrade(client: libClient.HttpUpgrade): Promise<void> {
+		/* handle WebSocket upgrades */
+	}
+	protected override async handleStop(): Promise<void> {
+		/* perform any necessary cleanup steps */
+	}
 }
 ```
 Any requests not handled by a module, may be handled by parent modules, should they host child modules. If no module handles a request, a default `404 Not Found` is sent.
@@ -66,16 +68,17 @@ The framework also provides default helper implementations of modules:
 
 - **`LambdaModule`** handles requests/upgrades via callback functions
 - **`DispatchModule`** routes requests by URL path prefix to child modules
+- **`HostModule`** routes requests by URL hostname prefix to child modules
 - **`UnhandledModule`** wraps a module and catches unhandled requests with a fallback
 - **`WrapModule`** intercepts requests before/after passing them to an inner module
 
 ```JavaScript
-const dispatch = new libInterface.DispatchModule({
-    '/api': apiModule,
-    '/static': fileModule
+const dispatch = new libHandler.DispatchModule({
+	'/api': apiModule,
+	'/static': fileModule
 });
-const unhandled = new libInterface.UnhandledModule(dispatch, {
-    request: async (client) => { client.respond('Custom not found', { status: libRequest.Status.NotFound }); }
+const unhandled = new libHandler.UnhandledModule(dispatch, {
+	request: async (client) => { client.respond('Custom not found', { status: libRequest.Status.NotFound }); }
 });
 server.listenHttp(8080, unhandled, (host) => host == 'localhost');
 ```
@@ -85,7 +88,7 @@ The `core` workspace provides all server functionality:
 
 | File | Purpose |
 |---|---|
-| `interface.ts` | `ModuleInterface` interface, and helper modules: `LambdaModule`, `DispatchModule`, `UnhandledModule`, `WrapModule` |
+| `handler.ts` | `ModuleHandler` interface, and helper modules: `LambdaModule`, `DispatchModule`, `UnhandledModule`, `WrapModule` |
 | `client.ts` | `HttpRequest` (response helpers, body parsing, file serving), `HttpUpgrade` and `ClientSocket` (WebSocket) |
 | `request.ts` | HTTP status codes, media types, range parsing, and encoding negotiation (gzip, deflate, brotli, zstd) |
 | `server.ts` | `Server` class managing HTTP/HTTPS listeners with host-header validation |
