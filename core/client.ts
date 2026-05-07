@@ -1,7 +1,6 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 /* Copyright (c) 2024-2026 Bjoern Boss Henrichsen */
 import { Config as libConfig } from "./config.js";
-import * as libTemplates from "./templates.js";
 import * as libLog from "./log.js";
 import * as libLocation from "./location.js";
 import * as libBuilder from "./builder.js";
@@ -140,6 +139,11 @@ enum ReceiveState {
 	receiving,
 	completed
 }
+enum UpgradeState {
+	none,
+	upgrading,
+	upgraded
+}
 enum ResponseState {
 	none,
 	acknowledged,
@@ -217,31 +221,33 @@ export abstract class IncomingBase extends ClientBase {
 	protected updateThroughput(delta: number): void {
 		this.throughput.processed += delta;
 	}
-	private constructQuickResponse(status: libRequest.StatusType, logReason: string, error: boolean | undefined, headers: Record<string, string> | undefined, content: { media: libRequest.MediaType, body: Buffer } | null): void {
+	private constructQuickResponse(status: libRequest.StatusType, logReason: string | null, error: boolean | undefined, headers: Record<string, string> | undefined, content: { media: libRequest.MediaType, body: Buffer } | null): void {
 		if (error == null)
 			error = false;
 		if (headers == null)
 			headers = {};
+		const description = `${this.isHead ? 'HEAD:' : ''}[${status.msg}]${logReason == null ? '' : `: ${logReason}`}`;
+
 		if (!('Cache-Control' in headers) && libConfig.responseCacheControl != '')
 			headers['Cache-Control'] = libConfig.responseCacheControl;
 
 		/* check if the response can still be sent or fail the operation */
 		if (this.state == ResponseState.none || (error && this.state == ResponseState.acknowledged)) {
 			if (error)
-				this.error(`Responding ${this.isHead ? 'to HEAD ' : ''}with [${status.msg}]${logReason}`);
+				this.error(`Responding with ${description}`);
 			else
-				this.log(`Responding ${this.isHead ? 'to HEAD ' : ''}with [${status.msg}]${logReason}`);
+				this.log(`Responding with ${description}`);
 			this.state = ResponseState.completed;
 			this.finalizeBufferHeader(status, error, headers, content);
 		}
 		else if (!error)
 			this.respondBadInternalUsage();
 		else if (this.state == ResponseState.headerSent) {
-			this.error(`Broken ${this.isHead ? 'for HEAD ' : ''}with [${status.msg}]${logReason}`);
+			this.error(`Broken due to ${description}`);
 			this.state = ResponseState.broken;
 		}
 		else
-			this.error(`Silently dropping exception ${this.isHead ? 'for HEAD ' : ''}[${status.msg}]${logReason}`);
+			this.error(`Silently dropping exception for ${description}`);
 	}
 
 	public get headers(): libHttp.IncomingHttpHeaders {
@@ -284,7 +290,7 @@ export abstract class IncomingBase extends ClientBase {
 
 		/* check if the connection should be killed (give it a grace timeout to receive any potential final response data) */
 		if (error != null) try {
-			const forceDestroy = setTimeout(() => this.handleKilling(false, error), libConfig.brokenGraceTimeout);
+			const forceDestroy = setTimeout(() => this.handleKilling(false, error), libConfig.killGraceTimeout);
 			await this.handleKilling(true, error);
 			clearTimeout(forceDestroy);
 		} catch (_) { }
@@ -335,9 +341,9 @@ export abstract class IncomingBase extends ClientBase {
 	}
 
 	/* respond with [internal-error] and a pre-defined html template response (always considered an error, clears any other header fields) */
-	public respondInternalError(msg: string, options?: { headers?: Record<string, string> }): void {
-		this.constructQuickResponse(libRequest.Status.InternalError, ` due to [${msg}]`, true, options?.headers, {
-			media: libRequest.Media.Html, body: Buffer.from(libTemplates.ErrorInternalServerError({ path: this.url.pathname, what: msg }), 'utf-8')
+	public respondInternalError(reason: string, options?: { headers?: Record<string, string> }): void {
+		this.constructQuickResponse(libRequest.Status.InternalError, reason, true, options?.headers, {
+			media: libRequest.Media.Text, body: Buffer.from(`An internal server error occurred while processing the request for [${this.url.pathname}]:\n${reason}`, 'utf-8')
 		});
 	}
 
@@ -356,7 +362,7 @@ export abstract class IncomingBase extends ClientBase {
 		const status = options?.status ?? libRequest.Status.Ok;
 
 		if (content == null)
-			return this.constructQuickResponse(status, ` with no body`, options?.error, options?.headers, null);
+			return this.constructQuickResponse(status, `no body`, options?.error, options?.headers, null);
 
 		let media = options?.media ?? libRequest.Media.Text;
 		if (typeof content == 'string')
@@ -364,118 +370,138 @@ export abstract class IncomingBase extends ClientBase {
 		else if (options?.media == null)
 			media = libRequest.Media.Unknown;
 
-		const logReason = ` of type [${media.mediaType}] and size [${content.byteLength}]`;
-		this.constructQuickResponse(status, logReason, options?.error, options?.headers, {
+		this.constructQuickResponse(status, `[${media.mediaType}] and size [${content.byteLength}]`, options?.error, options?.headers, {
 			media, body: content
 		});
 	}
 
-	/* respond with [ok] and a pre-defined html template response (default operation is the method) */
-	public respondOk(operation?: string, options?: { error?: boolean, headers?: Record<string, string> }): void {
-		const actual = (operation ?? this.method);
-		this.constructQuickResponse(libRequest.Status.Ok, ` for [${operation}]`, options?.error, options?.headers, {
-			media: libRequest.Media.Html, body: Buffer.from(libTemplates.SuccessOk({ path: this.url.pathname, operation: actual }), 'utf-8')
+	/* respond with [ok] and either a message or a default response */
+	public respondOk(options?: { message?: string, error?: boolean, headers?: Record<string, string> }): void {
+		this.constructQuickResponse(libRequest.Status.Ok, options?.message ?? null, options?.error, options?.headers, {
+			media: libRequest.Media.Text, body: Buffer.from(options?.message ?? `${this.method} was successful for [${this.url.pathname}].`, 'utf-8')
+		});
+	}
+
+	/* respond with [created] and either a message or a default response (ensure target is properly URI encoded) */
+	public respondCreated(target: string, options?: { error?: boolean, headers?: Record<string, string> }): void {
+		const header = (options?.headers ?? {});
+		header['Location'] = target;
+
+		this.constructQuickResponse(libRequest.Status.Created, target, options?.error, header, {
+			media: libRequest.Media.Text, body: Buffer.from(`Resource [${this.url.pathname}] successfully created:\n${target}`, 'utf-8')
 		});
 	}
 
 	/* respond with [not-modified] and no body */
 	public respondNotModified(options?: { error?: boolean, headers?: Record<string, string> }): void {
-		this.constructQuickResponse(libRequest.Status.NotModified, '', options?.error, options?.headers, null);
+		this.constructQuickResponse(libRequest.Status.NotModified, null, options?.error, options?.headers, null);
 	}
 
-	/* respond with [not-modified] and a pre-defined html template response (ensure the etag and/or last-modified is set) */
-	public respondPreconditionFailed(reason: string, options?: { error?: boolean, headers?: Record<string, string> }): void {
-		this.constructQuickResponse(libRequest.Status.PreconditionFailed, ` due to [${reason}]`, options?.error, options?.headers, {
-			media: libRequest.Media.Html, body: Buffer.from(libTemplates.ErrorPreconditionFailed({ path: this.url.pathname, reason }), 'utf-8')
+	/* respond with [not-modified] and a default text response (ensure the etag and/or last-modified is set) */
+	public respondPreconditionFailed(reason: string, options?: { etag?: string, lastModified?: string, error?: boolean, headers?: Record<string, string> }): void {
+		const header = (options?.headers ?? {});
+		if (options?.etag != null && !('ETag' in header))
+			header['ETag'] = options.etag;
+		if (options?.lastModified != null && !('Last-Modified' in header))
+			header['Last-Modified'] = options.lastModified;
+
+		this.constructQuickResponse(libRequest.Status.PreconditionFailed, reason, options?.error, options?.headers, {
+			media: libRequest.Media.Text, body: Buffer.from(`Precondition for resource [${this.url.pathname}] failed:\n${reason}`, 'utf-8')
 		});
 	}
 
-	/* respond with [bad-request] and a pre-defined html template response */
+	/* respond with [bad-request] and a default text response */
 	public respondBadRequest(reason: string, options?: { error?: boolean, headers?: Record<string, string> }): void {
-		this.constructQuickResponse(libRequest.Status.BadRequest, ` due to [${reason}]`, options?.error, options?.headers, {
-			media: libRequest.Media.Html, body: Buffer.from(libTemplates.ErrorBadRequest({ path: this.url.pathname, reason }), 'utf-8')
+		this.constructQuickResponse(libRequest.Status.BadRequest, reason, options?.error, options?.headers, {
+			media: libRequest.Media.Text, body: Buffer.from(`Request for [${this.url.pathname}] is perceived as malformed:\n${reason}`, 'utf-8')
 		});
 	}
 
-	/* respond with [range-not-satisfiable] and a pre-defined html template response */
+	/* respond with [range-not-satisfiable] and a default text response */
 	public respondRangeIssue(range: string, size: number, options?: { error?: boolean, headers?: Record<string, string> }): void {
 		const header = (options?.headers ?? {});
 		header['Content-Range'] = `bytes */${size}`;
-		this.constructQuickResponse(libRequest.Status.RangeIssue, `because [${range}] cannot be satisfied for size [${size}]`, options?.error, header, {
-			media: libRequest.Media.Html, body: Buffer.from(libTemplates.ErrorRangeIssue({ path: this.url.pathname, range, size }), 'utf-8')
+
+		this.constructQuickResponse(libRequest.Status.RangeIssue, `[${range}] cannot be satisfied for size [${size}]`, options?.error, header, {
+			media: libRequest.Media.Text, body: Buffer.from(`Range [${range}] cannot be satisfied for [${this.url.pathname}] of size ${size}.`, 'utf-8')
 		});
 	}
 
-	/* respond with [conflict] and a pre-defined html template response */
+	/* respond with [conflict] and a default text response */
 	public respondConflict(conflict: string, options?: { error?: boolean, headers?: Record<string, string> }): void {
-		this.constructQuickResponse(libRequest.Status.Conflict, ` due to [${conflict}]`, options?.error, options?.headers, {
-			media: libRequest.Media.Html, body: Buffer.from(libTemplates.ErrorConflict({ path: this.url.pathname, conflict }), 'utf-8')
+		this.constructQuickResponse(libRequest.Status.Conflict, conflict, options?.error, options?.headers, {
+			media: libRequest.Media.Text, body: Buffer.from(`Conflict for resource [${this.url.pathname}]:\n${conflict}`, 'utf-8')
 		});
 	}
 
-	/* respond with [not-found] and a pre-defined html template response */
+	/* respond with [not-found] and a default text response */
 	public respondNotFound(options?: { error?: boolean, headers?: Record<string, string> }): void {
-		this.constructQuickResponse(libRequest.Status.NotFound, '', options?.error, options?.headers, {
-			media: libRequest.Media.Html, body: Buffer.from(libTemplates.ErrorNotFound({ path: this.url.pathname }), 'utf-8')
+		this.constructQuickResponse(libRequest.Status.NotFound, null, options?.error, options?.headers, {
+			media: libRequest.Media.Text, body: Buffer.from(`Resource [${this.url.pathname}] could not be found.`, 'utf-8')
 		});
 	}
 
-	/* respond with [unsupported-media-type] and a pre-defined html template response */
+	/* respond with [unsupported-media-type] and a default text response */
 	public respondUnsupported(used: string, allowed: string, options?: { error?: boolean, headers?: Record<string, string> }): void {
-		this.constructQuickResponse(libRequest.Status.UnsupportedMediaType, ` because [${used}] was used and only [${allowed}] supported`, options?.error, options?.headers, {
-			media: libRequest.Media.Html, body: Buffer.from(libTemplates.ErrorUnsupportedMediaType({ path: this.url.pathname, used, allowed }), 'utf-8')
+		this.constructQuickResponse(libRequest.Status.UnsupportedMediaType, `Allowed was [${allowed}] but [${used}] was used`, options?.error, options?.headers, {
+			media: libRequest.Media.Text, body: Buffer.from(`Media type ${used} not supported for [${this.url.pathname}]. Allowed:\n${allowed}`, 'utf-8')
 		});
 	}
 
-	/* respond with [invalid-method] and a pre-defined html template response */
+	/* respond with [invalid-method] and a default text response */
 	public respondMethodNotAllowed(method: string, allowed: string, options?: { error?: boolean, headers?: Record<string, string> }): void {
 		const header = (options?.headers ?? {});
 		header['Allow'] = allowed;
-		this.constructQuickResponse(libRequest.Status.MethodNotAllowed, ` because [${method}] was used and only [${allowed}] supported`, options?.error, header, {
-			media: libRequest.Media.Html, body: Buffer.from(libTemplates.ErrorInvalidMethod({ path: this.url.pathname, method: method, allowed }), 'utf-8')
+
+		this.constructQuickResponse(libRequest.Status.MethodNotAllowed, `Allowed was [${allowed}] but [${method}] was used`, options?.error, header, {
+			media: libRequest.Media.Text, body: Buffer.from(`Method ${method} not allowed for [${this.url.pathname}]. Allowed:\n${allowed}`, 'utf-8')
 		});
 	}
 
-	/* respond with [request-timeout] and a pre-defined html template response */
+	/* respond with [request-timeout] and a default text response */
 	public respondRequestTimeout(reason: string, options?: { error?: boolean, headers?: Record<string, string> }): void {
 		const header = (options?.headers ?? {});
 		header['Connection'] = 'close';
-		this.constructQuickResponse(libRequest.Status.RequestTimeout, ` due to [${reason}]`, options?.error, header, {
-			media: libRequest.Media.Html, body: Buffer.from(libTemplates.ErrorRequestTimeout({ path: this.url.pathname, reason }), 'utf-8')
+
+		this.constructQuickResponse(libRequest.Status.RequestTimeout, reason, options?.error, header, {
+			media: libRequest.Media.Text, body: Buffer.from(`Request processing of [${this.url.pathname}] timed out:\n${reason}`, 'utf-8')
 		});
 	}
 
-	/* respond with [content-too-large] and a pre-defined html template response */
+	/* respond with [content-too-large] and a default text response */
 	public respondContentTooLarge(allowed: number, atLeastProvided: number, options?: { error?: boolean, headers?: Record<string, string> }): void {
-		this.constructQuickResponse(libRequest.Status.ContentTooLarge, ` because [${atLeastProvided}] > [${allowed}]`, options?.error, options?.headers, {
-			media: libRequest.Media.Html, body: Buffer.from(libTemplates.ErrorContentTooLarge({ path: this.url.pathname, allowedLength: allowed, providedLength: atLeastProvided }), 'utf-8')
+		this.constructQuickResponse(libRequest.Status.ContentTooLarge, `[${atLeastProvided}] > [${allowed}]`, options?.error, options?.headers, {
+			media: libRequest.Media.Text, body: Buffer.from(`Content of at least size ${atLeastProvided} too large for [${this.url.pathname}].\nAt most ${allowed} bytes are allowed.`, 'utf-8')
 		});
 	}
 
-	/* respond with [see-other] to the given target and a pre-defined html template response (forces method GET) */
+	/* respond with [see-other] to the given target and a default text response (forces method GET; ensure target is properly URI encoded) */
 	public respondSeeOther(target: string, options?: { error?: boolean, headers?: Record<string, string> }): void {
 		const header = (options?.headers ?? {});
 		header['Location'] = target;
-		this.constructQuickResponse(libRequest.Status.SeeOther, ` to [${target}]`, options?.error, header, {
-			media: libRequest.Media.Html, body: Buffer.from(libTemplates.SeeOther({ destination: target }), 'utf-8')
+
+		this.constructQuickResponse(libRequest.Status.SeeOther, target, options?.error, header, {
+			media: libRequest.Media.Text, body: Buffer.from(`Continue at: ${target}`, 'utf-8')
 		});
 	}
 
-	/* respond with [temporary-redirect] to the given target and a pre-defined html template response (preserves method) */
+	/* respond with [temporary-redirect] to the given target and a default text response (preserves method; ensure target is properly URI encoded) */
 	public respondTemporaryRedirect(target: string, options?: { error?: boolean, headers?: Record<string, string> }): void {
 		const header = (options?.headers ?? {});
 		header['Location'] = target;
-		this.constructQuickResponse(libRequest.Status.TemporaryRedirect, ` to [${target}]`, options?.error, header, {
-			media: libRequest.Media.Html, body: Buffer.from(libTemplates.TemporaryRedirect({ path: this.url.pathname, destination: target }), 'utf-8')
+
+		this.constructQuickResponse(libRequest.Status.TemporaryRedirect, target, options?.error, header, {
+			media: libRequest.Media.Text, body: Buffer.from(`Resource [${this.url.pathname}] temporarily redirects to:\n${target}`, 'utf-8')
 		});
 	}
 
-	/* respond with [permanent-redirect] to the given target and a pre-defined html template response (preserves method)  */
+	/* respond with [permanent-redirect] to the given target and a default text response (preserves method; ensure target is properly URI encoded)  */
 	public respondPermanentRedirect(target: string, options?: { error?: boolean, headers?: Record<string, string> }): void {
 		const header = (options?.headers ?? {});
 		header['Location'] = target;
-		this.constructQuickResponse(libRequest.Status.PermanentRedirect, ` to [${target}]`, options?.error, header, {
-			media: libRequest.Media.Html, body: Buffer.from(libTemplates.PermanentRedirect({ path: this.url.pathname, destination: target }), 'utf-8')
+
+		this.constructQuickResponse(libRequest.Status.PermanentRedirect, target, options?.error, header, {
+			media: libRequest.Media.Text, body: Buffer.from(`Resource [${this.url.pathname}] permanently redirects to:\n${target}`, 'utf-8')
 		});
 	}
 }
@@ -1123,10 +1149,20 @@ export class HttpRequest extends IncomingBase {
 		if (options?.encoded != null || (range.state == libRequest.RangeState.noRange && libRequest.ShouldEncode(cached.fileSize(), media)))
 			headers['Vary'] = 'Accept-Encoding';
 
-		/* validate the conditions */
-		if (this.headers['if-match'] != null && !libRequest.ETagMatchesList(etag, this.headers['if-match'])) {
-			this.respondPreconditionFailed(`ETag ${etag} not found`, { headers });
-			return true;
+		/* validate the conditions (e-tag more relevant than last-modified; invalid times are not
+		*	considered errors; no need to set etag/last-modified, as they are already set) */
+		if (this.headers['if-match'] != null) {
+			if (!libRequest.ETagMatchesList(etag, this.headers['if-match'])) {
+				this.respondPreconditionFailed(`New etag [${etag}]`, { headers });
+				return true;
+			}
+		}
+		else if (this.headers['if-unmodified-since'] != null) {
+			const result = libRequest.TimeStampCompare(cached.lastModified(), this.headers['if-unmodified-since']);
+			if (result != null && result > 0) {
+				this.respondPreconditionFailed(`Modified at [${cached.lastModified()}]`, { headers });
+				return true;
+			}
 		}
 
 		/* check if the response can be skipped due to the resource not having been modified since
@@ -1139,7 +1175,7 @@ export class HttpRequest extends IncomingBase {
 		}
 		else if (this.headers['if-modified-since'] != null) {
 			const result = libRequest.TimeStampCompare(cached.lastModified(), this.headers['if-modified-since']);
-			if (result != null && result >= 0) {
+			if (result != null && result <= 0) {
 				this.respondNotModified({ headers });
 				return true;
 			}
@@ -1231,14 +1267,14 @@ export class HttpUpgrade extends IncomingBase {
 	private socket: libStream.Duplex;
 	private head: Buffer;
 	private wss: libWs.WebSocketServer;
-	private upgraded: boolean;
+	private upgrade: UpgradeState;
 
 	constructor(request: libHttp.IncomingMessage, socket: libStream.Duplex, head: Buffer, host: string, protocol: string, wss: libWs.WebSocketServer) {
 		super(request, host, protocol, false);
 		this.socket = socket;
 		this.head = head;
 		this.wss = wss;
-		this.upgraded = false;
+		this.upgrade = UpgradeState.none;
 	}
 
 	protected override finalizeBufferHeader(status: libRequest.StatusType, error: boolean, headers: Record<string, string>, content: { media: libRequest.MediaType, body: Buffer | null } | null): void {
@@ -1276,9 +1312,13 @@ export class HttpUpgrade extends IncomingBase {
 			this.socket.end(content.body);
 	}
 	protected override async handleFinishing(): Promise<Error | null> {
+		/* check if the upgrade was not fully awaited */
+		if (this.upgrade == UpgradeState.upgrading)
+			this.respondBadInternalUsage();
+
 		/* check if the connection was accepted (only reason to keep it alive,
 		*	as source web-server will not clean this connection up anymore) */
-		if (this.state == ResponseState.completed && this.upgraded)
+		if (this.state == ResponseState.completed && this.upgrade == UpgradeState.upgraded)
 			return null;
 
 		/* check if the state is incomplete and break the connection but ensure it is closed
@@ -1324,10 +1364,12 @@ export class HttpUpgrade extends IncomingBase {
 		let connection = libRequest.SplitAndTrimList(this.headers.connection?.toLowerCase() ?? null, ',', false);
 		if (connection.indexOf('upgrade') == -1 || this.headers?.upgrade?.toLowerCase() != 'websocket' || this.request.method != 'GET') {
 			this.respondBadRequest('Endpoint designed for WebSockets', { error: true });
+			return null;
 		}
 
 		/* mark the connection as being accepted */
 		this.state = ResponseState.headerSent;
+		this.upgrade = UpgradeState.upgrading;
 		this.trace(`Performing upgrade on web socket connection: [${this._fullPath}]`);
 		const ws = await new Promise<ClientSocket | null>((resolve) => {
 			let settled = false;
@@ -1346,12 +1388,21 @@ export class HttpUpgrade extends IncomingBase {
 				resolve(new ClientSocket(ws, this));
 			});
 		});
+		this.upgrade = UpgradeState.upgraded;
 
-		/* mark the accept as having gone through or failed */
-		if (this.state != ResponseState.headerSent)
+		/* check if the connection has been responded to despite upgrading */
+		if (this.state != ResponseState.headerSent) {
+			if (ws != null) {
+				this.error('Upgrade connection was responded to');
+				this.socket.destroy();
+				this.request.destroy();
+			}
 			return null;
+		}
+
+		/* update the state according to the progress of the upgrade */
 		if (ws != null)
-			this.state = ResponseState.completed, this.upgraded = true;
+			this.state = ResponseState.completed;
 		else
 			this.state = ResponseState.broken;
 		return ws;
@@ -1366,7 +1417,7 @@ export class HttpUpgrade extends IncomingBase {
 */
 export class ClientSocket extends ClientBase {
 	private ws: libWs.WebSocket;
-	private aliveTimer: null | NodeJS.Timeout;
+	private timer: null | NodeJS.Timeout;
 	private isAlive: boolean;
 	private wsLogger: libLog.LogIdentity;
 	private closing: { promise: Promise<void> | null, closed: (() => void) | null };
@@ -1378,7 +1429,7 @@ export class ClientSocket extends ClientBase {
 	constructor(ws: libWs.WebSocket, base: HttpUpgrade) {
 		super(base);
 		this.ws = ws;
-		this.aliveTimer = null;
+		this.timer = null;
 		this.isAlive = true;
 		this.wsLogger = (base as libLog.LogIdentity);
 		this.closing = { promise: null, closed: null };
@@ -1401,16 +1452,17 @@ export class ClientSocket extends ClientBase {
 				this.handleClosing();
 		});
 		this.ws.once('close', () => {
-			if (this.aliveTimer != null)
-				clearTimeout(this.aliveTimer);
-			this.aliveTimer = null;
-
 			this.handleClosing();
+
+			/* check if any timers remain (must be the grace-kill timer, can be stopped, as this point can
+			*	only be reached with an active timer, if delivering was somehow still > 0, in which case
+			*	its nested leaving will trigger the proper cleanup, but the timer is not necessary anymore) */
+			if (this.timer != null)
+				clearTimeout(this.timer);
+			this.timer = null;
 		});
 		this.ws.once('error', (err: any) => {
-			this.wsLogger.error(`WebSocket error: ${err.message}`);
-			this.ws.terminate();
-			this.handleClosing();
+			this.handleClosing(`WebSocket error: ${err.message}`);
 		});
 
 		/* start the first alive check */
@@ -1418,38 +1470,61 @@ export class ClientSocket extends ClientBase {
 	}
 
 	private checkIsAlive(): void {
-		this.aliveTimer = null;
+		if (this.closing.promise != null)
+			return;
+
+		this.timer = null;
 		if (libConfig.webSocketTimeout == 0)
 			return;
 
 		/* cycle through the alive state and check again */
-		if (!this.isAlive) {
-			this.wsLogger.trace('Closing dead websocket');
-			this.ws.terminate();
-			return this.handleClosing();
-		}
+		if (!this.isAlive)
+			return this.handleClosing('Closing dead websocket');
 		this.isAlive = false;
-		this.aliveTimer = setTimeout(() => this.checkIsAlive(), libConfig.webSocketTimeout);
+		this.timer = setTimeout(() => this.checkIsAlive(), libConfig.webSocketTimeout);
 
 		/* try to ping the remote to check the liveliness */
 		try {
 			this.wsLogger.trace(`Sending ping to determine if connection is alive`);
 			this.ws.ping();
 		} catch (err: any) {
-			this.wsLogger.error(`WebSocket error while pinging: ${err.message}`);
-			this.ws.terminate();
-			this.handleClosing();
+			this.handleClosing(`WebSocket error while pinging: ${err.message}`);
 		}
 	}
 	private selfIsAlive(): void {
 		this.isAlive = true;
-		if (this.aliveTimer != null)
-			clearTimeout(this.aliveTimer);
-		this.aliveTimer = (libConfig.webSocketTimeout == 0 ? null : setTimeout(() => this.checkIsAlive(), libConfig.webSocketTimeout));
+		if (this.closing.promise != null)
+			return;
+
+		if (this.timer != null)
+			clearTimeout(this.timer);
+		this.timer = (libConfig.webSocketTimeout == 0 ? null : setTimeout(() => this.checkIsAlive(), libConfig.webSocketTimeout));
 	}
-	private handleClosing(): void {
-		if (this.closing.promise == null)
+	private handleClosing(terminate?: string): void {
+		/* register the initial closing to mark a closing being imminent */
+		if (this.closing.promise == null) {
 			this.closing.promise = new Promise<void>((resolve) => this.closing.closed = resolve);
+
+			/* kill the last timer (alive timer) */
+			if (this.timer != null)
+				clearTimeout(this.timer);
+			this.timer = null;
+
+			/* check if a termination should be triggered and otherwise start the grace termination timer */
+			if (terminate != null) {
+				this.wsLogger.error(terminate);
+				this.ws.terminate();
+			}
+			else {
+				this.timer = setTimeout(() => {
+					this.timer = null;
+					if (this.closing.closed != null) {
+						this.wsLogger.error('Closing connection');
+						this.ws.terminate();
+					}
+				}, libConfig.killGraceTimeout);
+			}
+		}
 
 		if (this.closing.closed == null || this.delivering > 0)
 			return;
@@ -1470,9 +1545,7 @@ export class ClientSocket extends ClientBase {
 		try {
 			this.ws.send(data);
 		} catch (err: any) {
-			this.wsLogger.error(`WebSocket error while sending data: ${err.message}`);
-			this.ws.terminate();
-			this.handleClosing();
+			this.handleClosing(`WebSocket error while sending data: ${err.message}`);
 		}
 	}
 	public close(): Promise<void> {

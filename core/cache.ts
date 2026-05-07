@@ -454,16 +454,10 @@ export class Cached {
 
 	/* [throws] object must not be used anymore after reading or streaming from it */
 	public readSync(): Buffer {
-		/* check if the data have already been cached */
+		/* just let reading exceptions propagate out */
 		if (this.data != null)
 			return this.data;
-
-		/* read the data into memory */
-		try {
-			this.data = libFs.readFileSync(this.path);
-		} catch (err: any) {
-			throw new Error(err);
-		}
+		this.data = libFs.readFileSync(this.path);
 
 		/* check if the file-size changed mid operation */
 		if (this.data.byteLength != this.size)
@@ -477,6 +471,9 @@ export class Cached {
 
 	/* [throws] object must not be used anymore after reading or streaming from it */
 	public async readAsync(): Promise<Buffer> {
+		if (this.data != null)
+			return this.data;
+
 		return new Promise((resolve, reject) => {
 			const stream: libStream.Readable = this.makeStream();
 			const buffers: Buffer[] = [];

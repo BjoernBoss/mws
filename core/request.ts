@@ -10,6 +10,7 @@ export interface StatusType {
 }
 export const Status = {
 	Ok: { code: 200, msg: 'Ok' },
+	Created: { code: 201, msg: 'Created' },
 	PartialContent: { code: 206, msg: 'Partial Content' },
 	SeeOther: { code: 303, msg: 'See Other' },
 	NotModified: { code: 304, msg: 'Not Modified' },
@@ -166,7 +167,7 @@ export function ETagMatchesList(etag: string, header: string | null): boolean {
 	return false;
 }
 
-/* returns null on invalid times, [>0] for b being greater, [<0] for b being smaller, [=0] for same time */
+/* returns null on invalid times, [>0] for a being greater, [<0] for a being smaller, [=0] for same time */
 export function TimeStampCompare(a: string, b: string): number | null {
 	const _a = new Date(a).getTime();
 	if (isNaN(_a))
@@ -174,7 +175,7 @@ export function TimeStampCompare(a: string, b: string): number | null {
 	const _b = new Date(b).getTime();
 	if (isNaN(_b))
 		return null;
-	return (_b - _a);
+	return (_a - _b);
 }
 
 /* setup the reverse list of file-endings to media types and encoding-names to encoding types */

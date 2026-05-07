@@ -11,7 +11,7 @@ export class CoreConfig {
 	private _headerTimeout: number = 0;
 	private _connectionTimeout: number = 0;
 	private _keepAliveTimeout: number = 0;
-	private _brokenGraceTimeout: number = 0;
+	private _killGraceTimeout: number = 0;
 	private _cacheSize: number = 0;
 	private _cacheAllowStable: boolean = false;
 	private _cacheAllowImmutable: boolean = false;
@@ -97,14 +97,14 @@ export class CoreConfig {
 		this.changed('Keep-alive timeout', value);
 	}
 
-	/* time for a broken connection to receive the response before force-closing it [0 results in immediate close; in milliseconds] */
-	public get brokenGraceTimeout(): number { return this._brokenGraceTimeout; }
-	public set brokenGraceTimeout(value: number) {
+	/* time for a broken connection or socket to receive the response before force-closing it [0 results in immediate close; in milliseconds] */
+	public get killGraceTimeout(): number { return this._killGraceTimeout; }
+	public set killGraceTimeout(value: number) {
 		value = Math.max(value, 0);
-		if (this._brokenGraceTimeout == value)
+		if (this._killGraceTimeout == value)
 			return;
-		this._brokenGraceTimeout = value;
-		this.changed('Broken grace timeout', value);
+		this._killGraceTimeout = value;
+		this.changed('Kill grace timeout', value);
 	}
 
 	/* maximum sum of data cached before evicting old cache entries [in bytes] */
@@ -225,7 +225,7 @@ export function Initialize(): void {
 	Config.headerTimeout = 30_000;
 	Config.connectionTimeout = 90_000;
 	Config.keepAliveTimeout = 10_000;
-	Config.brokenGraceTimeout = 1_000;
+	Config.killGraceTimeout = 1_000;
 	Config.cacheSize = 50_000_000;
 	Config.cacheFileSizeLimit = 10_000_000;
 	Config.cacheAllowStable = true;
@@ -236,7 +236,7 @@ export function Initialize(): void {
 	Config.throughputThreshold = 1_000;
 
 	/* cache valid for 10minutes */
-	Config.fileCacheControl = 'max-age=600, must-revalidate';
+	Config.fileCacheControl = 'public, max-age=600, must-revalidate';
 
 	/* cache valid for 30days */
 	Config.immutableCacheControl = 'public, max-age=2592000, immutable';
