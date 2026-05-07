@@ -222,9 +222,8 @@ export abstract class IncomingBase extends ClientBase {
 			error = false;
 		if (headers == null)
 			headers = {};
-		const cacheControl = (error ? libConfig.errorCacheControl : libConfig.responseCacheControl);
-		if (!('Cache-Control' in headers) && cacheControl != '')
-			headers['Cache-Control'] = cacheControl;
+		if (!('Cache-Control' in headers) && libConfig.responseCacheControl != '')
+			headers['Cache-Control'] = libConfig.responseCacheControl;
 
 		/* check if the response can still be sent or fail the operation */
 		if (this.state == ResponseState.none || (error && this.state == ResponseState.acknowledged)) {
@@ -554,8 +553,8 @@ export class HttpRequest extends IncomingBase {
 				let resolved = false;
 				const done = () => { if (!resolved) { resolved = true; resolve(); } };
 				this.request.on('data', (chunk: Buffer) => this.updateThroughput(chunk.byteLength));
-				this.request.on('end', done);
-				this.request.on('close', done);
+				this.request.once('end', done);
+				this.request.once('close', done);
 				this.request.resume();
 			});
 		}
@@ -578,17 +577,13 @@ export class HttpRequest extends IncomingBase {
 			return closeConnection();
 
 		return new Promise<void>((resolve) => {
-			let settled = false;
-			this.response.on('finish', () => {
+			let settled = false, handler = () => {
 				if (settled) return; settled = true;
 				closeConnection();
 				resolve();
-			});
-			this.response.on('error', () => {
-				if (settled) return; settled = true;
-				closeConnection();
-				resolve();
-			})
+			};
+			this.response.once('finish', () => handler());
+			this.response.once('error', () => handler());
 		});
 	}
 	private closeHeader(status: libRequest.StatusType, media: libRequest.MediaType | null, contentSize: number | null, updateState: boolean, encoding: string, headers: Record<string, string>, error: boolean): void {
@@ -686,14 +681,14 @@ export class HttpRequest extends IncomingBase {
 				/* configure the piping accordingly */
 				const decoder = encoding.makeDecode();
 				stream = stream.pipe(decoder);
-				decoder.on('error', (err: any) => {
+				decoder.once('error', (err: any) => {
 					if (output.destroyed) return;
 					this.respondBadRequest('Invalid data encoding', { error: true });
 					output.destroy(err);
 				});
 
 				/* register the cleanup handler to ensure the decoder is destroyed on completion */
-				output.on('close', () => decoder.destroy());
+				output.once('close', () => decoder.destroy());
 			}
 		}
 
@@ -710,7 +705,7 @@ export class HttpRequest extends IncomingBase {
 		}
 
 		/* register the network error handler to properly forward exceptions (no need to respond on network errors) */
-		this.request.on('error', (err: any) => {
+		this.request.once('error', (err: any) => {
 			if (!output.destroyed)
 				output.destroy(err);
 		});
@@ -777,7 +772,7 @@ export class HttpRequest extends IncomingBase {
 			resp.writer = encoding.makeEncode();
 			resp.writer.pipe(this.response);
 
-			resp.writer.on('error', (err: any) => {
+			resp.writer.once('error', (err: any) => {
 				if (resp.destroyed) return;
 				this.respondInternalError('Data encoding error encountered');
 				resp.destroy(err);
@@ -872,7 +867,7 @@ export class HttpRequest extends IncomingBase {
 
 		/* register the network error handler to properly forward
 		*	exceptions (no need to respond on network errors) */
-		this.response.on('error', (err: any) => {
+		this.response.once('error', (err: any) => {
 			if (!response.destroyed)
 				response.destroy(err);
 		});
@@ -948,8 +943,8 @@ export class HttpRequest extends IncomingBase {
 
 			const buffers: Buffer[] = [];
 			stream.on('data', (chunk: Buffer) => buffers.push(chunk));
-			stream.on('end', () => resolve(Buffer.concat(buffers)));
-			stream.on('error', (err: any) => reject(err));
+			stream.once('end', () => resolve(Buffer.concat(buffers)));
+			stream.once('error', (err: any) => reject(err));
 		});
 	}
 
@@ -984,18 +979,18 @@ export class HttpRequest extends IncomingBase {
 			/* create the stream to the file to be written and setup the plumbing */
 			const destination = libFs.createWriteStream(path, { flags: 'wx' });
 			let fileFailed = false, sourceFailed = false, opened = false;
-			source.on('error', (err: any) => {
+			source.once('error', (err: any) => {
 				sourceFailed = true;
 				destination.destroy(err);
 			});
-			destination.on('open', () => {
+			destination.once('open', () => {
 				opened = true;
 				if (!sourceFailed)
 					source.pipe(destination);
 				else
 					destination.destroy();
 			});
-			destination.on('error', (err: any) => {
+			destination.once('error', (err: any) => {
 				if (!sourceFailed)
 					this.respondFileSystemError();
 				fileFailed = true;
@@ -1014,7 +1009,7 @@ export class HttpRequest extends IncomingBase {
 					reject(err);
 				});
 			});
-			destination.on('close', () => {
+			destination.once('close', () => {
 				if (!sourceFailed && !fileFailed)
 					resolve();
 			});
@@ -1178,21 +1173,21 @@ export class HttpRequest extends IncomingBase {
 		let source: libStream.Readable = cached.stream({ start: range.first, end: range.last });
 
 		/* pipe the components together and await completion */
-		let closed = false;
+		let settled = false;
 		return new Promise((resolve) => {
 			source.pipe(stream);
-			source.on('error', (err: any) => {
-				if (closed) return; closed = true;
+			source.once('error', (err: any) => {
+				if (settled) return; settled = true;
 				this.respondFileSystemError();
 				this.error(`Error while sending file [${filePath}]: [${err.message}]`);
 				stream.destroy(err);
 			});
-			stream.on('error', (err: any) => {
-				if (closed) return; closed = true;
+			stream.once('error', (err: any) => {
+				if (settled) return; settled = true;
 				this.error(`Error while sending file [${filePath}]: [${err.message}]`);
 				source.destroy(err);
 			});
-			stream.on('close', () => resolve(true));
+			stream.once('close', () => resolve(true));
 		});
 	}
 }
@@ -1236,12 +1231,14 @@ export class HttpUpgrade extends IncomingBase {
 	private socket: libStream.Duplex;
 	private head: Buffer;
 	private wss: libWs.WebSocketServer;
+	private upgraded: boolean;
 
 	constructor(request: libHttp.IncomingMessage, socket: libStream.Duplex, head: Buffer, host: string, protocol: string, wss: libWs.WebSocketServer) {
 		super(request, host, protocol, false);
 		this.socket = socket;
 		this.head = head;
 		this.wss = wss;
+		this.upgraded = false;
 	}
 
 	protected override finalizeBufferHeader(status: libRequest.StatusType, error: boolean, headers: Record<string, string>, content: { media: libRequest.MediaType, body: Buffer | null } | null): void {
@@ -1279,9 +1276,9 @@ export class HttpUpgrade extends IncomingBase {
 			this.socket.end(content.body);
 	}
 	protected override async handleFinishing(): Promise<Error | null> {
-		/* check if the connection was accepted (only reason to keep it alive;
-		*	header-sent is only set by the accept web-socket method) */
-		if (this.state == ResponseState.headerSent)
+		/* check if the connection was accepted (only reason to keep it alive,
+		*	as source web-server will not clean this connection up anymore) */
+		if (this.state == ResponseState.completed && this.upgraded)
 			return null;
 
 		/* check if the state is incomplete and break the connection but ensure it is closed
@@ -1305,65 +1302,75 @@ export class HttpUpgrade extends IncomingBase {
 			return closeConnection();
 
 		return new Promise<void>((resolve) => {
-			let settled = false;
-			this.socket.on('finish', () => {
+			let settled = false, handler = () => {
 				if (settled) return; settled = true;
 				closeConnection();
 				resolve();
-			});
-			this.socket.on('error', () => {
-				if (settled) return; settled = true;
-				closeConnection();
-				resolve();
-			})
+			};
+			this.socket.once('finish', () => handler());
+			this.socket.once('error', () => handler());
 		});
 	}
 
-	/* marks the object as having been handled (return false, if connection is not a valid websocket upgrade request) */
-	public tryAcceptWebSocket(cb: (ws: ClientSocket) => Promise<void>): boolean {
+	/* [no-throw] marks the object as having been handled and returns a web socket or
+	*	automatically responds with a corresponding error and returns null */
+	public async acceptWebSocket(): Promise<ClientSocket | null> {
 		if (this.state != ResponseState.none) {
 			this.respondBadInternalUsage();
-			return true;
+			return null;
 		}
 
 		/* check if the connection is a valid upgrade request */
 		let connection = libRequest.SplitAndTrimList(this.headers.connection?.toLowerCase() ?? null, ',', false);
-		if (connection.indexOf('upgrade') == -1)
-			return false;
-		if (this.headers?.upgrade?.toLowerCase() != 'websocket' || this.request.method != 'GET')
-			return false;
+		if (connection.indexOf('upgrade') == -1 || this.headers?.upgrade?.toLowerCase() != 'websocket' || this.request.method != 'GET') {
+			this.respondBadRequest('Endpoint designed for WebSockets', { error: true });
+		}
 
-		/* save the current path state so that the ClientSocket receives the correct
-		*	shifted paths even if the caller restores before the async callback fires */
-		const snapshot = this.snapshot();
-
-		/* perform the upgrade (websocket will automatically send http error responses and close the socket
-		*	on errors in the upgrade process) and restore the context when the accept was performed */
+		/* mark the connection as being accepted */
 		this.state = ResponseState.headerSent;
 		this.trace(`Performing upgrade on web socket connection: [${this._fullPath}]`);
-		this.wss.handleUpgrade(this.request, this.socket, this.head, async (ws, _) => {
-			const current = this.restore(snapshot);
-			try {
-				/* the restored client ensures the websocket object is in the right logging and path context */
-				await cb(new ClientSocket(ws, this));
-			} catch (err: any) {
-				this.error(`Unhandled exception while processing web socket accept: ${err.message}`);
-				ws.close();
-			}
-			this.restore(current);
+		const ws = await new Promise<ClientSocket | null>((resolve) => {
+			let settled = false;
+
+			/* register the error callbacks (to detect failures of the upgrading) */
+			this.socket.once('close', () => {
+				if (settled) return; settled = true;
+				this.error('Failed to upgrade to WebSocket');
+				resolve(null);
+			});
+
+			/* start the upgrade process (web-socket upgrade handler will automatically send error messages) */
+			this.wss.handleUpgrade(this.request, this.socket, this.head, (ws, _) => {
+				if (settled) return; settled = true;
+				this.trace('Connection successfully upgraded to WebSocket');
+				resolve(new ClientSocket(ws, this));
+			});
 		});
-		return true;
+
+		/* mark the accept as having gone through or failed */
+		if (this.state != ResponseState.headerSent)
+			return null;
+		if (ws != null)
+			this.state = ResponseState.completed, this.upgraded = true;
+		else
+			this.state = ResponseState.broken;
+		return ws;
 	}
 }
 
 /*
 *	WebSocket with integrated alive checks
+*	Structured WebSocket, which takes care of error handling.
+*	close() is guaranteed to be called exactly once and no data or others will follow.
+*	Closing promise resolves once the close callback has been fully invoked.
 */
 export class ClientSocket extends ClientBase {
 	private ws: libWs.WebSocket;
 	private aliveTimer: null | NodeJS.Timeout;
 	private isAlive: boolean;
 	private wsLogger: libLog.LogIdentity;
+	private closing: { promise: Promise<void> | null, closed: (() => void) | null };
+	private delivering: number;
 
 	public ondata?: (data: libWs.RawData, isBinary: boolean) => void;
 	public onclose?: () => void;
@@ -1374,6 +1381,8 @@ export class ClientSocket extends ClientBase {
 		this.aliveTimer = null;
 		this.isAlive = true;
 		this.wsLogger = (base as libLog.LogIdentity);
+		this.closing = { promise: null, closed: null };
+		this.delivering = 0;
 
 		this.ws.on('pong', () => {
 			this.wsLogger.trace(`Alive check pong received`);
@@ -1381,21 +1390,27 @@ export class ClientSocket extends ClientBase {
 		});
 		this.ws.on('message', (data, isBinary) => {
 			this.selfIsAlive();
-			if (this.ondata != null)
-				this.ondata(data, isBinary);
+			if (this.closing.promise != null || this.ondata == null)
+				return;
+
+			++this.delivering;
+			this.ondata(data, isBinary);
+			--this.delivering;
+
+			if (this.closing.promise != null)
+				this.handleClosing();
 		});
-		this.ws.on('close', () => {
-			this.wsLogger.trace('Socket connection closed');
+		this.ws.once('close', () => {
 			if (this.aliveTimer != null)
 				clearTimeout(this.aliveTimer);
 			this.aliveTimer = null;
 
-			if (this.onclose != null)
-				this.onclose();
+			this.handleClosing();
 		});
-		this.ws.on('error', (err: any) => {
+		this.ws.once('error', (err: any) => {
 			this.wsLogger.error(`WebSocket error: ${err.message}`);
-			this.terminateSelf();
+			this.ws.terminate();
+			this.handleClosing();
 		});
 
 		/* start the first alive check */
@@ -1408,8 +1423,11 @@ export class ClientSocket extends ClientBase {
 			return;
 
 		/* cycle through the alive state and check again */
-		if (!this.isAlive)
-			return this.terminateSelf();
+		if (!this.isAlive) {
+			this.wsLogger.trace('Closing dead websocket');
+			this.ws.terminate();
+			return this.handleClosing();
+		}
 		this.isAlive = false;
 		this.aliveTimer = setTimeout(() => this.checkIsAlive(), libConfig.webSocketTimeout);
 
@@ -1419,7 +1437,8 @@ export class ClientSocket extends ClientBase {
 			this.ws.ping();
 		} catch (err: any) {
 			this.wsLogger.error(`WebSocket error while pinging: ${err.message}`);
-			this.terminateSelf();
+			this.ws.terminate();
+			this.handleClosing();
 		}
 	}
 	private selfIsAlive(): void {
@@ -1428,21 +1447,39 @@ export class ClientSocket extends ClientBase {
 			clearTimeout(this.aliveTimer);
 		this.aliveTimer = (libConfig.webSocketTimeout == 0 ? null : setTimeout(() => this.checkIsAlive(), libConfig.webSocketTimeout));
 	}
-	private terminateSelf(): void {
-		if (this.ws.readyState != libWs.WebSocket.CLOSED)
-			this.ws.terminate();
+	private handleClosing(): void {
+		if (this.closing.promise == null)
+			this.closing.promise = new Promise<void>((resolve) => this.closing.closed = resolve);
+
+		if (this.closing.closed == null || this.delivering > 0)
+			return;
+		const closed = this.closing.closed;
+		this.closing.closed = null;
+
+		this.wsLogger.trace('Socket connection closed');
+		if (this.onclose != null)
+			this.onclose();
+
+		closed();
 	}
 
 	public send(data: string | Buffer): void {
+		if (this.closing.promise != null)
+			return;
+
 		try {
 			this.ws.send(data);
 		} catch (err: any) {
 			this.wsLogger.error(`WebSocket error while sending data: ${err.message}`);
-			this.terminateSelf();
+			this.ws.terminate();
+			this.handleClosing();
 		}
 	}
-	public close(): void {
-		if (this.ws.readyState != libWs.WebSocket.CLOSED)
+	public close(): Promise<void> {
+		if (this.closing.promise == null) {
 			this.ws.close();
+			this.handleClosing();
+		}
+		return this.closing.promise!;
 	}
 }

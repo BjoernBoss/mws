@@ -415,11 +415,11 @@ export class Cached {
 
 		/* setup the file exceptions to be propagated to the stream */
 		let wrapped = stream.pipe(transformer);
-		stream.on('error', (err: any) => {
+		stream.once('error', (err: any) => {
 			if (settled) return; settled = true;
 			wrapped.destroy(err);
 		});
-		wrapped.on('error', (err: any) => {
+		wrapped.once('error', (err: any) => {
 			if (settled) return; settled = true;
 			stream.destroy(err);
 		});
@@ -487,13 +487,13 @@ export class Cached {
 				if (!settled)
 					buffers.push(chunk);
 			});
-			stream.on("error", (err) => {
+			stream.once("error", (err) => {
 				if (!settled) {
 					settled = true;
 					reject(err);
 				}
 			});
-			stream.on("end", () => {
+			stream.once("end", () => {
 				if (!settled) {
 					settled = true;
 					resolve(Buffer.concat(buffers));

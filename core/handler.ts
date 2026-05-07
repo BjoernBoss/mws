@@ -201,7 +201,7 @@ export class HostModule extends ModuleHandler {
 			return (host == test);
 		if (!test.endsWith(host))
 			return false;
-		return (test[test.length - host.length] == '.' || host.startsWith('.'));
+		return (test[test.length - host.length - 1] == '.' || host.startsWith('.') || host == '');
 	}
 	private async dispatchAndHandle(client: libClient.HttpRequest | libClient.HttpUpgrade): Promise<void> {
 		let bestMatch: string | null = null;

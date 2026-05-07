@@ -141,7 +141,7 @@ export class Server {
 				connectionsCheckingInterval: DEFAULT_SERVER_TIMEOUT_CHECK
 			};
 			const server = libHttp.createServer(config, (req, resp) => this.handleRequest(req, resp, checkHost, handler, port, false));
-			server.on('error', (err) => logger.error(`While listening to port ${port} using http: ${err.message}`));
+			server.once('error', (err) => logger.error(`While listening to port ${port} using http: ${err.message}`));
 			server.on('upgrade', (req, sock, head) => this.handleUpgrade(req, sock, head, checkHost, handler, port, false));
 			this.setupListener(server, port, 'Http', handler);
 		} catch (err: any) {
@@ -157,7 +157,7 @@ export class Server {
 				connectionsCheckingInterval: DEFAULT_SERVER_TIMEOUT_CHECK
 			};
 			const server = libHttps.createServer(config, (req, resp) => this.handleRequest(req, resp, checkHost, handler, port, true));
-			server.on('error', (err) => logger.error(`While listening to port ${port} using https: ${err.message}`));
+			server.once('error', (err) => logger.error(`While listening to port ${port} using https: ${err.message}`));
 			server.on('upgrade', (req, sock, head) => this.handleUpgrade(req, sock, head, checkHost, handler, port, true));
 			this.setupListener(server, port, 'Https', handler);
 		} catch (err: any) {

@@ -18,7 +18,6 @@ export class CoreConfig {
 	private _cacheFileSizeLimit: number = 0;
 	private _fileCacheControl: string = '';
 	private _immutableCacheControl: string = '';
-	private _errorCacheControl: string = '';
 	private _responseCacheControl: string = '';
 	private _throughputCheck: number = 0;
 	private _throughputStartup: number = 0;
@@ -162,15 +161,6 @@ export class CoreConfig {
 		this.changed('Immutable cache control', value);
 	}
 
-	/* default cache-control value for any error responses [empty string does not set any cache-control] */
-	public get errorCacheControl(): string { return this._errorCacheControl; }
-	public set errorCacheControl(value: string) {
-		if (this._errorCacheControl == value)
-			return;
-		this._errorCacheControl = value;
-		this.changed('Error cache control', value);
-	}
-
 	/* default cache-control value for any basic responses [empty string does not set any cache-control] */
 	public get responseCacheControl(): string { return this._responseCacheControl; }
 	public set responseCacheControl(value: string) {
@@ -240,14 +230,13 @@ export function Initialize(): void {
 	Config.cacheFileSizeLimit = 10_000_000;
 	Config.cacheAllowStable = true;
 	Config.cacheAllowImmutable = true;
-	Config.errorCacheControl = 'no-store';
-	Config.responseCacheControl = 'no-cache';
+	Config.responseCacheControl = 'private, no-cache';
 	Config.throughputCheck = 5_000;
 	Config.throughputStartup = 5_000;
 	Config.throughputThreshold = 1_000;
 
 	/* cache valid for 10minutes */
-	Config.fileCacheControl = 'public, max-age=600, must-revalidate';
+	Config.fileCacheControl = 'max-age=600, must-revalidate';
 
 	/* cache valid for 30days */
 	Config.immutableCacheControl = 'public, max-age=2592000, immutable';
