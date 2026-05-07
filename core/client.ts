@@ -12,17 +12,6 @@ import * as libUrl from "url";
 import * as libWs from "ws";
 import * as libHttp from "http";
 
-const NOT_DECODED_STRING: Record<string, string> = {
-	'\x00': '%00', '\x01': '%01', '\x02': '%02', '\x03': '%03',
-	'\x04': '%04', '\x05': '%05', '\x06': '%06', '\x07': '%07',
-	'\x08': '%08', '\x09': '%09', '\x0A': '%0A', '\x0B': '%0B',
-	'\x0C': '%0C', '\x0D': '%0D', '\x0E': '%0E', '\x0F': '%0F',
-	'\x10': '%10', '\x11': '%11', '\x12': '%12', '\x13': '%13',
-	'\x14': '%14', '\x15': '%15', '\x16': '%16', '\x17': '%17',
-	'\x18': '%18', '\x19': '%19', '\x1A': '%1A', '\x1B': '%1B',
-	'\x1C': '%1C', '\x1D': '%1D', '\x1E': '%1E', '\x1F': '%1F',
-	'\x7F': '%7F', '/': '%2F', '\\': '%5C'
-};
 const BAD_HEADER_VALUE_REGEX: RegExp = /[\x00-\x1f\x7f]/;
 
 let NextClientId: number = 0;
@@ -52,17 +41,8 @@ export class ClientBase extends libLog.LogIdentity {
 			const thisClientId = ++NextClientId;
 			super(`${client ? 'client' : 'upgrade'}!${thisClientId}`);
 
-			/* decode the string and re-encode it to ensure '/' and '\' and control
-			*	characters are preserved as URI encoding, but the rest is decoded */
-			const cleanPath: string = arg.pathname.split('/').map((segment) => {
-				let output = '';
-				for (const c of decodeURIComponent(segment))
-					output += (NOT_DECODED_STRING[c] ?? c);
-				return output;
-			}).join('/');
-
 			this.id = thisClientId;
-			this._path = libLocation.Sanitize(cleanPath, false);
+			this._path = libLocation.Sanitize(arg.pathname, false);
 			this._url = arg;
 			this._fullPath = this._path;
 			this._basePath = '/';
@@ -155,16 +135,15 @@ enum ResponseState {
 /*
 *	Does not throw any exceptions, unless explicitly stated.
 *
-*	Request is considered acknowledged, as soon as a response has been triggered or a preparation started.
-*	Paths are URI decoded, except for nested '/' and '\' and any control characters
+*	Request is considered acknowledged, as soon as a response has been triggered or a preparation started
+*	Path remains URI encoded, as it was received, and path building will use the same encoded paths.
 *	A request can only be responded to once, unless the response is marked as an error, in which
 *		case it will either be sent (if possible) or the connection will be flushed and closed
 *	Not responded to requests will result in [not-found]
 *
 *	All responses, which dont follow the normal execution path, should be marked as errors
 *	Errors can bypass already promised responses, or kill the connection (if a response has already been sent)
-*	Errors automatically add Config.errorCacheControl, if no other cache control is specified
-*	Normal responses automatically add Config.responseCacheControl, if no other cache control is specified
+*	Responses automatically add Config.responseCacheControl, if no other cache control is specified
 */
 export abstract class IncomingBase extends ClientBase {
 	protected request: libHttp.IncomingMessage;
@@ -444,7 +423,7 @@ export abstract class IncomingBase extends ClientBase {
 	/* respond with [unsupported-media-type] and a default text response */
 	public respondUnsupported(used: string, allowed: string, options?: { error?: boolean, headers?: Record<string, string> }): void {
 		this.constructQuickResponse(libRequest.Status.UnsupportedMediaType, `Allowed was [${allowed}] but [${used}] was used`, options?.error, options?.headers, {
-			media: libRequest.Media.Text, body: Buffer.from(`Media type ${used} not supported for [${this.url.pathname}]. Allowed:\n${allowed}`, 'utf-8')
+			media: libRequest.Media.Text, body: Buffer.from(`Media type ${used} not supported for [${this.url.pathname}].\nAllowed: ${allowed}`, 'utf-8')
 		});
 	}
 
@@ -454,7 +433,7 @@ export abstract class IncomingBase extends ClientBase {
 		header['Allow'] = allowed;
 
 		this.constructQuickResponse(libRequest.Status.MethodNotAllowed, `Allowed was [${allowed}] but [${method}] was used`, options?.error, header, {
-			media: libRequest.Media.Text, body: Buffer.from(`Method ${method} not allowed for [${this.url.pathname}]. Allowed:\n${allowed}`, 'utf-8')
+			media: libRequest.Media.Text, body: Buffer.from(`Method ${method} not allowed for [${this.url.pathname}].\nAllowed: ${allowed}`, 'utf-8')
 		});
 	}
 
@@ -1262,6 +1241,7 @@ class HttpRequestResponse extends libStream.Writable {
 /*
 *	WebSocket upgrade requests, which were not accepted, will be closed after responding
 *	Responses will not add or modify any cache configurations
+*	An accept attempt must be fully awaited before completing the upgrade procedure
 */
 export class HttpUpgrade extends IncomingBase {
 	private socket: libStream.Duplex;
