@@ -112,19 +112,25 @@ export class Server {
 		server.timeout = libConfig.connectionTimeout;
 		server.keepAliveTimeout = libConfig.keepAliveTimeout;
 	}
-	private setupListener(server: libHttp.Server | libHttps.Server, port: number, protocol: string, handler: libHandler.ModuleHandler): void {
+	private startServer(server: libHttp.Server | libHttps.Server, port: number, protocol: string, handler: libHandler.ModuleHandler): void {
 		/* register the config listener and initialize the configuration */
 		const updateTimeouts = () => this.applyConfig(server);
 		updateTimeouts();
 		libConfig.subscribe(updateTimeouts);
 
-		/* register the separate stop functions */
-		this.stopServerList.push(() => new Promise((resolve) => {
-			libConfig.unsubscribe(updateTimeouts);
-			server.close(() => resolve());
-			server.closeAllConnections();
-		}));
+		/* register the separate stop functions (server can stopped via the global server-stop or the handler being stopped) */
+		let serverStopPromise: Promise<void> | null = null;
+		const stopListening: () => Promise<void> = () => {
+			if (serverStopPromise == null) serverStopPromise = new Promise((resolve) => {
+				libConfig.unsubscribe(updateTimeouts);
+				server.close(() => resolve());
+				server.closeAllConnections();
+			});
+			return serverStopPromise;
+		};
+		this.stopServerList.push(() => stopListening());
 		this.stopModuleList.push(() => handler.stop());
+		handler.listenStop(() => stopListening());
 
 		/* log the established listener once the port is actually bound */
 		server.on('listening', () => {
@@ -136,30 +142,40 @@ export class Server {
 
 	public listenHttp(port: number, handler: libHandler.ModuleHandler, checkHost: CheckHost): void {
 		try {
+			if (handler.moduleStopped)
+				return logger.warning(`Not listening to http:${port} with stopped module`);
+
 			const config = {
 				requireHostHeader: true,
 				connectionsCheckingInterval: DEFAULT_SERVER_TIMEOUT_CHECK
 			};
+
+			/* create the actual server and register the corresponding error/connection handlers and start to listen for connections */
 			const server = libHttp.createServer(config, (req, resp) => this.handleRequest(req, resp, checkHost, handler, port, false));
 			server.once('error', (err) => logger.error(`While listening to port ${port} using http: ${err.message}`));
 			server.on('upgrade', (req, sock, head) => this.handleUpgrade(req, sock, head, checkHost, handler, port, false));
-			this.setupListener(server, port, 'Http', handler);
+			this.startServer(server, port, 'Http', handler);
 		} catch (err: any) {
 			logger.error(`While listening to port ${port} using http: ${err.message}`);
 		}
 	}
 	public listenHttps(port: number, key: string, cert: string, handler: libHandler.ModuleHandler, checkHost: CheckHost): void {
 		try {
+			if (handler.moduleStopped)
+				return logger.warning(`Not listening to https:${port} with stopped module`);
+
 			const config = {
 				requireHostHeader: true,
 				key: libFs.readFileSync(key),
 				cert: libFs.readFileSync(cert),
 				connectionsCheckingInterval: DEFAULT_SERVER_TIMEOUT_CHECK
 			};
+
+			/* create the actual server and register the corresponding error/connection handlers and start to listen for connections */
 			const server = libHttps.createServer(config, (req, resp) => this.handleRequest(req, resp, checkHost, handler, port, true));
 			server.once('error', (err) => logger.error(`While listening to port ${port} using https: ${err.message}`));
 			server.on('upgrade', (req, sock, head) => this.handleUpgrade(req, sock, head, checkHost, handler, port, true));
-			this.setupListener(server, port, 'Https', handler);
+			this.startServer(server, port, 'Https', handler);
 		} catch (err: any) {
 			logger.error(`While listening to port ${port} using https: ${err.message}`);
 		}
