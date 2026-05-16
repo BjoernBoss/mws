@@ -12,7 +12,7 @@ import * as libUrl from "url";
 import * as libWs from "ws";
 import * as libHttp from "http";
 
-const BAD_HEADER_VALUE_REGEX: RegExp = /[\x00-\x1f\x7f]/;
+const BAD_HTTP_STRING_REGEX: RegExp = /[\x00-\x1f\x7f]/;
 
 let NextClientId: number = 0;
 
@@ -152,6 +152,7 @@ export abstract class IncomingBase extends ClientBase {
 	protected breakState: {
 		listener: (() => void)[];
 		completed: Promise<void> | null;
+		closed: boolean;
 	};
 	private throughput: {
 		timer: NodeJS.Timeout | null,
@@ -175,7 +176,7 @@ export abstract class IncomingBase extends ClientBase {
 		super(new libUrl.URL(`${protocol}//${host == '' ? '_' : host}${request.url}`), client);
 		this.request = request;
 		this.state = ResponseState.none;
-		this.breakState = { listener: [], completed: null };
+		this.breakState = { listener: [], completed: null, closed: false };
 		this.headerPatchers = [];
 
 		let resolver: any = null;
@@ -238,8 +239,8 @@ export abstract class IncomingBase extends ClientBase {
 		this.throughput.deadline = now + Math.min(this.throughput.window, Math.max(0, this.throughput.deadline - now) + bought);
 		this.throughput.timer = setTimeout(() => this.failThroughput(), this.throughput.deadline - _now);
 	}
-	protected markAsBroken(reason: string, silent: boolean): void {
-		if (silent && this.state == ResponseState.broken)
+	protected markAsBroken(reason: string, lostConnection: boolean): void {
+		if (lostConnection && (this.state == ResponseState.broken || this.breakState.closed))
 			return;
 
 		this.error(`Connection broken: ${reason}`);
@@ -313,10 +314,11 @@ export abstract class IncomingBase extends ClientBase {
 			await this.breakState.completed!;
 
 		this.log('Request processing completed');
+		this.breakState.closed = true;
 		this.processed.resolve!();
 	}
 	public async _killConnection(): Promise<void> {
-		this.markAsBroken('Closing connection', true);
+		this.markAsBroken('Closing connection', false);
 		return this.handleKilling(false);
 	}
 	public _pushTranslation(path: string, identity?: string): ClientContext | null {
@@ -666,8 +668,8 @@ export class HttpRequest extends IncomingBase {
 		for (const [key, value] of Object.entries(headers)) {
 			try {
 				this.response.setHeader(key, value);
-			} catch (err: any) {
-				this.error(`Failed to set header [${key}]: ${err.message}`);
+			} catch (_) {
+				this.error(`Failed to set header [${key}]: Bad header value`);
 			}
 		}
 	}
@@ -1336,9 +1338,12 @@ export class HttpUpgrade extends IncomingBase {
 			this.headerPatchers[i](status, headers, error);
 
 		/* construct the entire header content and send it away (sanitize values to prevent response splitting) */
+		if (status.msg.match(BAD_HTTP_STRING_REGEX))
+			return this.markAsBroken(`Failed to finalize response: Bad status message`, false);
+
 		let headerText = `HTTP/1.1 ${status.code} ${status.msg}\r\n`;
 		for (const [key, value] of Object.entries(headers)) {
-			if (value.match(BAD_HEADER_VALUE_REGEX))
+			if (value.match(BAD_HTTP_STRING_REGEX))
 				this.error(`Failed to set header [${key}]: Bad header value`);
 			else
 				headerText += `${key}: ${value}\r\n`;
