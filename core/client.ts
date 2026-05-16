@@ -152,7 +152,6 @@ export abstract class IncomingBase extends ClientBase {
 	protected breakState: {
 		listener: (() => void)[];
 		completed: Promise<void> | null;
-		closed: boolean;
 	};
 	private throughput: {
 		timer: NodeJS.Timeout | null,
@@ -176,7 +175,7 @@ export abstract class IncomingBase extends ClientBase {
 		super(new libUrl.URL(`${protocol}//${host == '' ? '_' : host}${request.url}`), client);
 		this.request = request;
 		this.state = ResponseState.none;
-		this.breakState = { listener: [], completed: null, closed: false };
+		this.breakState = { listener: [], completed: null };
 		this.headerPatchers = [];
 
 		let resolver: any = null;
@@ -213,7 +212,7 @@ export abstract class IncomingBase extends ClientBase {
 		else if (!error)
 			this.respondBadInternalUsage();
 		else if (this.state == ResponseState.headerSent)
-			this.markAsBroken(`Broken due to ${description}`, false);
+			this.markAsBroken(`Broken due to ${description}`);
 		else
 			this.error(`Silently dropping exception for ${description}`);
 	}
@@ -223,7 +222,7 @@ export abstract class IncomingBase extends ClientBase {
 
 		if (this.state == ResponseState.none || this.state == ResponseState.acknowledged)
 			this.respondRequestTimeout(`throughput below [${this.throughput.threshold}] bytes/sec`, { error: true });
-		this.markAsBroken(`Throughput below [${this.throughput.threshold}] bytes/sec`, false);
+		this.markAsBroken(`Throughput below [${this.throughput.threshold}] bytes/sec`);
 	}
 	protected updateThroughput(delta: number): void {
 		if (this.throughput.timer != null)
@@ -239,11 +238,12 @@ export abstract class IncomingBase extends ClientBase {
 		this.throughput.deadline = now + Math.min(this.throughput.window, Math.max(0, this.throughput.deadline - now) + bought);
 		this.throughput.timer = setTimeout(() => this.failThroughput(), this.throughput.deadline - _now);
 	}
-	protected markAsBroken(reason: string, lostConnection: boolean): void {
-		if (lostConnection && (this.state == ResponseState.broken || this.breakState.closed))
-			return;
-
-		this.error(`Connection broken: ${reason}`);
+	protected connectionWasLost(closed: boolean): void {
+		if (this.state != ResponseState.completed && this.state != ResponseState.broken)
+			this.markAsBroken(closed ? 'Connection closed by remote' : 'Connection lost');
+	}
+	protected markAsBroken(reason: string): void {
+		this.error(`Connection broken: [${reason}]`);
 		this.state = ResponseState.broken;
 		if (this.breakState.completed != null)
 			return;
@@ -314,11 +314,10 @@ export abstract class IncomingBase extends ClientBase {
 			await this.breakState.completed!;
 
 		this.log('Request processing completed');
-		this.breakState.closed = true;
 		this.processed.resolve!();
 	}
 	public async _killConnection(): Promise<void> {
-		this.markAsBroken('Closing connection', false);
+		this.markAsBroken('Closing connection');
 		return this.handleKilling(false);
 	}
 	public _pushTranslation(path: string, identity?: string): ClientContext | null {
@@ -553,10 +552,10 @@ export class HttpRequest extends IncomingBase {
 		this.htmlPatcher = [];
 
 		/* register the necessary network error handlers */
-		request.once('error', () => this.markAsBroken('Connection lost', true));
-		request.once('close', () => this.markAsBroken('Connection lost', true));
-		response.once('error', () => this.markAsBroken('Connection lost', true));
-		response.once('close', () => this.markAsBroken('Connection lost', true));
+		request.once('error', () => this.connectionWasLost(false));
+		request.once('close', () => this.connectionWasLost(true));
+		response.once('error', () => this.connectionWasLost(false));
+		response.once('close', () => this.connectionWasLost(true));
 	}
 
 	protected override finalizeBufferHeader(status: libRequest.StatusType, error: boolean, headers: Record<string, string>, content: { media: libRequest.MediaType, body: Buffer | null } | null): void {
@@ -587,7 +586,7 @@ export class HttpRequest extends IncomingBase {
 			else
 				this.response.end();
 		} catch (err: any) {
-			this.markAsBroken(`Failed to finalize response: ${err.message}`, false);
+			this.markAsBroken(`Failed to finalize response: ${err.message}`);
 		}
 	}
 	protected override handleFinishing(): void {
@@ -612,7 +611,7 @@ export class HttpRequest extends IncomingBase {
 		const length = parseInt(this.headers['content-length'] ?? '0');
 		const chunked = (this.headers['transfer-encoding'] != null);
 		if (length != 0 || chunked)
-			this.markAsBroken(this.request.readableLength > 0 ? 'Uploaded data not consumed' : 'Potential uploaded data not consumed', false);
+			this.markAsBroken(this.request.readableLength > 0 ? 'Uploaded data not consumed' : 'Potential uploaded data not consumed');
 	}
 	protected override async handleKilling(graceful: boolean): Promise<void> {
 		const closeConnection = () => {
@@ -891,7 +890,7 @@ export class HttpRequest extends IncomingBase {
 			this.sendClientSetupHeader(resp, chunk, cb);
 		}
 		catch (err: any) {
-			this.markAsBroken(`Failed to process response: ${err.message}`, false);
+			this.markAsBroken(`Failed to process response: ${err.message}`);
 			return cb(new Error('Connection broken'));
 		}
 	}
@@ -920,8 +919,11 @@ export class HttpRequest extends IncomingBase {
 					response.writer.destroy();
 
 				/* check if the error originated from the outside and ensure the connection is closed */
-				if (!this.response.destroyed && this.state != ResponseState.broken)
-					this.respondBadInternalUsage();
+				if (!this.response.destroyed) {
+					if (this.state == ResponseState.acknowledged)
+						this.respondBadInternalUsage();
+					this.markAsBroken(`Data transfer failed: ${err.message}`);
+				}
 				return cb(err);
 			}
 		);
@@ -1235,10 +1237,12 @@ export class HttpRequest extends IncomingBase {
 		});
 		this.log(`Sending ${this.isHead ? 'HEAD' : 'content'} [${range.first} - ${range.last}/${cached.fileSize()}] from [${filePath}]`);
 
-		/* check if this is a head request, in which case the stream can just
-		*	immediately be closed again, to prevent the file from consuming resources */
-		if (this.isHead)
+		/* check if this is a head request, in which case the stream can just immediately be closed again, to prevent
+		*	the file from consuming resources (null-catch any errors to ensure they are not propagated out of the connection) */
+		if (this.isHead) {
+			stream.once('error', () => { });
 			return new Promise((resolve) => stream.end(() => resolve(true)));
+		}
 
 		/* create the source stream of the file to read from (will not throw any exceptions) */
 		let source: libStream.Readable = cached.stream({ start: range.first, end: range.last });
@@ -1250,15 +1254,16 @@ export class HttpRequest extends IncomingBase {
 			source.once('error', (err: any) => {
 				if (settled) return; settled = true;
 				this.respondFileSystemError();
-				this.error(`Error while sending file [${filePath}]: [${err.message}]`);
 				stream.destroy(err);
 			});
 			stream.once('error', (err: any) => {
 				if (settled) return; settled = true;
-				this.error(`Error while sending file [${filePath}]: [${err.message}]`);
 				source.destroy(err);
 			});
-			stream.once('close', () => resolve(true));
+			stream.once('close', () => {
+				settled = true;
+				resolve(true);
+			});
 		});
 	}
 }
@@ -1313,10 +1318,10 @@ export class HttpUpgrade extends IncomingBase {
 		this.upgrade = UpgradeState.none;
 
 		/* register the necessary network error handlers */
-		request.once('error', () => this.markAsBroken('Connection lost', true));
-		request.once('close', () => this.markAsBroken('Connection lost', true));
-		socket.once('error', () => this.markAsBroken('Connection lost', true));
-		socket.once('close', () => this.markAsBroken('Connection lost', true));
+		request.once('error', () => this.connectionWasLost(false));
+		request.once('close', () => this.connectionWasLost(true));
+		socket.once('error', () => this.connectionWasLost(false));
+		socket.once('close', () => this.connectionWasLost(true));
 	}
 
 	protected override finalizeBufferHeader(status: libRequest.StatusType, error: boolean, headers: Record<string, string>, content: { media: libRequest.MediaType, body: Buffer | null } | null): void {
@@ -1339,7 +1344,7 @@ export class HttpUpgrade extends IncomingBase {
 
 		/* construct the entire header content and send it away (sanitize values to prevent response splitting) */
 		if (status.msg.match(BAD_HTTP_STRING_REGEX))
-			return this.markAsBroken(`Failed to finalize response: Bad status message`, false);
+			return this.markAsBroken(`Failed to finalize response: Bad status message`);
 
 		let headerText = `HTTP/1.1 ${status.code} ${status.msg}\r\n`;
 		for (const [key, value] of Object.entries(headers)) {
@@ -1373,7 +1378,7 @@ export class HttpUpgrade extends IncomingBase {
 		if (this.state != ResponseState.completed && this.state != ResponseState.broken)
 			this.respondBadInternalUsage();
 		if (this.state != ResponseState.broken)
-			this.markAsBroken('Upgrade was not accepted', false);
+			this.markAsBroken('Upgrade was not accepted');
 	}
 	protected override async handleKilling(graceful: boolean): Promise<void> {
 		const closeConnection = () => {
@@ -1444,7 +1449,7 @@ export class HttpUpgrade extends IncomingBase {
 				const settler = !settled;
 				settled = true;
 
-				this.markAsBroken('Broken connection upgraded', false);
+				this.markAsBroken('Broken connection upgraded');
 				this.handleKilling(false);
 				if (settler)
 					resolve(null);
