@@ -333,6 +333,7 @@ class ImmutableManager {
 		}
 
 		/* merge the loaded state into the current state (prefer current state over loaded state) */
+		const performInitialWriteBack = (Object.keys(this.map).length > 0);
 		for (const state of states) {
 			if (state.identifier in this.map)
 				continue;
@@ -352,12 +353,13 @@ class ImmutableManager {
 			this.reverse[state.unique] = state.identifier;
 		}
 
-		/* check if the writeback should be configured and perform the first write back */
+		/* check if the writeback should be configured and perform the first write back (only if the internal state contains any new data) */
 		if (this.writeBack == null)
 			this.writeBack = { path, writing: null, dirty: false };
 		else if (this.writeBack.path == path)
 			return;
-		this.storeState();
+		if (performInitialWriteBack)
+			this.storeState();
 	}
 }
 const cacheManager: CacheManager = new CacheManager();

@@ -8,6 +8,7 @@ export class CoreConfig {
 	private _subscriber: (() => void)[] = [];
 	private _serverName: string = '';
 	private _webSocketTimeout: number = 0;
+	private _webSocketAliveTimeout: number = 0;
 	private _headerTimeout: number = 0;
 	private _connectionTimeout: number = 0;
 	private _keepAliveTimeout: number = 0;
@@ -19,9 +20,9 @@ export class CoreConfig {
 	private _fileCacheControl: string = '';
 	private _immutableCacheControl: string = '';
 	private _responseCacheControl: string = '';
-	private _throughputCheck: number = 0;
 	private _throughputStartup: number = 0;
 	private _throughputThreshold: number = 0;
+	private _throughputWindow: number = 0;
 	private _commonHeaders: Record<string, string> = {};
 
 	private changed(name: string, value: unknown): void {
@@ -64,6 +65,16 @@ export class CoreConfig {
 			return;
 		this._webSocketTimeout = value;
 		this.changed('WebSocket timeout', value);
+	}
+
+	/* default web-socket timeout to respond to a liveness ping before closing the connection [0 kills the connection without ping test; in milliseconds] */
+	public get webSocketAliveTimeout(): number { return this._webSocketAliveTimeout; }
+	public set webSocketAliveTimeout(value: number) {
+		value = Math.max(value, 0);
+		if (this._webSocketAliveTimeout == value)
+			return;
+		this._webSocketAliveTimeout = value;
+		this.changed('WebSocket alive timeout', value);
 	}
 
 	/* default timeout for request headers to be fully received [0 disables the timeout; in milliseconds] */
@@ -170,16 +181,6 @@ export class CoreConfig {
 		this.changed('Response cache control', value);
 	}
 
-	/* interval to check if the throughput is valid [in milliseconds] */
-	public get throughputCheck(): number { return this._throughputCheck; }
-	public set throughputCheck(value: number) {
-		value = Math.max(value, 0);
-		if (this._throughputCheck == value)
-			return;
-		this._throughputCheck = value;
-		this.changed('Throughput check', value);
-	}
-
 	/* grace period before the throughput is started to be measured [in milliseconds] */
 	public get throughputStartup(): number { return this._throughputStartup; }
 	public set throughputStartup(value: number) {
@@ -190,7 +191,7 @@ export class CoreConfig {
 		this.changed('Throughput startup', value);
 	}
 
-	/* throughput required for sending/receiving bodies of requests [0 disables the throughput check, in bytes/second] */
+	/* throughput required for combined sending and receiving bodies of requests [0 disables the throughput check, in bytes/second] */
 	public get throughputThreshold(): number { return this._throughputThreshold; }
 	public set throughputThreshold(value: number) {
 		value = Math.max(value, 0);
@@ -198,6 +199,16 @@ export class CoreConfig {
 			return;
 		this._throughputThreshold = value;
 		this.changed('Throughput threshold', value);
+	}
+
+	/* length of sliding time window for which the throughput must be above the threshold [greater than 0, window length in milliseconds] */
+	public get throughputWindow(): number { return this._throughputWindow; }
+	public set throughputWindow(value: number) {
+		value = Math.max(value, 1);
+		if (this._throughputWindow == value)
+			return;
+		this._throughputWindow = value;
+		this.changed('Throughput window', value);
 	}
 
 	/* directly forwarded to cache [ConfigureWriteBack] but for consistency also here [cannot be subscribed to] */
@@ -221,7 +232,8 @@ export const Config: CoreConfig = new CoreConfig();
 export function Initialize(): void {
 	Config.serverName = 'modular-web-server';
 	Config.commonHeaders = { 'X-Content-Type-Options': 'nosniff' };
-	Config.webSocketTimeout = 120_000;
+	Config.webSocketTimeout = 180_000;
+	Config.webSocketAliveTimeout = 2_000;
 	Config.headerTimeout = 30_000;
 	Config.connectionTimeout = 90_000;
 	Config.keepAliveTimeout = 10_000;
@@ -231,9 +243,9 @@ export function Initialize(): void {
 	Config.cacheAllowStable = true;
 	Config.cacheAllowImmutable = true;
 	Config.responseCacheControl = 'private, no-cache';
-	Config.throughputCheck = 5_000;
 	Config.throughputStartup = 5_000;
 	Config.throughputThreshold = 1_000;
+	Config.throughputWindow = 30_000;
 
 	/* cache valid for 10minutes */
 	Config.fileCacheControl = 'public, max-age=600, must-revalidate';
