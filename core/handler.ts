@@ -41,7 +41,7 @@ export abstract class ModuleHandler {
 		*	is not being handled nested and push the logging and path */
 		if (this._stop != null || this._active.has(client) || client.claimed)
 			return;
-		const snapshot = (path == null ? client.tagLog(this._name) : client._pushTranslation(path, this._name));
+		const snapshot = client._pushTranslation(path ?? '/', this._name);
 		if (snapshot == null)
 			return;
 
@@ -63,7 +63,7 @@ export abstract class ModuleHandler {
 
 		/* restore the context, clear the handling promise and remove the client from actively handled clients */
 		this._active.delete(client);
-		client.restore(snapshot);
+		client._restoreSnapshot(snapshot);
 		if (--this._handle.depth == 0) {
 			this._handle.promise = null;
 			this._handle.resolver();

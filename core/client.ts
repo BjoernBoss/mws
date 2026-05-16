@@ -34,26 +34,24 @@ export class ClientBase extends libLog.LogIdentity {
 	protected _fullPath: string;
 	protected _basePath: string;
 
-	protected constructor(url: libUrl.URL, client: boolean);
-	protected constructor(client: ClientBase);
-	protected constructor(arg: libUrl.URL | ClientBase, client?: boolean) {
-		if (arg instanceof libUrl.URL) {
-			const thisClientId = ++NextClientId;
-			super(`${client ? 'client' : 'upgrade'}!${thisClientId}`);
+	protected constructor(url: libUrl.URL, kind: string);
+	protected constructor(client: ClientBase, kind: string);
+	protected constructor(arg: libUrl.URL | ClientBase, kind: string) {
+		const thisClientId = ++NextClientId;
+		super(`${kind}!${thisClientId}`);
+		this.id = thisClientId;
 
-			this.id = thisClientId;
+		if (arg instanceof libUrl.URL) {
 			this._path = libLocation.Sanitize(arg.pathname, false);
 			this._url = arg;
 			this._fullPath = this._path;
 			this._basePath = '/';
 		}
 		else {
-			super(arg.logIdentity);
 			this._path = arg._path;
 			this._url = arg.url;
 			this._fullPath = arg._fullPath;
 			this._basePath = arg._basePath;
-			this.id = arg.id;
 		}
 	}
 
@@ -83,27 +81,6 @@ export class ClientBase extends libLog.LogIdentity {
 	/* create a path relative to the current translation base */
 	public makePath(path: string): string {
 		return libLocation.JoinSanitized(this._basePath, path);
-	}
-
-	/* preserve the current logging and translation and tag the logging with the given identity and return a snapshot of the old context */
-	public tagLog(identity: string): ClientContext {
-		const current = new ClientContext(this.logIdentity, this._basePath, this._path);
-		this.logIdentity = `${this.logIdentity}.${identity}`;
-		return current;
-	}
-
-	/* preserve the current logging and translation and return a snapshot of it */
-	public snapshot(): ClientContext {
-		return new ClientContext(this.logIdentity, this._basePath, this._path);
-	}
-
-	/* restore a client log and translation and context and return the previous context */
-	public restore(snapshot: ClientContext): ClientContext {
-		const current = new ClientContext(this.logIdentity, this._basePath, this._path);
-		this.logIdentity = snapshot.logIdentity;
-		this._basePath = snapshot.basePath;
-		this._path = snapshot.path;
-		return current;
 	}
 }
 
@@ -171,8 +148,8 @@ export abstract class IncomingBase extends ClientBase {
 	/* kill the current connection (if graceful, wait for the last queued data to be sent; may be called multiple times) */
 	protected abstract handleKilling(graceful: boolean): Promise<void>;
 
-	constructor(request: libHttp.IncomingMessage, host: string, protocol: string, client: boolean) {
-		super(new libUrl.URL(`${protocol}//${host == '' ? '_' : host}${request.url}`), client);
+	constructor(request: libHttp.IncomingMessage, host: string, protocol: string, kind: string) {
+		super(new libUrl.URL(`${protocol}//${host == '' ? '_' : host}${request.url}`), kind);
 		this.request = request;
 		this.state = ResponseState.none;
 		this.breakState = { listener: [], completed: null };
@@ -320,19 +297,26 @@ export abstract class IncomingBase extends ClientBase {
 		this.markAsBroken('Closing connection');
 		return this.handleKilling(false);
 	}
-	public _pushTranslation(path: string, identity?: string): ClientContext | null {
-		if (!libLocation.IsSubDirectory(path, this._path))
+	public _pushTranslation(path: string, identity: string): ClientContext | null {
+		if (path != '/' && !libLocation.IsSubDirectory(path, this._path))
 			return null;
 		const current = new ClientContext(this.logIdentity, this._basePath, this._path);
 
-		/* shift the paths and the log identity */
-		this._basePath = libLocation.JoinSanitized(this._basePath, path);
-		this._path = this._path.substring(path.endsWith('/') ? path.length - 1 : path.length);
-		if (this._path == '')
-			this._path = '/';
-		if (identity != null && identity != '')
+		if (path != '/') {
+			this._basePath = libLocation.JoinSanitized(this._basePath, path);
+			this._path = this._path.substring(path.endsWith('/') ? path.length - 1 : path.length);
+			if (this._path == '')
+				this._path = '/';
+		}
+
+		if (identity != '')
 			this.logIdentity = `${this.logIdentity}.${identity}`;
 		return current;
+	}
+	public _restoreSnapshot(snapshot: ClientContext): void {
+		this.logIdentity = snapshot.logIdentity;
+		this._basePath = snapshot.basePath;
+		this._path = snapshot.path;
 	}
 
 	/* ensure the method is one of the list and otherwise return null and auto-respond with [method-not-allowed]
@@ -546,7 +530,7 @@ export class HttpRequest extends IncomingBase {
 	private htmlPatcher: HtmlPatch[];
 
 	constructor(request: libHttp.IncomingMessage, response: libHttp.ServerResponse, host: string, protocol: string) {
-		super(request, host, protocol, true);
+		super(request, host, protocol, 'client');
 		this.response = response;
 		this.receive = ReceiveState.none;
 		this.htmlPatcher = [];
@@ -1311,7 +1295,7 @@ export class HttpUpgrade extends IncomingBase {
 	private upgrade: UpgradeState;
 
 	constructor(request: libHttp.IncomingMessage, socket: libStream.Duplex, head: Buffer, host: string, protocol: string, wss: libWs.WebSocketServer) {
-		super(request, host, protocol, false);
+		super(request, host, protocol, 'upgrade');
 		this.socket = socket;
 		this.head = head;
 		this.wss = wss;
@@ -1435,8 +1419,6 @@ export class HttpUpgrade extends IncomingBase {
 
 			/* start the upgrade process (web-socket upgrade handler will automatically send error messages) */
 			this.wss.handleUpgrade(this.request, this.socket, this.head, (ws, _) => {
-				this.trace('Connection successfully upgraded to WebSocket');
-
 				if (!settled && this.state == ResponseState.headerSent) {
 					settled = true, this.state = ResponseState.completed;
 
@@ -1470,24 +1452,25 @@ export class ClientSocket extends ClientBase {
 	private ws: libWs.WebSocket;
 	private timer: null | NodeJS.Timeout;
 	private isAlive: boolean;
-	private wsLogger: libLog.LogIdentity;
-	private closing: { promise: Promise<void> | null, closed: (() => void) | null };
-	private delivering: number;
+	private closing: { promise: Promise<void> | null, closed: (() => void) | null, defer: number };
+	private logging: {
+		root: libLog.LogIdentity,
+		tags: { value: string }[]
+	};
 
 	public ondata?: (data: libWs.RawData, isBinary: boolean) => void;
 	public onclose?: () => void;
 
 	constructor(ws: libWs.WebSocket, base: HttpUpgrade) {
-		super(base);
+		super(base, 'socket');
 		this.ws = ws;
 		this.timer = null;
 		this.isAlive = true;
-		this.wsLogger = (base as libLog.LogIdentity);
-		this.closing = { promise: null, closed: null };
-		this.delivering = 0;
+		this.closing = { promise: null, closed: null, defer: 0 };
+		this.logging = { root: libLog.Logger(this.logIdentity), tags: [] };
 
 		this.ws.on('pong', () => {
-			this.wsLogger.trace(`Alive check pong received`);
+			this.logging.root.trace(`Alive check pong received`);
 			this.selfIsAlive();
 		});
 		this.ws.on('message', (data, isBinary) => {
@@ -1495,9 +1478,9 @@ export class ClientSocket extends ClientBase {
 			if (this.closing.promise != null || this.ondata == null)
 				return;
 
-			++this.delivering;
+			++this.closing.defer;
 			this.ondata(data, isBinary);
-			--this.delivering;
+			--this.closing.defer;
 
 			if (this.closing.promise != null)
 				this.handleClosing();
@@ -1506,8 +1489,8 @@ export class ClientSocket extends ClientBase {
 			this.handleClosing();
 
 			/* check if any timers remain (must be the grace-kill timer, can be stopped, as this point can
-			*	only be reached with an active timer, if delivering was somehow still > 0, in which case
-			*	its nested leaving will trigger the proper cleanup, but the timer is not necessary anymore) */
+			*	only be reached with an active timer, if defer was somehow still > 0, in which case its
+			*	nested leaving will trigger the proper cleanup, but the timer is not necessary anymore) */
 			if (this.timer != null)
 				clearTimeout(this.timer);
 			this.timer = null;
@@ -1518,6 +1501,14 @@ export class ClientSocket extends ClientBase {
 
 		/* start the first alive check */
 		this.selfIsAlive();
+
+		/* perserve the log tags of the base */
+		base.log(`WebSocket acccepted: [${this.logIdentity}]`);
+		const logTagList = base.logIdentity.indexOf('.');
+		if (logTagList >= 0) {
+			this.logging.tags.push({ value: base.logIdentity.substring(logTagList + 1) });
+			this.updateLogging();
+		}
 	}
 
 	private checkIsAlive(): void {
@@ -1536,7 +1527,7 @@ export class ClientSocket extends ClientBase {
 
 		/* try to ping the remote to check the liveliness */
 		try {
-			this.wsLogger.trace(`Sending ping to determine if connection is alive`);
+			this.logging.root.trace(`Sending ping to determine if connection is alive`);
 			this.ws.ping();
 		} catch (err: any) {
 			this.handleClosing(`WebSocket error while pinging: ${err.message}`);
@@ -1563,30 +1554,65 @@ export class ClientSocket extends ClientBase {
 
 			/* check if a termination should be triggered and otherwise start the grace termination timer */
 			if (terminate != null) {
-				this.wsLogger.error(terminate);
+				this.logging.root.error(terminate);
 				this.ws.terminate();
 			}
 			else {
 				this.timer = setTimeout(() => {
 					this.timer = null;
 					if (this.closing.closed != null) {
-						this.wsLogger.error('Closing connection');
+						this.logging.root.error('Closing connection');
 						this.ws.terminate();
 					}
 				}, libConfig.killGraceTimeout);
 			}
 		}
 
-		if (this.closing.closed == null || this.delivering > 0)
+		if (this.closing.closed == null || this.closing.defer > 0)
 			return;
 		const closed = this.closing.closed;
 		this.closing.closed = null;
 
-		this.wsLogger.trace('Socket connection closed');
 		if (this.onclose != null)
 			this.onclose();
+		this.logging.root.trace('Socket connection closed');
 
 		closed();
+	}
+	private updateLogging(): void {
+		let identity = this.logging.root.logIdentity;
+
+		for (const tag of this.logging.tags) {
+			if (tag.value != '')
+				identity += `.${tag.value}`;
+		}
+
+		this.logIdentity = identity;
+	}
+
+	/* tag the logging with the given identity and return a callback to update the tag (empty string will
+	*	hide the tag entry; null will completely remove the tag; other values will update the tag) */
+	public tagLog(identity: string): ((value?: string) => void) {
+		let tag: { value: string } | null = { value: identity };
+
+		this.logging.tags.push(tag);
+		if (tag.value != '')
+			this.updateLogging();
+
+		/* setup the handler responsible to update the logging */
+		return (value?: string) => {
+			if (tag == null) return;
+
+			/* check if the tag should be removed or if the value should just be updated */
+			if (value == null) {
+				this.logging.tags = this.logging.tags.filter((v) => v != tag);
+				tag = null;
+			}
+			else if (value != tag.value)
+				tag.value = value;
+
+			this.updateLogging();
+		};
 	}
 
 	public send(data: string | Buffer): void {
