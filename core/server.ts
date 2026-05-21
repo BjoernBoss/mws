@@ -25,15 +25,13 @@ const DEFAULT_SERVER_TIMEOUT_CHECK: number = 10_000;
 export type CheckHost = (host: string) => boolean;
 
 export class Server {
-	private stopServerList: (() => Promise<void>)[];
-	private stopModuleList: (() => Promise<void>)[];
+	private stopListener: (() => [Promise<void>, Promise<void>])[];
 	private wss: libWs.WebSocketServer;
 	private stopping: Promise<void> | null;
 
 	constructor() {
-		logger.info(`Server object created`);
-		this.stopServerList = [];
-		this.stopModuleList = [];
+		logger.info(`Server created`);
+		this.stopListener = [];
 		this.wss = new libWs.WebSocketServer({ noServer: true });
 		this.stopping = null;
 	}
@@ -45,7 +43,7 @@ export class Server {
 			headers: { 'Connection': 'close' }
 		});
 	}
-	private async handleWrapper(wasRequest: boolean, request: libHttp.IncomingMessage, checkHost: CheckHost, handler: libHandler.ModuleHandler, port: number, establish: (host: string) => libClient.HttpRequest | libClient.HttpUpgrade): Promise<void> {
+	private async handleWrapper(wasRequest: boolean, request: libHttp.IncomingMessage, checkHost: CheckHost, handler: libHandler.MountedModule, port: number, establish: (host: string) => libClient.HttpRequest | libClient.HttpUpgrade): Promise<void> {
 		let client = null;
 		try {
 			/* setup the client object */
@@ -88,7 +86,7 @@ export class Server {
 			client.respondBadInternalUsage();
 		}
 	}
-	private handleRequest(request: libHttp.IncomingMessage, response: libHttp.ServerResponse, check: CheckHost, handler: libHandler.ModuleHandler, port: number, secure: boolean): void {
+	private handleRequest(request: libHttp.IncomingMessage, response: libHttp.ServerResponse, check: CheckHost, handler: libHandler.MountedModule, port: number, secure: boolean): void {
 		this.handleWrapper(true, request, check, handler, port, (host: string): libClient.HttpRequest => {
 			return new libClient.HttpRequest(request, response, host, (secure ? 'https:' : 'http:'));
 		}).catch((err: any) => {
@@ -96,7 +94,7 @@ export class Server {
 			request.destroy(new Error('Unhandled exception'));
 		});
 	}
-	private handleUpgrade(request: libHttp.IncomingMessage, socket: libStream.Duplex, head: Buffer, check: CheckHost, handler: libHandler.ModuleHandler, port: number, secure: boolean): void {
+	private handleUpgrade(request: libHttp.IncomingMessage, socket: libStream.Duplex, head: Buffer, check: CheckHost, handler: libHandler.MountedModule, port: number, secure: boolean): void {
 		this.handleWrapper(false, request, check, handler, port, (host: string): libClient.HttpUpgrade => {
 			return new libClient.HttpUpgrade(request, socket, head, host, (secure ? 'https:' : 'http:'), this.wss);
 		}).catch((err: any) => {
@@ -112,58 +110,72 @@ export class Server {
 		server.timeout = libConfig.connectionTimeout;
 		server.keepAliveTimeout = libConfig.keepAliveTimeout;
 	}
-	private startServer(server: libHttp.Server | libHttps.Server, port: number, protocol: string, handler: libHandler.ModuleHandler): void {
+	private startListening(server: libHttp.Server | libHttps.Server, port: number, protocol: string, handler: libHandler.MountedModule, unmounted: { cb: () => void }): void {
 		/* register the config listener and initialize the configuration */
 		const updateTimeouts = () => this.applyConfig(server);
 		updateTimeouts();
 		libConfig.subscribe(updateTimeouts);
 
-		/* register the separate stop functions (server can stopped via the global server-stop or the handler being stopped) */
+		/* register the stop functions (server can stopped via the global server-stop or the handler being stopped) */
 		let serverStopPromise: Promise<void> | null = null;
-		const stopListening: () => Promise<void> = () => {
-			if (serverStopPromise == null) serverStopPromise = new Promise((resolve) => {
+		const triggerListenStop: () => [Promise<void>, Promise<void>] = () => {
+			if (serverStopPromise == null) {
+				let resolver = () => { };
+				serverStopPromise = new Promise((res) => resolver = res);
+
+				const address = server.address() as libNet.AddressInfo;
+				logger.info(`${protocol}-server stopping to listen [${address.address}]:${address.port} [family: ${address.family}] with handler [${handler.module.moduleName}]`);
+
 				libConfig.unsubscribe(updateTimeouts);
-				server.close(() => resolve());
+				server.close(() => resolver());
 				server.closeAllConnections();
-			});
-			return serverStopPromise;
+			}
+			return [serverStopPromise, handler.detach()];
 		};
-		this.stopServerList.push(() => stopListening());
-		this.stopModuleList.push(() => handler.stop());
-		handler.listenStop(() => stopListening());
+		this.stopListener.push(triggerListenStop);
+		unmounted.cb = async () => {
+			if (this.stopping != null) return;
+
+			const [module, handler] = triggerListenStop();
+			await Promise.all([module, handler]);
+
+			if (this.stopping == null)
+				this.stopListener = this.stopListener.filter((v) => v != triggerListenStop);
+		};
 
 		/* log the established listener once the port is actually bound */
+		server.once('error', (err) => logger.error(`Error while listening to port ${port} using http: ${err.message}`));
 		server.on('listening', () => {
 			const address = server.address() as libNet.AddressInfo;
-			logger.info(`${protocol}-server started successfully on [${address.address}]:${address.port} [family: ${address.family}] with handler [${handler.moduleName}]`);
+			logger.info(`${protocol}-server started successfully on [${address.address}]:${address.port} [family: ${address.family}] with handler [${handler.module.moduleName}]`);
 		});
 		server.listen(port);
 	}
 
+	/* listener entry will automatically be stopped once the server is stopped or the handler */
 	public listenHttp(port: number, handler: libHandler.ModuleHandler, checkHost: CheckHost): void {
 		try {
-			if (handler.moduleStopped)
-				return logger.warning(`Not listening to http:${port} with stopped module`);
-
 			const config = {
 				requireHostHeader: true,
 				connectionsCheckingInterval: DEFAULT_SERVER_TIMEOUT_CHECK
 			};
 
+			/* mount the module to the root (start listening will register the corresponding unmounted handler) */
+			const unmounted = { cb: () => { } };
+			const mounted = handler._mountToRoot(() => unmounted.cb());
+
 			/* create the actual server and register the corresponding error/connection handlers and start to listen for connections */
-			const server = libHttp.createServer(config, (req, resp) => this.handleRequest(req, resp, checkHost, handler, port, false));
-			server.once('error', (err) => logger.error(`While listening to port ${port} using http: ${err.message}`));
-			server.on('upgrade', (req, sock, head) => this.handleUpgrade(req, sock, head, checkHost, handler, port, false));
-			this.startServer(server, port, 'Http', handler);
+			const server = libHttp.createServer(config, (req, resp) => this.handleRequest(req, resp, checkHost, mounted, port, false));
+			server.on('upgrade', (req, sock, head) => this.handleUpgrade(req, sock, head, checkHost, mounted, port, false));
+			this.startListening(server, port, 'Http', mounted, unmounted);
 		} catch (err: any) {
 			logger.error(`While listening to port ${port} using http: ${err.message}`);
 		}
 	}
+
+	/* listener entry will automatically be stopped once the server is stopped or the handler */
 	public listenHttps(port: number, key: string, cert: string, handler: libHandler.ModuleHandler, checkHost: CheckHost): void {
 		try {
-			if (handler.moduleStopped)
-				return logger.warning(`Not listening to https:${port} with stopped module`);
-
 			const config = {
 				requireHostHeader: true,
 				key: libFs.readFileSync(key),
@@ -171,11 +183,14 @@ export class Server {
 				connectionsCheckingInterval: DEFAULT_SERVER_TIMEOUT_CHECK
 			};
 
+			/* mount the module to the root (start listening will register the corresponding unmounted handler) */
+			const unmounted = { cb: () => { } };
+			const mounted = handler._mountToRoot(() => unmounted.cb());
+
 			/* create the actual server and register the corresponding error/connection handlers and start to listen for connections */
-			const server = libHttps.createServer(config, (req, resp) => this.handleRequest(req, resp, checkHost, handler, port, true));
-			server.once('error', (err) => logger.error(`While listening to port ${port} using https: ${err.message}`));
-			server.on('upgrade', (req, sock, head) => this.handleUpgrade(req, sock, head, checkHost, handler, port, true));
-			this.startServer(server, port, 'Https', handler);
+			const server = libHttps.createServer(config, (req, resp) => this.handleRequest(req, resp, checkHost, mounted, port, true));
+			server.on('upgrade', (req, sock, head) => this.handleUpgrade(req, sock, head, checkHost, mounted, port, true));
+			this.startListening(server, port, 'Https', mounted, unmounted);
 		} catch (err: any) {
 			logger.error(`While listening to port ${port} using https: ${err.message}`);
 		}
@@ -186,19 +201,22 @@ export class Server {
 		if (this.stopping != null)
 			return this.stopping;
 
-		this.stopping = new Promise<void>(async (resolve) => {
-			/* stop all servers to prevent new connections from coming in; and close any on-the-fly connections
-			*	(dont await immediately, as this only resolves once all connections have been closed) */
-			logger.info('Stopping server and connections');
-			let promises: Promise<void>[] = [];
-			for (const cb of this.stopServerList)
-				promises.push(cb());
+		/* setup the promise beforehand to ensure the promise body does not recursively
+		*	enter this handler again, and sees the stopping object still being unset */
+		let resolver = () => { };
+		this.stopping = new Promise<void>((res) => resolver = res);
 
-			/* destroy all connections and all modules */
-			logger.info('Stopping all modules');
-			let modules: Promise<void>[] = [];
-			for (const cb of this.stopModuleList)
-				modules.push(cb());
+		(async () => {
+			/* stop all servers to prevent new connections from coming in, close any in-progress connections, and start destroying the modules */
+			logger.info('Stopping server connections and modules');
+			let promises: Promise<void>[] = [], modules: Promise<void>[] = [];
+			for (const cb of this.stopListener) {
+				const [server, module] = cb();
+				promises.push(server);
+				modules.push(module);
+			}
+
+			/* only await the module destruction, as the server first resolves once all its connections have been closed */
 			await Promise.all(modules);
 
 			/* destroy any remaining web-sockets (to give the modules the chance to clean them up) and await the full termination */
@@ -210,8 +228,10 @@ export class Server {
 				ws.terminate();
 			}
 			await Promise.all(promises);
-			resolve();
-		});
+
+			logger.info('Server stopped');
+			resolver();
+		})();
 
 		return this.stopping;
 	}

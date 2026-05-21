@@ -18,12 +18,10 @@ let NextClientId: number = 0;
 
 export class ClientContext {
 	public logIdentity: string;
-	public basePath: string;
 	public path: string;
 
-	constructor(logIdentity: string, basePath: string, path: string) {
+	constructor(logIdentity: string, path: string) {
 		this.logIdentity = logIdentity;
-		this.basePath = basePath;
 		this.path = path;
 	}
 }
@@ -32,7 +30,6 @@ export class ClientBase extends libLog.LogIdentity {
 	protected _url: libUrl.URL;
 	protected _path: string;
 	protected _fullPath: string;
-	protected _basePath: string;
 
 	protected constructor(url: libUrl.URL, kind: string);
 	protected constructor(client: ClientBase, kind: string);
@@ -45,13 +42,11 @@ export class ClientBase extends libLog.LogIdentity {
 			this._path = libLocation.Sanitize(arg.pathname, false);
 			this._url = arg;
 			this._fullPath = this._path;
-			this._basePath = '/';
 		}
 		else {
 			this._path = arg._path;
 			this._url = arg.url;
 			this._fullPath = arg._fullPath;
-			this._basePath = arg._basePath;
 		}
 	}
 
@@ -64,11 +59,6 @@ export class ClientBase extends libLog.LogIdentity {
 	}
 
 	/* absolute path on web-server */
-	public get basePath(): string {
-		return this._basePath;
-	}
-
-	/* base path between the fullPath and path */
 	public get fullPath(): string {
 		return this._fullPath;
 	}
@@ -76,11 +66,6 @@ export class ClientBase extends libLog.LogIdentity {
 	/* raw request origin (no host will result in '_') */
 	public get url(): libUrl.URL {
 		return this._url;
-	}
-
-	/* create a path relative to the current translation base */
-	public makePath(path: string): string {
-		return libLocation.JoinSanitized(this._basePath, path);
 	}
 }
 
@@ -225,22 +210,27 @@ export abstract class IncomingBase extends ClientBase {
 		if (this.breakState.completed != null)
 			return;
 
+		/* setup the promise beforehand to ensure the promise body does not recursively
+		*	enter this handler again, and sees the completed object still being unset */
+		let resolver = () => { };
+		this.breakState.completed = new Promise<void>((res) => resolver = res);
+
 		/* setup the break promise to ensure the connection is killed properly with the given grace */
-		this.breakState.completed = new Promise<void>(async (resolve) => {
+		(async () => {
 			let settled = false;
 
 			const forceDestroy = setTimeout(() => {
 				if (settled) return; settled = true;
 				this.handleKilling(false);
-				resolve();
+				resolver();
 			}, libConfig.killGraceTimeout);
 
 			await this.handleKilling(true);
 			clearTimeout(forceDestroy);
 
 			if (settled) return; settled = true;
-			resolve();
-		});
+			resolver();
+		})();
 
 		/* notify all broken listener */
 		for (const cb of this.breakState.listener)
@@ -298,16 +288,13 @@ export abstract class IncomingBase extends ClientBase {
 		return this.handleKilling(false);
 	}
 	public _pushTranslation(path: string, identity: string): ClientContext | null {
-		if (path != '/' && !libLocation.IsSubDirectory(path, this._path))
+		if (!libLocation.IsSubDirectory(path, this._fullPath))
 			return null;
-		const current = new ClientContext(this.logIdentity, this._basePath, this._path);
+		const current = new ClientContext(this.logIdentity, this._path);
 
-		if (path != '/') {
-			this._basePath = libLocation.JoinSanitized(this._basePath, path);
-			this._path = this._path.substring(path.endsWith('/') ? path.length - 1 : path.length);
-			if (this._path == '')
-				this._path = '/';
-		}
+		this._path = this._fullPath.substring(path.endsWith('/') ? path.length - 1 : path.length);
+		if (this._path == '')
+			this._path = '/';
 
 		if (identity != '')
 			this.logIdentity = `${this.logIdentity}.${identity}`;
@@ -315,7 +302,6 @@ export abstract class IncomingBase extends ClientBase {
 	}
 	public _restoreSnapshot(snapshot: ClientContext): void {
 		this.logIdentity = snapshot.logIdentity;
-		this._basePath = snapshot.basePath;
 		this._path = snapshot.path;
 	}
 
@@ -1545,7 +1531,7 @@ export class ClientSocket extends ClientBase {
 	private handleClosing(terminate?: string): void {
 		/* register the initial closing to mark a closing being imminent */
 		if (this.closing.promise == null) {
-			this.closing.promise = new Promise<void>((resolve) => this.closing.closed = resolve);
+			this.closing.promise = new Promise<void>((res) => this.closing.closed = res);
 
 			/* kill the last timer (alive timer) */
 			if (this.timer != null)

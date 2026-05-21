@@ -4,11 +4,13 @@ import * as libFs from "fs";
 
 export type LogLevel = 'error' | 'info' | 'warning' | 'log' | 'trace';
 
-let LogListener: LogCallback[] = [ConsoleLogger()];
+let LogListener: { log: LogCallback, detached: boolean }[] = [{ log: ConsoleLogger(), detached: false }];
 function MakeActualLog(level: LogLevel, identity: string, msg: string): void {
 	const date: string = new Date().toUTCString();
-	for (const log of LogListener)
-		log(level, date, identity, msg);
+	for (const log of LogListener) {
+		if (!log.detached)
+			log.log(level, date, identity, msg);
+	}
 }
 
 /* if [level] is null: is not a log, but the callback is being unregistered */
@@ -172,14 +174,29 @@ export function LineLogger(cb: (line: string) => void): LogCallback {
 
 /* remove all registered loggers (default logger is a single console logger) */
 export function ClearLoggers(): void {
-	for (const log of LogListener)
-		log(null, '', '', '');
-	LogListener = [];
+	for (const log of [...LogListener]) {
+		if (log.detached)
+			continue;
+		log.detached = true;
+		log.log(null, '', '', '');
+	}
+	LogListener = LogListener.filter((val) => !val.detached);
 }
 
-/* register another logger to receive the logs */
-export function AddLogger(cb: LogCallback): void {
-	LogListener.push(cb);
+/* type to invoke to detach the given logger */
+export type Detacher = () => void;
+
+/* register another logger to receive the logs (returned detacher can be invoked to remove the log) */
+export function AddLogger(cb: LogCallback): Detacher {
+	const entry = { log: cb, detached: false };
+	LogListener.push(entry);
+
+	return () => {
+		if (entry.detached) return;
+		LogListener = LogListener.filter((val) => val != entry);
+		entry.detached = true;
+		entry.log(null, '', '', '');
+	};
 }
 
 export class LogIdentity {

@@ -27,7 +27,7 @@ export class CoreConfig {
 
 	private changed(name: string, value: unknown): void {
 		logger.info(`${name} set to [${value}]`);
-		for (const fn of this._subscriber)
+		for (const fn of [...this._subscriber])
 			fn();
 	}
 
