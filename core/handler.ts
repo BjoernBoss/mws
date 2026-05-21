@@ -147,9 +147,9 @@ export abstract class ModuleHandler extends libLog.LogIdentity {
 		this.info(`Handler mounted`);
 
 		/* push the next ordered promise, to ensure the mount is fully performed before the next unmount */
-		let resolver = () => { };
-		const promise = new Promise<void>((res) => resolver = res);
-		this._mounting.task.order.push(promise);
+		let taskResolver = () => { };
+		const taskPromise = new Promise<void>((res) => taskResolver = res);
+		this._mounting.task.order.push(taskPromise);
 
 		/* trigger any mount calls (may push new independent tasks) */
 		for (const link of this._mounting.links) {
@@ -158,20 +158,19 @@ export abstract class ModuleHandler extends libLog.LogIdentity {
 		}
 
 		/* drain the current task queue and convert the task back to the unordered next step */
-		await this.drainTaskQueue(true, promise);
+		await this.drainTaskQueue(true, taskPromise);
 		this._mounting.task.order.shift();
-		this.pushHandleTask(promise);
+		this.pushHandleTask(taskPromise);
 
 		/* notify the module itself about the mount */
 		try {
-			this.trace('Executing mounting handler...');
 			await this.handleMounted(path);
 		}
 		catch (err: any) {
 			this.error(`Unhandled exception while mounting: ${err.message}`);
 			this.stop();
 		}
-		resolver();
+		taskResolver();
 	}
 	private async performUnmountSelf(): Promise<void> {
 		if (this._mounting.path == null)
@@ -181,14 +180,14 @@ export abstract class ModuleHandler extends libLog.LogIdentity {
 		this.info(`Handler unmounted`);
 
 		/* push the next ordered promise, to ensure the unmount is fully performed before the next mount */
-		let resolver = () => { };
-		const promise = new Promise<void>((res) => resolver = res);
-		this._mounting.task.order.push(promise);
+		let taskResolver = () => { };
+		const taskPromise = new Promise<void>((res) => taskResolver = res);
+		this._mounting.task.order.push(taskPromise);
 
-		/* trigger the unmount of all now unmounted children (may push new tasks) */
+		/* trigger the unmount of all now unmounted children */
 		for (const entry of this._mounting.links) {
 			if (entry.parent == this && !this.checkIsModuleMounted(entry.child))
-				entry.child.performUnmountSelf();
+				this.pushHandleTask(entry.child.performUnmountSelf());
 		}
 
 		/* check if the mount should be stopped due to being unmounted */
@@ -198,22 +197,25 @@ export abstract class ModuleHandler extends libLog.LogIdentity {
 		/* kill any current connections and wait for any current tasks and connections to complete */
 		for (const client of this._handling.active)
 			client._killConnection();
-		await this.drainTaskQueue(true, promise);
+		await this.drainTaskQueue(true, taskPromise);
 
 		/* convert the task back to the unordered next step */
 		this._mounting.task.order.shift();
-		this.pushHandleTask(promise);
+		this.pushHandleTask(taskPromise);
 
 		/* notify the module itself about the unmount */
 		try {
-			this.trace('Executing unmounting handler...');
 			await this.handleUnmount();
 		}
 		catch (err: any) {
 			this.error(`Unhandled exception while unmounting: ${err.message}`);
 			this.stop();
 		}
-		resolver();
+		taskResolver();
+
+		/* check if the module was stopped and await the proper stopping */
+		if (this._stopped != null)
+			await this._stopped;
 	}
 	private performMountToParent(parent: ModuleHandler | null, path: string, detached: () => void): MountedModule {
 		const recSearchParents = (parent: ModuleHandler): boolean => {
@@ -261,26 +263,33 @@ export abstract class ModuleHandler extends libLog.LogIdentity {
 			cleanup: async (): Promise<void> => {
 				if (detaching != null) return detaching;
 				let resolver = () => { };
-				detaching = new Promise<void>((resolve) => resolver = resolve);
+				detaching = new Promise<void>((res) => resolver = res);
 				link.setup = null;
+
+				let taskResolver = () => { }, taskPromise = new Promise<void>((res) => taskResolver = res);
 
 				/* remove the link from the parent and add its cleanup to its task list */
 				if (parent != null) {
 					parent._mounting.links.delete(link);
-					parent.pushHandleTask(detaching);
+					parent.pushHandleTask(taskPromise);
 				}
 
 				/* remove the link from this handler and check if the object should be unmounted */
 				this._mounting.links.delete(link);
 				if (this._mounting.path != null && !this.checkIsModuleMounted(this))
-					this.performUnmountSelf();
+					await this.performUnmountSelf();
 
 				/* start the actual detach call */
-				process.nextTick(() => {
+				process.nextTick(async () => {
 					try { detached(); }
 					catch (err: any) {
 						this.error(`Unhandled exception while detaching: ${err.message}`);
 					}
+					taskResolver();
+
+					/* check if the module was stopped, in which case the stop should be awaited before resolving the cleanup promise */
+					if (this._stopped != null)
+						await this._stopped;
 					resolver();
 				});
 				return detaching;
@@ -394,7 +403,6 @@ export abstract class ModuleHandler extends libLog.LogIdentity {
 		await this.drainTaskQueue(true, null);
 
 		try {
-			this.trace('Executing stop handler...');
 			await this.handleStop();
 		}
 		catch (err: any) {
