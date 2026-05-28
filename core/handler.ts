@@ -256,19 +256,37 @@ export abstract class ModuleHandler extends libLog.LogIdentity {
 		};
 
 		/* setup the link object and its creation and unmount methods */
-		let detaching: Promise<void> | null = null;
+		let detachPromise: Promise<void> | null = null;
+		let taskPromise: Promise<void> | null = null;
 		const link: LinkedModules = {
 			parent,
 			child: this,
+			setup: (): void => {
+				if (detachPromise != null)
+					return;
+
+				/* check if the mount is possible in theory */
+				const path = validateLinkState();
+				if (path == null)
+					link.cleanup();
+
+				/* check if the mount is still uncertain (can only happen once on the first time mounting,
+				*	as the second execution is performed after the parent has just been mounted) */
+				else if (path != '') {
+					link.setup = null;
+					if (this._mounting.path == null)
+						this.performMountSelf(path);
+				}
+			},
 			cleanup: async (): Promise<void> => {
-				if (detaching != null) return detaching;
-				let resolver = () => { };
-				detaching = new Promise<void>((res) => resolver = res);
+				if (detachPromise != null) return detachPromise;
+				let detachResolver = () => { }, taskResolver = () => { };
+				detachPromise = new Promise<void>((res) => detachResolver = res);
+				taskPromise = new Promise<void>((res) => taskResolver = res);
 				link.setup = null;
 
-				let taskResolver = () => { }, taskPromise = new Promise<void>((res) => taskResolver = res);
-
-				/* remove the link from the parent and add its cleanup to its task list */
+				/* remove the link from the parent and add its cleanup to its task list (cleanup calls are only linked as task to the parent,
+				*	as the child does not care for them; this implies that the module's stop method itself does not await them either) */
 				if (parent != null) {
 					parent._mounting.links.delete(link);
 					parent.pushHandleTask(taskPromise);
@@ -290,26 +308,9 @@ export abstract class ModuleHandler extends libLog.LogIdentity {
 					/* check if the module was stopped, in which case the stop should be awaited before resolving the cleanup promise */
 					if (this._stopped != null)
 						await this._stopped;
-					resolver();
+					detachResolver();
 				});
-				return detaching;
-			},
-			setup: (): void => {
-				if (detaching != null)
-					return;
-
-				/* check if the mount is possible in theory */
-				const path = validateLinkState();
-				if (path == null)
-					link.cleanup();
-
-				/* check if the mount is still uncertain (can only happen once on the first time mounting,
-				*	as the second execution is performed after the parent has just been mounted) */
-				else if (path != '') {
-					link.setup = null;
-					if (this._mounting.path == null)
-						this.performMountSelf(path);
-				}
+				return detachPromise;
 			}
 		};
 
@@ -321,7 +322,7 @@ export abstract class ModuleHandler extends libLog.LogIdentity {
 		/* try to immediately perform the initial load and setup the mount handler */
 		link.setup!();
 		return {
-			handle: (client) => (detaching != null ? Promise.resolve(client.claimed) : this.handleIncoming(client)),
+			handle: (client) => (detachPromise != null ? Promise.resolve(client.claimed) : this.handleIncoming(client)),
 			detach: () => link.cleanup(),
 			module: this
 		};
@@ -396,7 +397,8 @@ export abstract class ModuleHandler extends libLog.LogIdentity {
 		this._stopped = new Promise<void>((res) => resolver = res);
 
 		/* trigger the unmounting and kill all links and drain the remaining task queue (no
-		*	need to kill connections manually, as the unmounting will take care of this) */
+		*	need to kill connections manually, as the unmounting will take care of this;
+		*	this will not await the detach calls of links where this element is the child) */
 		this.performUnmountSelf();
 		for (const link of this._mounting.links)
 			link.cleanup();

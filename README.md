@@ -29,7 +29,7 @@ import { Config as libConfig } from "core/config.js";
 
 export async function Run(server) {
 	try {
-		libConfig.cacheWriteBack('./some_local_path/immutable.cache');
+		await libConfig.cacheWriteBack('./some_local_path/immutable.cache');
 
 		const mod = await import("my-module/app.js");
 		server.listenHttp(8080, new mod.MyModule(), (host) => host == 'localhost');
@@ -48,17 +48,24 @@ import * as libClient from "core/client.js";
 import * as libRequest from "core/request.js";
 
 export class MyModule extends libHandler.ModuleHandler {
-	public name: string = 'my-module';
+	constructor() {
+		super('my-module');
+	}
 
+	protected override async handleMounted(path: string): Promise<void> {
+		/* module is now reachable at [path] in the URL space */
+	}
 	protected override async handleRequest(client: libClient.HttpRequest): Promise<void> {
 		client.respond('Hello from my module!', { media: libRequest.Media.Text });
 	}
-
 	protected override async handleUpgrade(client: libClient.HttpUpgrade): Promise<void> {
 		/* handle WebSocket upgrades */
 	}
+	protected override async handleUnmount(): Promise<void> {
+		/* module removed from URL space; all connections have drained (WebSockets need to be closed manually) */
+	}
 	protected override async handleStop(): Promise<void> {
-		/* perform any necessary cleanup steps */
+		/* close timers and release resources */
 	}
 }
 ```
@@ -88,11 +95,11 @@ The `core` workspace provides all server functionality:
 
 | File | Purpose |
 |---|---|
-| `handler.ts` | `ModuleHandler` interface, and helper modules: `LambdaModule`, `DispatchModule`, `UnhandledModule`, `WrapModule` |
+| `handler.ts` | `ModuleHandler` abstract class, and helper modules: `LambdaModule`, `DispatchModule`, `HostModule`, `UnhandledModule`, `WrapModule` |
 | `client.ts` | `HttpRequest` (response helpers, body parsing, file serving), `HttpUpgrade` and `ClientSocket` (WebSocket) |
 | `request.ts` | HTTP status codes, media types, range parsing, and encoding negotiation (gzip, deflate, brotli, zstd) |
 | `server.ts` | `Server` class managing HTTP/HTTPS listeners with host-header validation |
-| `config.ts` | `CoreConfig` class and global `Config` instance for server name, timeouts, and cache settings |
+| `config.ts` | `CoreConfig` class and global `Config` instance for server name, timeouts, cache settings, common response headers, throughput controls |
 | `cache.ts` | File cache with LRU eviction, immutable file versioning, sync/async read, and streaming |
 | `templates.ts` | Template loading and placeholder expansion |
 | `builder.ts` | Programmatic HTML page construction |

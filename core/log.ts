@@ -2,16 +2,17 @@
 /* Copyright (c) 2024-2026 Bjoern Boss Henrichsen */
 import * as libFs from "fs";
 
-export type LogLevel = 'error' | 'info' | 'warning' | 'log' | 'trace';
+/* setup the initial default console-logger */
+let LogListener: Set<LogCallback> = new Set<LogCallback>();
+AddLogger(ConsoleLogger());
 
-let LogListener: { log: LogCallback, detached: boolean }[] = [{ log: ConsoleLogger(), detached: false }];
 function MakeActualLog(level: LogLevel, identity: string, msg: string): void {
 	const date: string = new Date().toUTCString();
-	for (const log of LogListener) {
-		if (!log.detached)
-			log.log(level, date, identity, msg);
-	}
+	for (const log of LogListener)
+		log(level, date, identity, msg);
 }
+
+export type LogLevel = 'error' | 'info' | 'warning' | 'log' | 'trace';
 
 /* if [level] is null: is not a log, but the callback is being unregistered */
 export type LogCallback = (level: LogLevel | null, date: string, identity: string, msg: string) => void;
@@ -67,6 +68,14 @@ export function ConsoleLogger(): LogCallback {
 		}
 
 		console.log(`\x1b[90m[${date}] ${levelColor}${levelPrint}\x1b[0m: [\x1b[93m${identity}\x1b[0m] ${msg}`);
+	};
+}
+
+/* implementation of a logger which receives a well formatted line */
+export function LineLogger(cb: (line: string) => void): LogCallback {
+	return (level: LogLevel | null, date: string, identity: string, msg: string) => {
+		if (level != null)
+			cb(FormatLine(level, date, identity, msg, false));
 	};
 }
 
@@ -164,23 +173,10 @@ export function FileLogger(filePath: string, options?: { flushingDelayMs?: numbe
 	};
 }
 
-/* implementation of a logger which receives a well formatted line */
-export function LineLogger(cb: (line: string) => void): LogCallback {
-	return (level: LogLevel | null, date: string, identity: string, msg: string) => {
-		if (level != null)
-			cb(FormatLine(level, date, identity, msg, false));
-	};
-}
-
 /* remove all registered loggers (default logger is a single console logger) */
 export function ClearLoggers(): void {
-	for (const log of [...LogListener]) {
-		if (log.detached)
-			continue;
-		log.detached = true;
-		log.log(null, '', '', '');
-	}
-	LogListener = LogListener.filter((val) => !val.detached);
+	for (const log of LogListener)
+		log(null, '', '', '');
 }
 
 /* type to invoke to detach the given logger */
@@ -188,17 +184,34 @@ export type Detacher = () => void;
 
 /* register another logger to receive the logs (returned detacher can be invoked to remove the log) */
 export function AddLogger(cb: LogCallback): Detacher {
-	const entry = { log: cb, detached: false };
-	LogListener.push(entry);
+	let detached = false;
+	const wrapped = (level: LogLevel | null, date: string, identity: string, msg: string): void => {
+		if (detached) return;
+
+		if (level == null) {
+			LogListener.delete(wrapped);
+			detached = true;
+		}
+
+		try {
+			if (detached)
+				cb(null, '', '', '');
+			else
+				cb(level, date, identity, msg);
+		}
+		catch (err: any) {
+			console.error(`Logger failed: ${err.message}`);
+			wrapped(null, '', '', '');
+		}
+	};
+	LogListener.add(wrapped);
 
 	return () => {
-		if (entry.detached) return;
-		LogListener = LogListener.filter((val) => val != entry);
-		entry.detached = true;
-		entry.log(null, '', '', '');
+		wrapped(null, '', '', '');
 	};
 }
 
+/* logger identity class to extend, supporting various log classes */
 export class LogIdentity {
 	public logIdentity: string;
 
@@ -223,6 +236,7 @@ export class LogIdentity {
 	}
 }
 
+/* create a logger identity interface to create associated logs */
 export function Logger(identity: string): LogIdentity {
 	return new LogIdentity(identity);
 }

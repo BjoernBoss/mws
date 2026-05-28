@@ -148,20 +148,22 @@ export function ParseRangeHeader(range: string | null, fileSize: number): { firs
 	return { first: fileSize - last!, last: fileSize - 1, state: RangeState.valid };
 }
 
-/* check if the [etag] matches the list (i.e. in list or list is '*'), will not match
-*	for undefined list (performs equality comparisions, without regard to weak etags) */
-export function ETagMatchesList(etag: string, header: string | null): boolean {
+/* check if the [etag] matches the list (i.e. in list or list is '*'), will not match for undefined list; if [strong]
+*	comparison, both must be non-weak, opaque-tags equal (strip W/ prefix and compare opaque-tags regardless of weakness) */
+export function ETagMatchesList(etag: string, header: string | null, strong: boolean): boolean {
 	if (header == null)
 		return false;
 
 	const list: string[] = SplitAndTrimList(header, ',', true);
 	if (list.length == 1 && list[0] == '*')
 		return true;
+	if (strong && etag.startsWith('W/'))
+		return false;
 
-	/* check if its a weak comparison and strip W/ prefix and compare opaque-tags */
 	const target = etag.startsWith('W/') ? etag.substring(2) : etag;
 	for (const entry of list) {
-		if (target == (entry.startsWith('W/') ? entry.substring(2) : entry))
+		const current = ((strong || !entry.startsWith('W/')) ? entry : entry.substring(2));
+		if (target == current)
 			return true;
 	}
 	return false;
@@ -205,17 +207,12 @@ export function BuildMediaTypeIdentifier(media: MediaType): string {
 	return `${media.mediaType}; ${media.encoding}`;
 }
 
-/* an unknown at-least-size is considered valid */
+/* does not respect 'no-identity' encoding requests; unknown at-least-size is considered valid */
 export const MIN_ENCODING_SIZE: number = 1_000;
-export function ShouldEncode(atLeastSize: number | null, media: MediaType): boolean {
-	if (!media.compressible)
-		return false;
-	return (atLeastSize == null || atLeastSize >= MIN_ENCODING_SIZE);
-}
-
-/* does not respect 'no-identity' encoding requests */
-export function SelectEncoding(accept: string | null): EncodingType | null {
-	if (accept == null)
+export function NegotiateEncoding(accept: string | null, atLeastSize: number | null, media: MediaType): EncodingType | null {
+	if (!media.compressible || accept == null)
+		return null;
+	if (atLeastSize != null && atLeastSize < MIN_ENCODING_SIZE)
 		return null;
 
 	/* parse the encoding types and their score */

@@ -27,8 +27,12 @@ export class CoreConfig {
 
 	private changed(name: string, value: unknown): void {
 		logger.info(`${name} set to [${value}]`);
-		for (const fn of [...this._subscriber])
-			fn();
+		for (const fn of [...this._subscriber]) {
+			try { fn(); }
+			catch (err: any) {
+				logger.error(`Unhandled exception in config subscriber: ${err.message}`);
+			}
+		}
 	}
 
 	public subscribe(cb: () => void): void {
