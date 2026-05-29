@@ -55,10 +55,10 @@ export class MyModule extends libHandler.ModuleHandler {
 	protected override async handleMounted(path: string): Promise<void> {
 		/* module is now reachable at [path] in the URL space */
 	}
-	protected override async handleRequest(client: libClient.HttpRequest): Promise<void> {
+	protected override async handleRequest(client: libClient.HttpRequest, params: unknown): Promise<void> {
 		client.respond('Hello from my module!', { media: libRequest.Media.Text });
 	}
-	protected override async handleUpgrade(client: libClient.HttpUpgrade): Promise<void> {
+	protected override async handleUpgrade(client: libClient.HttpUpgrade, params: unknown): Promise<void> {
 		/* handle WebSocket upgrades */
 	}
 	protected override async handleUnmount(): Promise<void> {
