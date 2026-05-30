@@ -16,13 +16,19 @@ const BAD_HTTP_STRING_REGEX: RegExp = /[\x00-\x1f\x7f]/;
 
 let NextClientId: number = 0;
 
-export class ClientContext {
+class ClientContext {
 	public logIdentity: string;
 	public path: string;
+	public busyCount: number;
+	public headerPatchCount: number;
+	public htmlPatchCount: number;
 
-	constructor(logIdentity: string, path: string) {
+	constructor(logIdentity: string, path: string, busyCount: number, headerPatchCount: number, htmlPatchCount: number) {
 		this.logIdentity = logIdentity;
 		this.path = path;
+		this.busyCount = busyCount;
+		this.headerPatchCount = headerPatchCount;
+		this.htmlPatchCount = htmlPatchCount;
 	}
 }
 
@@ -110,19 +116,27 @@ enum ResponseState {
 export abstract class IncomingBase extends ClientBase {
 	protected request: libHttp.IncomingMessage;
 	protected headerPatchers: HeaderPatch[];
+	protected htmlPatcher: HtmlPatch[];
 	protected state: ResponseState;
 	protected breakState: {
-		listener: (() => void)[];
+		breakPromise: Promise<void>;
+		breakResolve: () => void;
 		completed: Promise<void> | null;
 	};
-	private throughput: {
-		timer: NodeJS.Timeout | null,
-		deadline: number,
-		start: number,
-		threshold: number,
-		window: number
+	protected baseState: {
+		respondedPromise: Promise<void>;
+		respondedResolve: () => void;
+		completedPromise: Promise<void>;
+		completedResolve: () => void;
 	};
-	private processed: { promise: Promise<void>, resolve?: () => void };
+	private throughput: {
+		timer: NodeJS.Timeout | null;
+		deadline: number;
+		start: number;
+		threshold: number;
+		window: number;
+		busyCheck: (() => boolean)[];
+	};
 
 	/* write the given header and content out (no need to update state; body may be null for HEAD responses of unknown size) */
 	protected abstract finalizeBufferHeader(status: libRequest.StatusType, error: boolean, headers: Record<string, string>, content: { media: libRequest.MediaType, body: Buffer | null } | null): void;
@@ -137,19 +151,68 @@ export abstract class IncomingBase extends ClientBase {
 		super(new libUrl.URL(`${protocol}//${host == '' ? '_' : host}${request.url}`), kind);
 		this.request = request;
 		this.state = ResponseState.none;
-		this.breakState = { listener: [], completed: null };
 		this.headerPatchers = [];
+		this.htmlPatcher = [];
 
-		let resolver: any = null;
-		this.processed = { promise: new Promise<void>((resolve) => resolver = resolve) };
-		this.processed.resolve = resolver;
+		let breakResolve: any = null;
+		this.breakState = {
+			breakPromise: new Promise<void>((resolve) => breakResolve = resolve),
+			breakResolve: () => { },
+			completed: null
+		};
+		this.breakState.breakResolve = breakResolve;
+
+		let respondedResolve: any = null, completedResolve: any = null;
+		this.baseState = {
+			respondedPromise: new Promise<void>((resolve) => respondedResolve = resolve),
+			respondedResolve: () => { },
+			completedPromise: new Promise<void>((resolve) => completedResolve = resolve),
+			completedResolve: () => { }
+		};
+		this.baseState.respondedResolve = respondedResolve;
+		this.baseState.completedResolve = completedResolve;
 
 		/* setup the throughput measurement to detect any stalling connections */
-		this.throughput = { timer: null, deadline: 0, start: 0, threshold: libConfig.throughputThreshold, window: libConfig.throughputWindow };
+		this.throughput = {
+			timer: null,
+			deadline: 0,
+			start: 0,
+			threshold: libConfig.throughputThreshold,
+			window: libConfig.throughputWindow,
+			busyCheck: []
+		};
 		if (this.throughput.threshold > 0) {
-			this.throughput.start = Date.now() + libConfig.throughputStartup;
+			this.throughput.start = Date.now() + libConfig.throughputGrace;
 			this.updateThroughput(0);
 		}
+
+		/* register the necessary network error handlers */
+		const lostHandler = () => {
+			if (this.state != ResponseState.completed && this.state != ResponseState.broken)
+				this.markAsBroken('Connection lost', false);
+		};
+		const closedHandler = () => {
+			if (this.state != ResponseState.completed && this.state != ResponseState.broken)
+				this.markAsBroken('Connection closed by remote', false);
+		};
+		const timeoutHandler = () => {
+			if (this.state != ResponseState.completed && this.state != ResponseState.broken)
+				this.markAsBroken('Connection timed out', false);
+		};
+		request.once('error', lostHandler);
+		request.once('aborted', closedHandler);
+		request.socket.once('timeout', timeoutHandler);
+		request.socket.once('error', () => lostHandler);
+		request.socket.once('close', () => closedHandler);
+
+		/* ensure to remove the events again once the processing has completed */
+		this.baseState.completedPromise.then(() => {
+			request.removeListener('error', lostHandler);
+			request.removeListener('aborted', closedHandler);
+			request.socket.removeListener('timeout', timeoutHandler);
+			request.socket.removeListener('error', () => lostHandler);
+			request.socket.removeListener('close', () => closedHandler);
+		});
 	}
 
 	private constructQuickResponse(status: libRequest.StatusType, logReason: string | null, error: boolean | undefined, headers: Record<string, string> | undefined, content: { media: libRequest.MediaType, body: Buffer } | null): void {
@@ -181,8 +244,11 @@ export abstract class IncomingBase extends ClientBase {
 			if (closing)
 				this.markAsBroken('Broken due to error while preparing response', true);
 		}
-		else if (!error)
-			this.respondBadInternalUsage();
+		else if (!error) {
+			this.warning(`Request already processed and discarding response ${description}`);
+			if (this.state != ResponseState.completed && this.state != ResponseState.broken)
+				this.respondBadInternalUsage();
+		}
 		else if (this.state == ResponseState.headerSent)
 			this.markAsBroken(`Broken due to ${description}`, false);
 		else
@@ -192,9 +258,23 @@ export abstract class IncomingBase extends ClientBase {
 		if (this.throughput.threshold <= 0 || this.state == ResponseState.broken)
 			return;
 
+		/* check if the connection is still considered busy and should receive a grace delay */
+		for (const cb of this.throughput.busyCheck) {
+			let result = false;
+			try { result = cb(); }
+			catch (err: any) { this.error(`Unhandled exception in busy check: ${err.message}`); }
+			if (!result) continue;
+
+			this.trace(`Deferring throughput closing as connection is busy`);
+			this.throughput.start = Date.now() + libConfig.throughputGrace;
+			this.updateThroughput(0);
+			this.request.socket.setTimeout(libConfig.connectionTimeout);
+			return;
+		}
+
 		const closing = (this.state == ResponseState.none || this.state == ResponseState.acknowledged);
 		if (closing)
-			this.respondRequestTimeout(`throughput below [${this.throughput.threshold}] bytes/sec`, { error: true, headers: { 'Connection': 'close' } });
+			this.respondRequestTimeout(`Throughput below [${this.throughput.threshold}] bytes/sec`, { error: true, headers: { 'Connection': 'close' } });
 		this.markAsBroken(`Throughput below [${this.throughput.threshold}] bytes/sec`, closing);
 	}
 	protected updateThroughput(delta: number): void {
@@ -211,10 +291,6 @@ export abstract class IncomingBase extends ClientBase {
 		this.throughput.deadline = now + Math.min(this.throughput.window, Math.max(0, this.throughput.deadline - now) + bought);
 		this.throughput.timer = setTimeout(() => this.failThroughput(), this.throughput.deadline - _now);
 	}
-	protected connectionWasLost(closed: boolean): void {
-		if (this.state != ResponseState.completed && this.state != ResponseState.broken)
-			this.markAsBroken((closed ? 'Connection closed by remote' : 'Connection lost'), false);
-	}
 	protected markAsBroken(reason: string, graceful: boolean): void {
 		this.error(`Connection broken: [${reason}]`);
 		this.state = ResponseState.broken;
@@ -223,6 +299,8 @@ export abstract class IncomingBase extends ClientBase {
 				this.handleKilling(false);
 			return;
 		}
+
+		this.baseState.respondedResolve();
 
 		/* setup the promise beforehand to ensure the promise body does not recursively
 		*	enter this handler again, and sees the completed object still being unset */
@@ -246,25 +324,11 @@ export abstract class IncomingBase extends ClientBase {
 			resolver();
 		})();
 
-		/* notify all broken listener */
-		for (const cb of this.breakState.listener)
-			cb();
+		this.breakState.breakResolve();
 	}
 
 	public get headers(): libHttp.IncomingHttpHeaders {
 		return this.request.headers;
-	}
-	public get unhandled(): boolean {
-		return (this.state == ResponseState.none);
-	}
-	public get claimed(): boolean {
-		return (this.state != ResponseState.none);
-	}
-	public get headerSent(): boolean {
-		return (this.state != ResponseState.none && this.state != ResponseState.acknowledged);
-	}
-	public get broken(): boolean {
-		return (this.state == ResponseState.broken);
 	}
 	public get method(): string {
 		return this.request.method ?? '';
@@ -272,8 +336,25 @@ export abstract class IncomingBase extends ClientBase {
 	public get isHead(): boolean {
 		return (this.request.method == 'HEAD');
 	}
+
+	/* request has not yet been acknowledged in any way */
+	public get unhandled(): boolean {
+		return (this.state == ResponseState.none);
+	}
+
+	/* request has been acknowledged or already processed */
+	public get claimed(): boolean {
+		return (this.state != ResponseState.none);
+	}
+
+	/* resolves whenever the response has been determined (is broken or a response header has been sent) */
+	public get responded(): Promise<void> {
+		return this.baseState.respondedPromise;
+	}
+
+	/* resolves whenever the client has been fully processed */
 	public get completion(): Promise<void> {
-		return this.processed.promise;
+		return this.baseState.completedPromise;
 	}
 
 	public async _finishConnection(): Promise<void> {
@@ -284,7 +365,8 @@ export abstract class IncomingBase extends ClientBase {
 		} catch (_) { }
 
 		/* kill the throughput timer, as it either does not need to be checked anymore, or it
-		*	will have left the connection as broken, and will automatically be closed now */
+		*	will have left the connection as broken, and will automatically be closed now
+		*	(reset the threshold timer to ensure no new timers will be started anymore) */
 		if (this.throughput.timer != null)
 			clearTimeout(this.throughput.timer);
 		this.throughput.timer = null;
@@ -295,7 +377,7 @@ export abstract class IncomingBase extends ClientBase {
 			await this.breakState.completed!;
 
 		this.log('Request processing completed');
-		this.processed.resolve!();
+		this.baseState.completedResolve();
 	}
 	public _killConnection(): void {
 		this.markAsBroken('Closing connection', false);
@@ -303,7 +385,8 @@ export abstract class IncomingBase extends ClientBase {
 	public _pushTranslation(path: string, identity: string): ClientContext | null {
 		if (!libLocation.IsSubDirectory(path, this._fullPath))
 			return null;
-		const current = new ClientContext(this.logIdentity, this._path);
+		const current = new ClientContext(this.logIdentity, this._path, this.throughput.busyCheck.length,
+			this.headerPatchers.length, this.htmlPatcher.length);
 
 		this._path = this._fullPath.substring(path.endsWith('/') ? path.length - 1 : path.length);
 		if (this._path == '')
@@ -316,6 +399,9 @@ export abstract class IncomingBase extends ClientBase {
 	public _restoreSnapshot(snapshot: ClientContext): void {
 		this.logIdentity = snapshot.logIdentity;
 		this._path = snapshot.path;
+		this.throughput.busyCheck.splice(snapshot.busyCount);
+		this.headerPatchers.splice(snapshot.headerPatchCount);
+		this.htmlPatcher.splice(snapshot.htmlPatchCount);
 	}
 
 	/* ensure the method is one of the list and otherwise return null and auto-respond with [method-not-allowed]
@@ -337,7 +423,14 @@ export abstract class IncomingBase extends ClientBase {
 		return null;
 	}
 
-	/* register a callback to be invoked once the response is sent, to adjust the headers to be sent */
+	/* register a callback to check if the request is still being processed (delays throughput
+	*	termintion and resets connection timeout; will only be considered within this handler context) */
+	public busyCheck(cb: () => boolean): void {
+		this.throughput.busyCheck.push(cb);
+	}
+
+	/* register a callback to be invoked once the response is sent, to adjust the
+	*	headers to be sent (will only be considered within this handler context) */
 	public patchHeaders(cb: HeaderPatch): void {
 		this.headerPatchers.push(cb);
 	}
@@ -529,19 +622,11 @@ export abstract class IncomingBase extends ClientBase {
 export class HttpRequest extends IncomingBase {
 	private response: libHttp.ServerResponse;
 	private receive: ReceiveState;
-	private htmlPatcher: HtmlPatch[];
 
 	constructor(request: libHttp.IncomingMessage, response: libHttp.ServerResponse, host: string, protocol: string) {
 		super(request, host, protocol, 'client');
 		this.response = response;
 		this.receive = ReceiveState.none;
-		this.htmlPatcher = [];
-
-		/* register the necessary network error handlers */
-		request.once('error', () => this.connectionWasLost(false));
-		request.once('aborted', () => this.connectionWasLost(true));
-		response.once('error', () => this.connectionWasLost(false));
-		response.once('close', () => this.connectionWasLost(true));
 	}
 
 	protected override finalizeBufferHeader(status: libRequest.StatusType, error: boolean, headers: Record<string, string>, content: { media: libRequest.MediaType, body: Buffer | null } | null): void {
@@ -658,6 +743,8 @@ export class HttpRequest extends IncomingBase {
 				this.error(`Failed to set header [${key}]: Bad header value`);
 			}
 		}
+
+		this.baseState.respondedResolve();
 	}
 	private receiveClientData(maxLength: number | null): libStream.Readable {
 		const makeErrorStream = (msg: string) => new libStream.Readable({ read() { this.destroy(new Error(msg)) } });
@@ -742,7 +829,7 @@ export class HttpRequest extends IncomingBase {
 		}
 
 		/* register the broken handler to detect closed or failed connections */
-		this.breakState.listener.push(() => {
+		this.breakState.breakPromise.then(() => {
 			if (!output.destroyed)
 				output.destroy(new Error('Connection broken'));
 		});
@@ -914,7 +1001,7 @@ export class HttpRequest extends IncomingBase {
 		);
 
 		/* register the broken handler to detect closed or failed connections */
-		this.breakState.listener.push(() => {
+		this.breakState.breakPromise.then(() => {
 			if (!response.destroyed)
 				response.destroy(new Error('Connection broken'));
 		});
@@ -1064,7 +1151,8 @@ export class HttpRequest extends IncomingBase {
 		});
 	}
 
-	/* register a callback to be invoked if html is built, to adjust the headers or the content to be sent */
+	/* register a callback to be invoked if html is built, to adjust the headers or
+	*	the content to be sent (will only be considered within this handler context) */
 	public patchHtmlPage(cb: HtmlPatch): void {
 		this.htmlPatcher.push(cb);
 	}
@@ -1309,12 +1397,6 @@ export class HttpUpgrade extends IncomingBase {
 		this.head = head;
 		this.wss = wss;
 		this.upgrade = UpgradeState.none;
-
-		/* register the necessary network error handlers */
-		request.once('error', () => this.connectionWasLost(false));
-		request.once('close', () => this.connectionWasLost(true));
-		socket.once('error', () => this.connectionWasLost(false));
-		socket.once('close', () => this.connectionWasLost(true));
 	}
 
 	protected override finalizeBufferHeader(status: libRequest.StatusType, error: boolean, headers: Record<string, string>, content: { media: libRequest.MediaType, body: Buffer | null } | null): void {
@@ -1357,6 +1439,8 @@ export class HttpUpgrade extends IncomingBase {
 		}
 		else
 			this.socket.end();
+
+		this.baseState.respondedResolve();
 	}
 	protected override handleFinishing(): void {
 		/* check if the upgrade was not fully awaited */
@@ -1422,7 +1506,7 @@ export class HttpUpgrade extends IncomingBase {
 			let settled = false;
 
 			/* register the broken listener (to detect failures of the upgrading or network errors) */
-			this.breakState.listener.push(() => {
+			this.breakState.breakPromise.then(() => {
 				if (settled) return; settled = true;
 				this.error('Failed to upgrade to WebSocket');
 				resolve(null);
@@ -1446,6 +1530,8 @@ export class HttpUpgrade extends IncomingBase {
 					resolve(null);
 			});
 		});
+
+		this.baseState.respondedResolve();
 		this.upgrade = UpgradeState.upgraded;
 		return ws;
 	}

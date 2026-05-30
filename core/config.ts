@@ -20,7 +20,7 @@ export class CoreConfig {
 	private _fileCacheControl: string = '';
 	private _immutableCacheControl: string = '';
 	private _responseCacheControl: string = '';
-	private _throughputStartup: number = 0;
+	private _throughputGrace: number = 0;
 	private _throughputThreshold: number = 0;
 	private _throughputWindow: number = 0;
 	private _commonHeaders: Record<string, string> = {};
@@ -185,14 +185,14 @@ export class CoreConfig {
 		this.changed('Response cache control', value);
 	}
 
-	/* grace period before the throughput is started to be measured [in milliseconds] */
-	public get throughputStartup(): number { return this._throughputStartup; }
-	public set throughputStartup(value: number) {
+	/* grace period before the throughput is started to be measured or for busy connections [in milliseconds] */
+	public get throughputGrace(): number { return this._throughputGrace; }
+	public set throughputGrace(value: number) {
 		value = Math.max(value, 0);
-		if (this._throughputStartup == value)
+		if (this._throughputGrace == value)
 			return;
-		this._throughputStartup = value;
-		this.changed('Throughput startup', value);
+		this._throughputGrace = value;
+		this.changed('Throughput grace', value);
 	}
 
 	/* throughput required for combined sending and receiving bodies of requests [0 disables the throughput check, in bytes/second] */
@@ -247,7 +247,7 @@ export function Initialize(): void {
 	Config.cacheAllowStable = true;
 	Config.cacheAllowImmutable = true;
 	Config.responseCacheControl = 'private, no-cache';
-	Config.throughputStartup = 5_000;
+	Config.throughputGrace = 10_000;
 	Config.throughputThreshold = 1_000;
 	Config.throughputWindow = 30_000;
 
