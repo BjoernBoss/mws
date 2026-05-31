@@ -353,12 +353,13 @@ export abstract class ModuleHandler extends libLog.LogIdentity {
 	*	resolves, client must either have been handled or must not be handled anymore) */
 	protected async handleUpgrade(client: libClient.HttpUpgrade, params?: object): Promise<void> { const _0 = client, _1 = params; }
 
-	/* module has been detached and it not attached to the server anymore, but not yet stopped (will only be called
-	*	after an attach call; all clients are guaranteed to have left, but accepted WebSockets will be left intact) */
+	/* module has been detached and it not attached to the server anymore, but not yet stopped
+	*	(will only be called after an attach call; all clients are guaranteed to have left, but
+	*	accepted WebSockets will be left intact and must be closed manually by this module) */
 	protected async handleDetached(): Promise<void> { }
 
-	/* stop this module (will only be called when detached; will only be called once; module should cleanup any resources and timers;
-	*	will only be called once; WebSockets will not be closed automatically and must be closed manually by the module handler) */
+	/* stop this module (will only be called when detached; will only be called once; module should
+	*	cleanup any resources and timers and cleanup any remaining WebSockets not disonnected on detach) */
 	protected async handleStop(): Promise<void> { }
 
 	/* name of the module */
