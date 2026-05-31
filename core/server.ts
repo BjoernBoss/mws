@@ -36,14 +36,14 @@ export class Server {
 		this.stopping = null;
 	}
 
-	private respondBadEndpoint(request: libHttp.IncomingMessage, client: libClient.HttpRequest | libClient.HttpUpgrade): void {
+	private respondBadEndpoint(request: libHttp.IncomingMessage, client: libClient.HttpClient): void {
 		client.respond(`No resource found at [${request.headers.host ?? ''}]:[${client.url.pathname}]`, {
 			status: libRequest.Status.NotFound,
 			media: libRequest.Media.Text,
 			headers: { 'Connection': 'close' }
 		});
 	}
-	private async handleWrapper(wasRequest: boolean, request: libHttp.IncomingMessage, checkHost: CheckHost, handler: libHandler.AttachedModule, port: number, establish: (host: string) => libClient.HttpRequest | libClient.HttpUpgrade): Promise<void> {
+	private async handleWrapper(wasRequest: boolean, request: libHttp.IncomingMessage, checkHost: CheckHost, handler: libHandler.AttachedModule, port: number, establish: (host: string) => libClient.HttpClient): Promise<void> {
 		let client = null;
 		try {
 			/* setup the client object */
@@ -123,8 +123,9 @@ export class Server {
 				let resolver = () => { };
 				serverStopPromise = new Promise((res) => resolver = res);
 
-				const address = server.address() as libNet.AddressInfo;
-				logger.info(`${protocol}-server stopping to listen [${address.address}]:${address.port} [family: ${address.family}] with handler [${handler.module.moduleName}]`);
+				const address = server.address() as libNet.AddressInfo | null;
+				if (address != null)
+					logger.info(`${protocol}-server stopping to listen [${address.address}]:${address.port} [family: ${address.family}] with handler [${handler.module.moduleName}]`);
 
 				libConfig.unsubscribe(updateTimeouts);
 				server.close(() => resolver());
@@ -146,6 +147,7 @@ export class Server {
 		/* log the established listener once the port is actually bound */
 		server.once('error', (err) => logger.error(`Error while listening to port ${port} using http: ${err.message}`));
 		server.on('listening', () => {
+			if (serverStopPromise != null) return;
 			const address = server.address() as libNet.AddressInfo;
 			logger.info(`${protocol}-server started successfully on [${address.address}]:${address.port} [family: ${address.family}] with handler [${handler.module.moduleName}]`);
 		});

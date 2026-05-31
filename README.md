@@ -52,8 +52,8 @@ export class MyModule extends libHandler.ModuleHandler {
 		super('my-module');
 	}
 
-	protected override async handleMounted(path: string): Promise<void> {
-		/* module is now reachable at [path] in the URL space */
+	protected override async handleAttached(): Promise<void> {
+		/* module is now reachable in the URL space */
 	}
 	protected override async handleRequest(client: libClient.HttpRequest, params: unknown): Promise<void> {
 		client.respond('Hello from my module!', { media: libRequest.Media.Text });
@@ -61,7 +61,7 @@ export class MyModule extends libHandler.ModuleHandler {
 	protected override async handleUpgrade(client: libClient.HttpUpgrade, params: unknown): Promise<void> {
 		/* handle WebSocket upgrades */
 	}
-	protected override async handleUnmount(): Promise<void> {
+	protected override async handleDetached(): Promise<void> {
 		/* module removed from URL space; all connections have drained (WebSockets need to be closed manually) */
 	}
 	protected override async handleStop(): Promise<void> {
@@ -85,7 +85,7 @@ const dispatch = new libHandler.DispatchModule({
 	'/static': fileModule
 });
 const unhandled = new libHandler.UnhandledModule(dispatch, {
-	request: async (client) => { client.respond('Custom not found', { status: libRequest.Status.NotFound }); }
+	handle: async (client) => { client.respond('Custom not found', { status: libRequest.Status.NotFound }); }
 });
 server.listenHttp(8080, unhandled, (host) => host == 'localhost');
 ```
@@ -119,6 +119,6 @@ MWS has a two-layer caching system: a server-side in-memory file cache and HTTP 
 The in-memory file cache is used to serve frequently used content. Optionally, it determines freshness before every read.
 
 On top of the in-memory caching, the cache system also allows for immutable versioned unique paths to be used, which allows clients to cache entries immutably.
-For this, the given paths are tagged with a `UUID` (`style.css` becomes `style.<uuid>.css`), which is then associated with the given version of the file. This allows content to serve the file as immutable, as the path will change, if the file changes.
+For this, the given paths are tagged with a unique id (`style.css` becomes `style.<id>.css`), which is then associated with the given version of the file. This allows content to serve the file as immutable, as the path will change, if the file changes.
 
 Other features for caching include the support for `etag` and `last-modified` to allow clients to identify freshness of their cached content.

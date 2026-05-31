@@ -14,7 +14,7 @@ export interface AttachedModule {
 	*	designated for the client; returns false if the client is still unhandled after the handler; params are
 	*	passed on to the module without modification; no translation is equivalent to [/] => [/]; the translation
 	*	is applied for the nested client and reversed for any paths produced by the client */
-	handle(client: libClient.HttpRequest | libClient.HttpUpgrade, params?: object, translate?: PathTranslation): Promise<boolean>;
+	handle(client: libClient.HttpClient, params?: object, translate?: PathTranslation): Promise<boolean>;
 
 	/* detach the module from the parent module handler (registered unlinked callback will be invoked before this promise
 	*	is completed; clients dispatched to the module will not be disconnected directly any may still be active) */
@@ -110,7 +110,7 @@ export abstract class ModuleHandler extends libLog.LogIdentity {
 		}
 		return false;
 	}
-	private async processIncomingClient(client: libClient.HttpRequest | libClient.HttpUpgrade, params?: object, translate?: PathTranslation): Promise<boolean> {
+	private async processIncomingClient(client: libClient.HttpClient, params?: object, translate?: PathTranslation): Promise<boolean> {
 		/* check if the client is already being handled or has already
 		*	been handled and otherwise process any outstanding tasks */
 		if (this._handling.active.has(client) || client.claimed)
@@ -345,7 +345,7 @@ export abstract class ModuleHandler extends libLog.LogIdentity {
 	/* handle the client request or upgrade (guaranteed to not have been claimed yet; if the
 	*	promise resolves, client must either have been handled or must not be handled anymore;
 	*	default implementation dispatches to separate handle-request/handle-upgrade) */
-	protected async handleClient(client: libClient.HttpRequest | libClient.HttpUpgrade, params?: object): Promise<void> {
+	protected async handleClient(client: libClient.HttpClient, params?: object): Promise<void> {
 		if (client instanceof libClient.HttpRequest)
 			await this.handleRequest(client, params);
 		else
@@ -434,11 +434,11 @@ export type AttachLambda = (self: ModuleHandler) => Promise<void>;
 export type DetachLambda = () => Promise<void>;
 export type RequestLambda = (client: libClient.HttpRequest, params?: object) => Promise<void>;
 export type UpgradeLambda = (client: libClient.HttpUpgrade, params?: object) => Promise<void>;
-export type ClientLambda = (client: libClient.HttpRequest | libClient.HttpUpgrade, params?: object) => Promise<void>;
+export type HandleLambda = (client: libClient.HttpClient, params?: object) => Promise<void>;
 export type StopLambda = () => Promise<void>;
 export type RequestWrap = (client: libClient.HttpRequest, handle: (params?: object, translate?: PathTranslation) => Promise<boolean>, params?: object) => Promise<void>;
 export type UpgradeWrap = (client: libClient.HttpUpgrade, handle: (params?: object, translate?: PathTranslation) => Promise<boolean>, params?: object) => Promise<void>;
-export type ClientWrap = (client: libClient.HttpRequest | libClient.HttpUpgrade, handle: (params?: object, translate?: PathTranslation) => Promise<boolean>, params?: object) => Promise<void>;
+export type HandleWrap = (client: libClient.HttpClient, handle: (params?: object, translate?: PathTranslation) => Promise<boolean>, params?: object) => Promise<void>;
 
 /*
 *	Simple module handler implementation, which dispatches requests to different children based on the request path (longest match).
@@ -469,7 +469,7 @@ export class DispatchModule extends ModuleHandler {
 			this.stop();
 	}
 
-	protected override async handleClient(client: libClient.HttpRequest | libClient.HttpUpgrade, params?: object): Promise<void> {
+	protected override async handleClient(client: libClient.HttpClient, params?: object): Promise<void> {
 		let bestMatch: string | null = null;
 
 		/* iterate over the mappings and look for the corresponding best handler */
@@ -528,7 +528,7 @@ export class HostModule extends ModuleHandler {
 		return (test[test.length - host.length - 1] == '.' || host.startsWith('.') || host == '');
 	}
 
-	protected override async handleClient(client: libClient.HttpRequest | libClient.HttpUpgrade, params?: object): Promise<void> {
+	protected override async handleClient(client: libClient.HttpClient, params?: object): Promise<void> {
 		let bestMatch: string | null = null;
 
 		/* iterate over the mappings and look for the corresponding best handler */
@@ -560,13 +560,13 @@ export class LambdaModule extends ModuleHandler {
 	private upgradeLambda?: UpgradeLambda;
 	private stopLambda?: StopLambda;
 
-	constructor(options?: { attach?: AttachLambda, detach?: DetachLambda, client?: ClientLambda, request?: RequestLambda, upgrade?: UpgradeLambda, stop?: StopLambda, name?: string }) {
+	constructor(options?: { attach?: AttachLambda, detach?: DetachLambda, handle?: HandleLambda, request?: RequestLambda, upgrade?: UpgradeLambda, stop?: StopLambda, name?: string }) {
 		super(options?.name ?? 'lambda');
 		this.attachLambda = options?.attach;
 		this.detachLambda = options?.detach;
 
-		this.requestLambda = options?.client ?? options?.request;
-		this.upgradeLambda = options?.client ?? options?.upgrade;
+		this.requestLambda = options?.handle ?? options?.request;
+		this.upgradeLambda = options?.handle ?? options?.upgrade;
 		this.stopLambda = options?.stop;
 	}
 
@@ -603,12 +603,12 @@ export class UnhandledModule extends ModuleHandler {
 	private requestLambda?: RequestLambda;
 	private upgradeLambda?: UpgradeLambda;
 
-	constructor(handler: ModuleHandler, options?: { client?: ClientLambda, request?: RequestLambda, upgrade?: UpgradeLambda }) {
+	constructor(handler: ModuleHandler, options?: { handle?: HandleLambda, request?: RequestLambda, upgrade?: UpgradeLambda }) {
 		super('unhandler');
 
 		this.handler = this.linkChild(handler, () => this.stop());
-		this.requestLambda = options?.client ?? options?.request;
-		this.upgradeLambda = options?.client ?? options?.upgrade;
+		this.requestLambda = options?.handle ?? options?.request;
+		this.upgradeLambda = options?.handle ?? options?.upgrade;
 	}
 
 	protected override async handleRequest(client: libClient.HttpRequest, params?: object): Promise<void> {
@@ -634,12 +634,12 @@ export class WrapModule extends ModuleHandler {
 	private requestWrap?: RequestWrap;
 	private upgradeWrap?: UpgradeWrap;
 
-	constructor(handler: ModuleHandler, options?: { client?: ClientWrap, request?: RequestWrap, upgrade?: UpgradeWrap }) {
+	constructor(handler: ModuleHandler, options?: { handle?: HandleWrap, request?: RequestWrap, upgrade?: UpgradeWrap }) {
 		super('wrap');
 
 		this.handler = this.linkChild(handler, () => this.stop());
-		this.requestWrap = options?.client ?? options?.request;
-		this.upgradeWrap = options?.client ?? options?.upgrade;
+		this.requestWrap = options?.handle ?? options?.request;
+		this.upgradeWrap = options?.handle ?? options?.upgrade;
 	}
 
 	protected override async handleRequest(client: libClient.HttpRequest, params?: object): Promise<void> {

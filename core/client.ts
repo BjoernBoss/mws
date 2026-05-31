@@ -1782,3 +1782,5 @@ export class ClientSocket extends ClientBase {
 		return this.closing.promise!;
 	}
 }
+
+export type HttpClient = HttpRequest | HttpUpgrade;
