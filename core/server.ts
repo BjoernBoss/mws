@@ -43,7 +43,7 @@ export class Server {
 			headers: { 'Connection': 'close' }
 		});
 	}
-	private async handleWrapper(wasRequest: boolean, request: libHttp.IncomingMessage, checkHost: CheckHost, handler: libHandler.MountedModule, port: number, establish: (host: string) => libClient.HttpRequest | libClient.HttpUpgrade): Promise<void> {
+	private async handleWrapper(wasRequest: boolean, request: libHttp.IncomingMessage, checkHost: CheckHost, handler: libHandler.AttachedModule, port: number, establish: (host: string) => libClient.HttpRequest | libClient.HttpUpgrade): Promise<void> {
 		let client = null;
 		try {
 			/* setup the client object */
@@ -86,7 +86,7 @@ export class Server {
 			client.respondBadInternalUsage();
 		}
 	}
-	private handleRequest(request: libHttp.IncomingMessage, response: libHttp.ServerResponse, check: CheckHost, handler: libHandler.MountedModule, port: number, secure: boolean): void {
+	private handleRequest(request: libHttp.IncomingMessage, response: libHttp.ServerResponse, check: CheckHost, handler: libHandler.AttachedModule, port: number, secure: boolean): void {
 		this.handleWrapper(true, request, check, handler, port, (host: string): libClient.HttpRequest => {
 			return new libClient.HttpRequest(request, response, host, (secure ? 'https:' : 'http:'));
 		}).catch((err: any) => {
@@ -94,7 +94,7 @@ export class Server {
 			request.destroy(new Error('Unhandled exception'));
 		});
 	}
-	private handleUpgrade(request: libHttp.IncomingMessage, socket: libStream.Duplex, head: Buffer, check: CheckHost, handler: libHandler.MountedModule, port: number, secure: boolean): void {
+	private handleUpgrade(request: libHttp.IncomingMessage, socket: libStream.Duplex, head: Buffer, check: CheckHost, handler: libHandler.AttachedModule, port: number, secure: boolean): void {
 		this.handleWrapper(false, request, check, handler, port, (host: string): libClient.HttpUpgrade => {
 			return new libClient.HttpUpgrade(request, socket, head, host, (secure ? 'https:' : 'http:'), this.wss);
 		}).catch((err: any) => {
@@ -110,7 +110,7 @@ export class Server {
 		server.timeout = libConfig.connectionTimeout;
 		server.keepAliveTimeout = libConfig.keepAliveTimeout;
 	}
-	private startListening(server: libHttp.Server | libHttps.Server, port: number, protocol: string, handler: libHandler.MountedModule, unmounted: { cb: () => void }): void {
+	private startListening(server: libHttp.Server | libHttps.Server, port: number, protocol: string, handler: libHandler.AttachedModule, unlinked: { cb: () => void }): void {
 		/* register the config listener and initialize the configuration */
 		const updateTimeouts = () => this.applyConfig(server);
 		updateTimeouts();
@@ -130,10 +130,10 @@ export class Server {
 				server.close(() => resolver());
 				server.closeAllConnections();
 			}
-			return [serverStopPromise, handler.detach()];
+			return [serverStopPromise, handler.unlink()];
 		};
 		this.stopListener.push(triggerListenStop);
-		unmounted.cb = async () => {
+		unlinked.cb = async () => {
 			if (this.stopping != null) return;
 
 			const [module, handler] = triggerListenStop();
@@ -160,14 +160,14 @@ export class Server {
 				connectionsCheckingInterval: DEFAULT_SERVER_TIMEOUT_CHECK
 			};
 
-			/* mount the module to the root (start listening will register the corresponding unmounted handler) */
-			const unmounted = { cb: () => { } };
-			const mounted = handler._mountToRoot(() => unmounted.cb());
+			/* attach the module to the root (start listening will register the corresponding unlink handler) */
+			const unlinked = { cb: () => { } };
+			const attached = handler._attachToRoot(() => unlinked.cb());
 
 			/* create the actual server and register the corresponding error/connection handlers and start to listen for connections */
-			const server = libHttp.createServer(config, (req, resp) => this.handleRequest(req, resp, checkHost, mounted, port, false));
-			server.on('upgrade', (req, sock, head) => this.handleUpgrade(req, sock, head, checkHost, mounted, port, false));
-			this.startListening(server, port, 'Http', mounted, unmounted);
+			const server = libHttp.createServer(config, (req, resp) => this.handleRequest(req, resp, checkHost, attached, port, false));
+			server.on('upgrade', (req, sock, head) => this.handleUpgrade(req, sock, head, checkHost, attached, port, false));
+			this.startListening(server, port, 'Http', attached, unlinked);
 		} catch (err: any) {
 			logger.error(`While listening to port ${port} using http: ${err.message}`);
 		}
@@ -183,14 +183,14 @@ export class Server {
 				connectionsCheckingInterval: DEFAULT_SERVER_TIMEOUT_CHECK
 			};
 
-			/* mount the module to the root (start listening will register the corresponding unmounted handler) */
-			const unmounted = { cb: () => { } };
-			const mounted = handler._mountToRoot(() => unmounted.cb());
+			/* attach the module to the root (start listening will register the corresponding unlink handler) */
+			const unlinked = { cb: () => { } };
+			const attached = handler._attachToRoot(() => unlinked.cb());
 
 			/* create the actual server and register the corresponding error/connection handlers and start to listen for connections */
-			const server = libHttps.createServer(config, (req, resp) => this.handleRequest(req, resp, checkHost, mounted, port, true));
-			server.on('upgrade', (req, sock, head) => this.handleUpgrade(req, sock, head, checkHost, mounted, port, true));
-			this.startListening(server, port, 'Https', mounted, unmounted);
+			const server = libHttps.createServer(config, (req, resp) => this.handleRequest(req, resp, checkHost, attached, port, true));
+			server.on('upgrade', (req, sock, head) => this.handleUpgrade(req, sock, head, checkHost, attached, port, true));
+			this.startListening(server, port, 'Https', attached, unlinked);
 		} catch (err: any) {
 			logger.error(`While listening to port ${port} using https: ${err.message}`);
 		}

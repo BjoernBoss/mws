@@ -176,7 +176,14 @@ class ImmutableManager {
 			let output: ImmutableSerialized[] = [];
 			for (const identifier in this.map) {
 				const entry = this.map[identifier];
-				output.push({ unique: entry.unique, identifier, path: entry.path, fileSystem: entry.fileSystem, size: entry.size, mtime: entry.mtime });
+				output.push({
+					unique: entry.unique,
+					identifier,
+					path: entry.path,
+					fileSystem: entry.fileSystem,
+					size: entry.size,
+					mtime: entry.mtime
+				});
 			}
 			const content: string = JSON.stringify(output);
 
@@ -548,7 +555,7 @@ export function GetActual(path: string, stable: boolean): Cached | null {
 
 /* generate a unique tagged path for the given query path, which will change whenever the underlying file changes; [stable]: if
 *	created as stable, dont re-validate the file stats to detect changes (creates a path to a file, which looks similar to the
-*	source, except that the name includes a UUID, which will be used to identity the given file state; will be removed from the
+*	source, except that the name includes a unique id, which will be used to identity the given file state; will be removed from the
 *	final target path to be served, to identify the actual source) */
 export function MakeImmutable(handler: string, path: string, stable: boolean): string {
 	return immutableManager.make(handler, path, stable);

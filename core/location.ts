@@ -80,6 +80,17 @@ export function IsSubDirectory(base: string, path: string): boolean {
 	return (path[base.length] == '/' || base.endsWith('/'));
 }
 
+/* return the remaining path for the sub directory path in base (must be a true sub-directory) */
+export function Remainder(base: string, path: string): string {
+	const out = path.substring(base.endsWith('/') ? base.length - 1 : base.length);
+	return (out == '' ? '/' : out);
+}
+
+/* rebase the path from the old base directory onto the new base (must be a true sub-directory) */
+export function Rebase(oldBase: string, newBase: string, path: string): string {
+	return JoinSanitized(newBase, Remainder(oldBase, path));
+}
+
 /* create path-creator, which returns sanitized paths relative to [path] */
 export function MakeLocation(path: string): (path: string) => string {
 	return function (p) {

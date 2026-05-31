@@ -19,13 +19,15 @@ let NextClientId: number = 0;
 class ClientContext {
 	public logIdentity: string;
 	public path: string;
+	public translationCount: number;
 	public busyCount: number;
 	public headerPatchCount: number;
 	public htmlPatchCount: number;
 
-	constructor(logIdentity: string, path: string, busyCount: number, headerPatchCount: number, htmlPatchCount: number) {
+	constructor(logIdentity: string, path: string, translationCount: number, busyCount: number, headerPatchCount: number, htmlPatchCount: number) {
 		this.logIdentity = logIdentity;
 		this.path = path;
+		this.translationCount = translationCount;
 		this.busyCount = busyCount;
 		this.headerPatchCount = headerPatchCount;
 		this.htmlPatchCount = htmlPatchCount;
@@ -33,9 +35,8 @@ class ClientContext {
 }
 
 export class ClientBase extends libLog.LogIdentity {
-	protected _url: libUrl.URL;
-	protected _path: string;
-	protected _fullPath: string;
+	protected relativePath: string;
+	protected pathTranslation: Record<string, string | null>[];
 
 	protected constructor(url: libUrl.URL, kind: string);
 	protected constructor(client: ClientBase, kind: string);
@@ -45,33 +46,68 @@ export class ClientBase extends libLog.LogIdentity {
 		this.id = thisClientId;
 
 		if (arg instanceof libUrl.URL) {
-			this._path = libLocation.Sanitize(arg.pathname, false);
-			this._url = arg;
-			this._fullPath = this._path;
+			this.pathTranslation = [];
+			this.relativePath = libLocation.Sanitize(arg.pathname, false);
+			this.url = arg;
 		}
 		else {
-			this._path = arg._path;
-			this._url = arg.url;
-			this._fullPath = arg._fullPath;
+			this.pathTranslation = arg.pathTranslation;
+			this.relativePath = arg.relativePath;
+			this.url = arg.url;
 		}
 	}
 
 	/* unique id to identify client in logs */
 	readonly id: number;
 
-	/* path relative to current module base-path */
-	public get path(): string {
-		return this._path;
-	}
-
-	/* absolute path on web-server */
-	public get fullPath(): string {
-		return this._fullPath;
-	}
-
 	/* raw request origin (no host will result in '_') */
-	public get url(): libUrl.URL {
-		return this._url;
+	readonly url: libUrl.URL;
+
+	/* path relative to current module */
+	public get path(): string {
+		return this.relativePath;
+	}
+
+	/* check if the path relative to the current module is a sub path of the given test base path */
+	public isSubPath(base: string): boolean {
+		return libLocation.IsSubDirectory(base, this.relativePath);
+	}
+
+	/* create a path relative from the current module into the clients traversed server space */
+	public makePath(path: string): string {
+		path = libLocation.Sanitize(path, false);
+		let output = path;
+
+		for (let i = this.pathTranslation.length - 1; i >= 0; --i) {
+			let nullCheck = false, match: [string, string | null] | null = null;
+
+			/* find the best reverse mapping and apply it */
+			for (const [from, to] of Object.entries(this.pathTranslation[i])) {
+				if (to == null)
+					nullCheck = true;
+				else if (libLocation.IsSubDirectory(to, output) && (match == null || match[1]!.length < to.length))
+					match = [from, to];
+			}
+			if (match != null)
+				output = libLocation.Rebase(match[1]!, match[0], output);
+
+			/* check if the translation contained null-mappings and check if
+			*	the final unpacked path re-maps into the null-mapping */
+			if (nullCheck) {
+				match = null;
+				for (const [from, to] of Object.entries(this.pathTranslation[i])) {
+					if (libLocation.IsSubDirectory(from, output) && (match == null || match[0].length < from.length))
+						match = [from, to];
+				}
+			}
+
+			/* check if the path could not be translated */
+			if (match == null || match[1] == null) {
+				this.warning(`Path [${path}] is not mapped by translations`);
+				return path;
+			}
+		}
+		return output;
 	}
 }
 
@@ -382,23 +418,45 @@ export abstract class IncomingBase extends ClientBase {
 	public _killConnection(): void {
 		this.markAsBroken('Closing connection', false);
 	}
-	public _pushTranslation(path: string, identity: string): ClientContext | null {
-		if (!libLocation.IsSubDirectory(path, this._fullPath))
-			return null;
-		const current = new ClientContext(this.logIdentity, this._path, this.throughput.busyCheck.length,
-			this.headerPatchers.length, this.htmlPatcher.length);
+	public _pushTranslation(map: Record<string, string | null>, identity: string): ClientContext | null {
+		let sanitized: Record<string, string | null> | null = null;
+		let match: [string, string | null] | null = null;
 
-		this._path = this._fullPath.substring(path.endsWith('/') ? path.length - 1 : path.length);
-		if (this._path == '')
-			this._path = '/';
+		/* check if this is only an identity map, in which case nothing complex needs to be evaluated */
+		if (Object.keys(map).length == 1 && map['/'] == '/')
+			match = ['/', '/'];
 
+		/* create the merged reverse map and check if the map applies to the current translation */
+		else {
+			sanitized = {};
+			for (const [_from, _to] of Object.entries(map)) {
+				const from = libLocation.Sanitize(_from, false);
+				const to = (_to == null ? null : libLocation.Sanitize(_to, false));
+				sanitized[from] = to;
+
+				/* check if the mapping can be applied to the current path */
+				if (this.isSubPath(from) && (match == null || match[0].length < from.length))
+					match = [from, to];
+			}
+			if (match == null || match[1] == null)
+				return null;
+		}
+
+		const current = new ClientContext(this.logIdentity, this.relativePath, this.pathTranslation.length,
+			this.throughput.busyCheck.length, this.headerPatchers.length, this.htmlPatcher.length);
+
+		/* setup the new path, all path translations, and the tagged logging identity */
+		this.relativePath = libLocation.Rebase(match[0], match[1]!, this.relativePath);
+		if (sanitized != null)
+			this.pathTranslation.push(sanitized);
 		if (identity != '')
 			this.logIdentity = `${this.logIdentity}.${identity}`;
 		return current;
 	}
 	public _restoreSnapshot(snapshot: ClientContext): void {
 		this.logIdentity = snapshot.logIdentity;
-		this._path = snapshot.path;
+		this.relativePath = snapshot.path;
+		this.pathTranslation.splice(snapshot.translationCount);
 		this.throughput.busyCheck.splice(snapshot.busyCount);
 		this.headerPatchers.splice(snapshot.headerPatchCount);
 		this.htmlPatcher.splice(snapshot.htmlPatchCount);
@@ -1069,12 +1127,7 @@ export class HttpRequest extends IncomingBase {
 	*	automatically responds with given exceptions if the payload cannot be received properly */
 	public async receiveAllBuffer(maxLength: number | null): Promise<Buffer> {
 		return new Promise((resolve, reject) => {
-			let stream: libStream.Readable | null = null;
-			try {
-				stream = this.receiveClientData(maxLength);
-			} catch (err: any) {
-				return reject(err);
-			}
+			let stream: libStream.Readable = this.receiveClientData(maxLength);
 
 			const buffers: Buffer[] = [];
 			stream.on('data', (chunk: Buffer) => buffers.push(chunk));
@@ -1103,13 +1156,7 @@ export class HttpRequest extends IncomingBase {
 	public async receiveToFile(path: string, maxLength: number | null): Promise<void> {
 		this.trace(`Collecting data from [${this.url.pathname}] to: [${path}]`);
 		return new Promise((resolve, reject) => {
-			let source: libStream.Readable | null = null;
-			try {
-				source = this.receiveClientData(maxLength);
-			}
-			catch (err: any) {
-				return reject(err);
-			}
+			let source: libStream.Readable = this.receiveClientData(maxLength);
 
 			/* create the stream to the file to be written and setup the plumbing */
 			const destination = libFs.createWriteStream(path, { flags: 'wx' });
@@ -1501,7 +1548,7 @@ export class HttpUpgrade extends IncomingBase {
 		/* mark the connection as being accepted */
 		this.state = ResponseState.headerSent;
 		this.upgrade = UpgradeState.upgrading;
-		this.trace(`Performing upgrade on web socket connection: [${this._fullPath}]`);
+		this.trace(`Performing upgrade on web socket connection: [${this.url.pathname}]`);
 		const ws = await new Promise<ClientSocket | null>((resolve) => {
 			let settled = false;
 
