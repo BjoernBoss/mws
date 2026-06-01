@@ -71,9 +71,10 @@ export class Server {
 			/* handle the actual client request */
 			await handler.handle(client);
 		} catch (err: any) {
-			logger.error(`Uncaught exception encountered for client!${client != null ? client.id : '#'}: ${err.message}`)
 			if (client != null)
-				client.respondBadInternalUsage();
+				client.respondInternalError(`Uncaught exception: ${err.message}`);
+			else
+				logger.error(`Uncaught exception: ${err.message}`)
 		}
 
 		/* finish the client handling or consume all remaining data in the pipeline */
@@ -82,8 +83,7 @@ export class Server {
 		else try {
 			await client._finishConnection();
 		} catch (err: any) {
-			logger.error(`Failed to complete client!${client.id}: ${err.message}`);
-			client.respondBadInternalUsage();
+			client.respondInternalError(`Failed to complete connection: ${err.message}`);
 		}
 	}
 	private handleRequest(request: libHttp.IncomingMessage, response: libHttp.ServerResponse, check: CheckHost, handler: libHandler.AttachedModule, port: number, secure: boolean): void {

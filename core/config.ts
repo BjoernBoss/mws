@@ -14,8 +14,8 @@ export class CoreConfig {
 	private _keepAliveTimeout: number = 0;
 	private _killGraceTimeout: number = 0;
 	private _cacheSize: number = 0;
-	private _cacheAllowStable: boolean = false;
-	private _cacheAllowImmutable: boolean = false;
+	private _cacheAlwaysValidate: boolean = false;
+	private _cacheImmutableTagging: boolean = false;
 	private _cacheFileSizeLimit: number = 0;
 	private _fileCacheControl: string = '';
 	private _immutableCacheControl: string = '';
@@ -140,22 +140,22 @@ export class CoreConfig {
 		this.changed('Cache file size limit', value);
 	}
 
-	/* allow the usage of stable caches, otherwise all cached entries will be re-validated before serving */
-	public get cacheAllowStable(): boolean { return this._cacheAllowStable; }
-	public set cacheAllowStable(value: boolean) {
-		if (this._cacheAllowStable == value)
+	/* update the cache to always revalidate the freshness before serving, otherwise base the decision on the on the owner */
+	public get cacheAlwaysValidate(): boolean { return this._cacheAlwaysValidate; }
+	public set cacheAlwaysValidate(value: boolean) {
+		if (this._cacheAlwaysValidate == value)
 			return;
-		this._cacheAllowStable = value;
-		this.changed('Cache allow stable', value);
+		this._cacheAlwaysValidate = value;
+		this.changed('Cache always validate', value);
 	}
 
-	/* allow the usage of immutable ids, otherwise the normal files will just be served - as mutable */
-	public get cacheAllowImmutable(): boolean { return this._cacheAllowImmutable; }
-	public set cacheAllowImmutable(value: boolean) {
-		if (this._cacheAllowImmutable == value)
+	/* tag served content with immutable ids, otherwise the normal files will just be served - as mutable */
+	public get cacheImmutableTagging(): boolean { return this._cacheImmutableTagging; }
+	public set cacheImmutableTagging(value: boolean) {
+		if (this._cacheImmutableTagging == value)
 			return;
-		this._cacheAllowImmutable = value;
-		this.changed('Cache allow immutable', value);
+		this._cacheImmutableTagging = value;
+		this.changed('Cache immutable tagging', value);
 	}
 
 	/* default cache-control value for normal cache reads [empty string does not set any cache-control] */
@@ -244,8 +244,8 @@ export function Initialize(): void {
 	Config.killGraceTimeout = 1_000;
 	Config.cacheSize = 50_000_000;
 	Config.cacheFileSizeLimit = 10_000_000;
-	Config.cacheAllowStable = true;
-	Config.cacheAllowImmutable = true;
+	Config.cacheAlwaysValidate = false;
+	Config.cacheImmutableTagging = true;
 	Config.responseCacheControl = 'private, no-cache';
 	Config.throughputGrace = 10_000;
 	Config.throughputThreshold = 1_000;

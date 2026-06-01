@@ -55,10 +55,10 @@ export class MyModule extends libHandler.ModuleHandler {
 	protected override async handleAttached(): Promise<void> {
 		/* module is now reachable in the URL space */
 	}
-	protected override async handleRequest(client: libClient.HttpRequest, params: unknown): Promise<void> {
+	protected override async handleRequest(client: libClient.HttpRequest, params?: object): Promise<void> {
 		client.respond('Hello from my module!', { media: libRequest.Media.Text });
 	}
-	protected override async handleUpgrade(client: libClient.HttpUpgrade, params: unknown): Promise<void> {
+	protected override async handleUpgrade(client: libClient.HttpUpgrade, params?: object): Promise<void> {
 		/* handle WebSocket upgrades */
 	}
 	protected override async handleDetached(): Promise<void> {
@@ -70,6 +70,8 @@ export class MyModule extends libHandler.ModuleHandler {
 }
 ```
 Any requests not handled by a module, may be handled by parent modules, should they host child modules. If no module handles a request, a default `404 Not Found` is sent.
+
+**Important:** `server.stop()` waits for all active request handlers to complete before shutting down. Long-running handlers **must** check `client.claimed` or await `client.responded` to detect when the connection has been broken, and exit promptly. A handler that blocks unconditionally (e.g. an uncancellable `await`) will prevent the server from shutting down.
 
 The framework also provides default helper implementations of modules:
 
@@ -90,19 +92,21 @@ const unhandled = new libHandler.UnhandledModule(dispatch, {
 server.listenHttp(8080, unhandled, (host) => host == 'localhost');
 ```
 
+### Internal Methods
+Methods prefixed with `_` (e.g. `_attachToRoot`, `_pushTranslation`, `_finishConnection`) are framework-internal and **must not** be called by module implementations. They are used by the server and handler infrastructure to manage connection lifecycle and path translation. Despite being `public` in TypeScript (required for cross-class access within the framework), they are not part of the public API and may change without notice.
+
 ## Core Components
 The `core` workspace provides all server functionality:
 
 | File | Purpose |
 |---|---|
 | `handler.ts` | `ModuleHandler` abstract class, and helper modules: `LambdaModule`, `DispatchModule`, `HostModule`, `UnhandledModule`, `WrapModule` |
-| `client.ts` | `HttpRequest` (response helpers, body parsing, file serving), `HttpUpgrade` and `ClientSocket` (WebSocket) |
+| `client.ts` | `HttpRequest` (response helpers, body receiving, file serving), `HttpUpgrade` and `ClientSocket` (WebSocket), `HttpClient` type union |
 | `request.ts` | HTTP status codes, media types, range parsing, and encoding negotiation (gzip, deflate, brotli, zstd) |
 | `server.ts` | `Server` class managing HTTP/HTTPS listeners with host-header validation |
 | `config.ts` | `CoreConfig` class and global `Config` instance for server name, timeouts, cache settings, common response headers, throughput controls |
 | `cache.ts` | File cache with LRU eviction, immutable file versioning, sync/async read, and streaming |
-| `templates.ts` | Template loading and placeholder expansion |
-| `builder.ts` | Programmatic HTML page construction |
+| `builder.ts` | Programmatic HTML page construction, placeholder expansion, HTML escaping via `HtmlGuard` |
 | `location.ts` | Path sanitization, joining, and sub-directory checks |
 | `log.ts` | Logging with console, file (with rotation), and custom logger support |
 

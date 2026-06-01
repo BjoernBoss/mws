@@ -17,6 +17,7 @@ export const Status = {
 	TemporaryRedirect: { code: 307, msg: 'Temporary Redirect' },
 	PermanentRedirect: { code: 308, msg: 'Permanent Redirect' },
 	BadRequest: { code: 400, msg: 'Bad Request' },
+	Forbidden: { code: 403, msg: 'Forbidden' },
 	NotFound: { code: 404, msg: 'Not Found' },
 	MethodNotAllowed: { code: 405, msg: 'Method Not Allowed' },
 	Conflict: { code: 409, msg: 'Conflict' },

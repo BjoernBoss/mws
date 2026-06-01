@@ -112,7 +112,7 @@ export class ClientBase extends libLog.LogIdentity {
 }
 
 /* look at the state and modify the headers accordingly (only add or remove headers, must not try to alter the response) */
-export type HeaderPatch = (status: libRequest.StatusType, headers: Record<string, string>, error: boolean) => void;
+export type HeaderPatch = (status: libRequest.StatusType, headers: Record<string, string>) => void;
 
 /* look at the page and modify it or the headers accordingly (return true if this was only a light/shallow
 *	build, due to a HEAD request; can be interrupted by returning an alternate response marked as an error) */
@@ -145,8 +145,8 @@ enum ResponseState {
 *		case it will either be sent (if possible) or the connection will be flushed and closed
 *	Not responded to requests will result in [not-found]
 *
-*	All responses, which dont follow the normal execution path, should be marked as errors
-*	Errors can bypass already promised responses, or kill the connection (if a response has already been sent)
+*	A response sent while another is being prepared (acknowledged) will override it and close the connection
+*	A response sent while data is already being streamed (header sent) will break the connection
 *	Responses automatically add Config.responseCacheControl, if no other cache control is specified
 */
 export abstract class IncomingBase extends ClientBase {
@@ -175,7 +175,7 @@ export abstract class IncomingBase extends ClientBase {
 	};
 
 	/* write the given header and content out (no need to update state; body may be null for HEAD responses of unknown size) */
-	protected abstract finalizeBufferHeader(status: libRequest.StatusType, error: boolean, headers: Record<string, string>, content: { media: libRequest.MediaType, body: Buffer | null } | null): void;
+	protected abstract finalizeBufferHeader(status: libRequest.StatusType, headers: Record<string, string>, content: { media: libRequest.MediaType, body: Buffer | null } | null): void;
 
 	/* finish handling the request */
 	protected abstract handleFinishing(): void;
@@ -238,22 +238,20 @@ export abstract class IncomingBase extends ClientBase {
 		request.once('error', lostHandler);
 		request.once('aborted', closedHandler);
 		request.socket.once('timeout', timeoutHandler);
-		request.socket.once('error', () => lostHandler);
-		request.socket.once('close', () => closedHandler);
+		request.socket.once('error', lostHandler);
+		request.socket.once('close', closedHandler);
 
 		/* ensure to remove the events again once the processing has completed */
 		this.baseState.completedPromise.then(() => {
 			request.removeListener('error', lostHandler);
 			request.removeListener('aborted', closedHandler);
 			request.socket.removeListener('timeout', timeoutHandler);
-			request.socket.removeListener('error', () => lostHandler);
-			request.socket.removeListener('close', () => closedHandler);
+			request.socket.removeListener('error', lostHandler);
+			request.socket.removeListener('close', closedHandler);
 		});
 	}
 
-	private constructQuickResponse(status: libRequest.StatusType, logReason: string | null, error: boolean | undefined, headers: Record<string, string> | undefined, content: { media: libRequest.MediaType, body: Buffer } | null): void {
-		if (error == null)
-			error = false;
+	private constructQuickResponse(status: libRequest.StatusType, logReason: string | null, headers: Record<string, string> | undefined, content: { media: libRequest.MediaType, body: Buffer } | null): void {
 		if (headers == null)
 			headers = {};
 		const description = `${this.isHead ? 'HEAD:' : ''}[${status.msg}]${logReason == null ? '' : `: ${logReason}`}`;
@@ -261,34 +259,32 @@ export abstract class IncomingBase extends ClientBase {
 		if (!('Cache-Control' in headers) && libConfig.responseCacheControl != '')
 			headers['Cache-Control'] = libConfig.responseCacheControl;
 
-		/* check if the response can still be sent */
-		if (this.state == ResponseState.none || (error && this.state == ResponseState.acknowledged)) {
-			if (error)
+		/* check if the response can still be sent (acknowledged state can be overridden; the connection
+		*	will be closed afterwards to prevent the client from seeing inconsistent responses) */
+		const override = (this.state == ResponseState.acknowledged);
+		if (this.state == ResponseState.none || override) {
+			if (status.code >= 500)
 				this.error(`Responding with ${description}`);
+			else if (override)
+				this.warning(`Overriding in-progress response with ${description}`);
 			else
 				this.log(`Responding with ${description}`);
 
-			/* check if the connection was already acknowledged for different content, in which case
-			*	it can be marked as broken to notify the original intent that something failed */
-			const closing = (this.state == ResponseState.acknowledged);
-			if (closing)
+			if (override)
 				headers['Connection'] = 'close';
 
 			this.state = ResponseState.completed;
-			this.finalizeBufferHeader(status, error, headers, content);
+			this.finalizeBufferHeader(status, headers, content);
 
-			if (closing)
-				this.markAsBroken('Broken due to error while preparing response', true);
-		}
-		else if (!error) {
-			this.warning(`Request already processed and discarding response ${description}`);
-			if (this.state != ResponseState.completed && this.state != ResponseState.broken)
-				this.respondBadInternalUsage();
+			if (override)
+				this.markAsBroken('Overridden in-progress response', true);
 		}
 		else if (this.state == ResponseState.headerSent)
-			this.markAsBroken(`Broken due to ${description}`, false);
+			this.markAsBroken(`Overlap with committed response ${description}`, false);
+		else if (this.state != ResponseState.broken)
+			this.warning(`Request already completed, discarding response ${description}`);
 		else
-			this.error(`Silently dropping exception for ${description}`);
+			this.trace(`Request broken, discarding response ${description}`);
 	}
 	private failThroughput(): void {
 		if (this.throughput.threshold <= 0 || this.state == ResponseState.broken)
@@ -310,7 +306,7 @@ export abstract class IncomingBase extends ClientBase {
 
 		const closing = (this.state == ResponseState.none || this.state == ResponseState.acknowledged);
 		if (closing)
-			this.respondRequestTimeout(`Throughput below [${this.throughput.threshold}] bytes/sec`, { error: true, headers: { 'Connection': 'close' } });
+			this.respondRequestTimeout(`Throughput below [${this.throughput.threshold}] bytes/sec`, { headers: { 'Connection': 'close' } });
 		this.markAsBroken(`Throughput below [${this.throughput.threshold}] bytes/sec`, closing);
 	}
 	protected updateThroughput(delta: number): void {
@@ -361,6 +357,9 @@ export abstract class IncomingBase extends ClientBase {
 		})();
 
 		this.breakState.breakResolve();
+	}
+	protected badClientUsage(reason: string, close: boolean): void {
+		this.respondInternalError(`Bad Usage: ${reason}`, (close ? { headers: { 'Connection': 'close' } } : undefined));
 	}
 
 	public get headers(): libHttp.IncomingHttpHeaders {
@@ -464,7 +463,7 @@ export abstract class IncomingBase extends ClientBase {
 
 	/* ensure the method is one of the list and otherwise return null and auto-respond with [method-not-allowed]
 	*	if [headExplicit] is false, method will substitute HEAD for GET, framework will consume the remaining body */
-	public checkMethod(methods: string[] | string, options?: { headExplicit?: boolean, error?: boolean, headers?: Record<string, string> }): string | null {
+	public requireMethod(methods: string[] | string, options?: { headExplicit?: boolean, headers?: Record<string, string> }): string | null {
 		if (!Array.isArray(methods))
 			methods = [methods];
 
@@ -493,29 +492,26 @@ export abstract class IncomingBase extends ClientBase {
 		this.headerPatchers.push(cb);
 	}
 
-	/* respond with [internal-error] and a pre-defined html template response (always considered an error, clears any other header fields) */
+	/* respond with [internal-error] and a default text response (always considered an error; reason is logged server-side only) */
 	public respondInternalError(reason: string, options?: { headers?: Record<string, string> }): void {
-		this.constructQuickResponse(libRequest.Status.InternalError, reason, true, options?.headers, {
-			media: libRequest.Media.Text, body: Buffer.from(`An internal server error occurred while processing the request for [${this.url.pathname}]:\n${reason}`, 'utf-8')
+		this.constructQuickResponse(libRequest.Status.InternalError, reason, options?.headers, {
+			media: libRequest.Media.Text, body: Buffer.from(`An internal server error occurred while processing the request for [${this.url.pathname}].`, 'utf-8')
 		});
 	}
 
-	/* respond with [internal-error] and message 'Filesystem operation failed' */
-	public respondFileSystemError(options?: { headers?: Record<string, string> }): void {
-		this.respondInternalError('Filesystem operation failed', options);
-	}
-
-	/* respond with [internal-error] and message 'Internal request handling error' */
-	public respondBadInternalUsage(options?: { headers?: Record<string, string> }): void {
-		this.respondInternalError('Internal request handling error', options);
+	/* respond with [forbidden] and a default text response (reason is logged server-side only) */
+	public respondForbidden(reason: string, options?: { headers?: Record<string, string> }): void {
+		this.constructQuickResponse(libRequest.Status.Forbidden, reason, options?.headers, {
+			media: libRequest.Media.Text, body: Buffer.from(`Access to [${this.url.pathname}] denied.`, 'utf-8')
+		});
 	}
 
 	/* respond with a any response of the given configuration (defaults to media-type: text/unknown/-, status: ok) */
-	public respond(content: string | Buffer | null, options?: { media?: libRequest.MediaType, status?: libRequest.StatusType, error?: boolean, headers?: Record<string, string> }): void {
+	public respond(content: string | Buffer | null, options?: { media?: libRequest.MediaType, status?: libRequest.StatusType, headers?: Record<string, string> }): void {
 		const status = options?.status ?? libRequest.Status.Ok;
 
 		if (content == null)
-			return this.constructQuickResponse(status, `no body`, options?.error, options?.headers, null);
+			return this.constructQuickResponse(status, 'no body', options?.headers, null);
 
 		let media = options?.media ?? libRequest.Media.Text;
 		if (typeof content == 'string')
@@ -523,137 +519,143 @@ export abstract class IncomingBase extends ClientBase {
 		else if (options?.media == null)
 			media = libRequest.Media.Unknown;
 
-		this.constructQuickResponse(status, `[${media.mediaType}] and size [${content.byteLength}]`, options?.error, options?.headers, {
+		this.constructQuickResponse(status, `[${media.mediaType}] and size [${content.byteLength}]`, options?.headers, {
 			media, body: content
 		});
 	}
 
 	/* respond with [ok] and either a message or a default response */
-	public respondOk(options?: { message?: string, error?: boolean, headers?: Record<string, string> }): void {
-		this.constructQuickResponse(libRequest.Status.Ok, options?.message ?? null, options?.error, options?.headers, {
+	public respondOk(options?: { message?: string, headers?: Record<string, string> }): void {
+		this.constructQuickResponse(libRequest.Status.Ok, options?.message ?? null, options?.headers, {
 			media: libRequest.Media.Text, body: Buffer.from(options?.message ?? `${this.method} was successful for [${this.url.pathname}].`, 'utf-8')
 		});
 	}
 
 	/* respond with [created] and either a message or a default response (ensure target is properly URI encoded) */
-	public respondCreated(target: string, options?: { error?: boolean, headers?: Record<string, string> }): void {
+	public respondCreated(target: string, options?: { headers?: Record<string, string> }): void {
 		const header = (options?.headers ?? {});
 		header['Location'] = target;
 
-		this.constructQuickResponse(libRequest.Status.Created, target, options?.error, header, {
+		this.constructQuickResponse(libRequest.Status.Created, target, header, {
 			media: libRequest.Media.Text, body: Buffer.from(`Resource [${this.url.pathname}] successfully created:\n${target}`, 'utf-8')
 		});
 	}
 
-	/* respond with [not-modified] and no body */
-	public respondNotModified(options?: { error?: boolean, headers?: Record<string, string> }): void {
-		this.constructQuickResponse(libRequest.Status.NotModified, null, options?.error, options?.headers, null);
-	}
-
-	/* respond with [not-modified] and a default text response (ensure the etag and/or last-modified is set) */
-	public respondPreconditionFailed(reason: string, options?: { etag?: string, lastModified?: string, error?: boolean, headers?: Record<string, string> }): void {
+	/* respond with [not-modified] and no body (ensure the etag and/or last-modified is set) */
+	public respondNotModified(options?: { etag?: string, lastModified?: string, headers?: Record<string, string> }): void {
 		const header = (options?.headers ?? {});
 		if (options?.etag != null && !('ETag' in header))
 			header['ETag'] = options.etag;
 		if (options?.lastModified != null && !('Last-Modified' in header))
 			header['Last-Modified'] = options.lastModified;
 
-		this.constructQuickResponse(libRequest.Status.PreconditionFailed, reason, options?.error, options?.headers, {
+		this.constructQuickResponse(libRequest.Status.NotModified, null, header, null);
+	}
+
+	/* respond with [precondition-failed] and a default text response (ensure the etag and/or last-modified is set) */
+	public respondPreconditionFailed(reason: string, options?: { etag?: string, lastModified?: string, headers?: Record<string, string> }): void {
+		const header = (options?.headers ?? {});
+		if (options?.etag != null && !('ETag' in header))
+			header['ETag'] = options.etag;
+		if (options?.lastModified != null && !('Last-Modified' in header))
+			header['Last-Modified'] = options.lastModified;
+
+		this.constructQuickResponse(libRequest.Status.PreconditionFailed, reason, options?.headers, {
 			media: libRequest.Media.Text, body: Buffer.from(`Precondition for resource [${this.url.pathname}] failed:\n${reason}`, 'utf-8')
 		});
 	}
 
 	/* respond with [bad-request] and a default text response */
-	public respondBadRequest(reason: string, options?: { error?: boolean, headers?: Record<string, string> }): void {
-		this.constructQuickResponse(libRequest.Status.BadRequest, reason, options?.error, options?.headers, {
+	public respondBadRequest(reason: string, options?: { headers?: Record<string, string> }): void {
+		this.constructQuickResponse(libRequest.Status.BadRequest, reason, options?.headers, {
 			media: libRequest.Media.Text, body: Buffer.from(`Request for [${this.url.pathname}] is perceived as malformed:\n${reason}`, 'utf-8')
 		});
 	}
 
 	/* respond with [range-not-satisfiable] and a default text response */
-	public respondRangeIssue(range: string, size: number, options?: { error?: boolean, headers?: Record<string, string> }): void {
+	public respondRangeIssue(range: string, size: number, options?: { headers?: Record<string, string> }): void {
 		const header = (options?.headers ?? {});
 		header['Content-Range'] = `bytes */${size}`;
 
-		this.constructQuickResponse(libRequest.Status.RangeIssue, `[${range}] cannot be satisfied for size [${size}]`, options?.error, header, {
+		this.constructQuickResponse(libRequest.Status.RangeIssue, `[${range}] cannot be satisfied for size [${size}]`, header, {
 			media: libRequest.Media.Text, body: Buffer.from(`Range [${range}] cannot be satisfied for [${this.url.pathname}] of size ${size}.`, 'utf-8')
 		});
 	}
 
 	/* respond with [conflict] and a default text response */
-	public respondConflict(conflict: string, options?: { error?: boolean, headers?: Record<string, string> }): void {
-		this.constructQuickResponse(libRequest.Status.Conflict, conflict, options?.error, options?.headers, {
+	public respondConflict(conflict: string, options?: { headers?: Record<string, string> }): void {
+		this.constructQuickResponse(libRequest.Status.Conflict, conflict, options?.headers, {
 			media: libRequest.Media.Text, body: Buffer.from(`Conflict for resource [${this.url.pathname}]:\n${conflict}`, 'utf-8')
 		});
 	}
 
 	/* respond with [not-found] and a default text response */
-	public respondNotFound(options?: { error?: boolean, headers?: Record<string, string> }): void {
-		this.constructQuickResponse(libRequest.Status.NotFound, null, options?.error, options?.headers, {
+	public respondNotFound(options?: { headers?: Record<string, string> }): void {
+		this.constructQuickResponse(libRequest.Status.NotFound, null, options?.headers, {
 			media: libRequest.Media.Text, body: Buffer.from(`Resource [${this.url.pathname}] could not be found.`, 'utf-8')
 		});
 	}
 
 	/* respond with [unsupported-media-type] and a default text response */
-	public respondUnsupported(used: string, allowed: string, options?: { error?: boolean, headers?: Record<string, string> }): void {
-		this.constructQuickResponse(libRequest.Status.UnsupportedMediaType, `Allowed was [${allowed}] but [${used}] was used`, options?.error, options?.headers, {
+	public respondUnsupported(used: string, allowed: string, options?: { headers?: Record<string, string> }): void {
+		this.constructQuickResponse(libRequest.Status.UnsupportedMediaType, `Allowed was [${allowed}] but [${used}] was used`, options?.headers, {
 			media: libRequest.Media.Text, body: Buffer.from(`Media type [${used}] not supported for [${this.url.pathname}].\nAllowed: ${allowed}`, 'utf-8')
 		});
 	}
 
 	/* respond with [invalid-method] and a default text response */
-	public respondMethodNotAllowed(method: string, allowed: string, options?: { error?: boolean, headers?: Record<string, string> }): void {
+	public respondMethodNotAllowed(method: string, allowed: string, options?: { headers?: Record<string, string> }): void {
 		const header = (options?.headers ?? {});
 		header['Allow'] = allowed;
 
-		this.constructQuickResponse(libRequest.Status.MethodNotAllowed, `Allowed was [${allowed}] but [${method}] was used`, options?.error, header, {
+		this.constructQuickResponse(libRequest.Status.MethodNotAllowed, `Allowed was [${allowed}] but [${method}] was used`, header, {
 			media: libRequest.Media.Text, body: Buffer.from(`Method ${method} not allowed for [${this.url.pathname}].\nAllowed: ${allowed}`, 'utf-8')
 		});
 	}
 
 	/* respond with [request-timeout] and a default text response */
-	public respondRequestTimeout(reason: string, options?: { error?: boolean, headers?: Record<string, string> }): void {
+	public respondRequestTimeout(reason: string, options?: { headers?: Record<string, string> }): void {
 		const header = (options?.headers ?? {});
 		header['Connection'] = 'close';
 
-		this.constructQuickResponse(libRequest.Status.RequestTimeout, reason, options?.error, header, {
+		this.constructQuickResponse(libRequest.Status.RequestTimeout, reason, header, {
 			media: libRequest.Media.Text, body: Buffer.from(`Request processing of [${this.url.pathname}] timed out:\n${reason}`, 'utf-8')
 		});
 	}
 
 	/* respond with [content-too-large] and a default text response */
-	public respondContentTooLarge(allowed: number, atLeastProvided: number, options?: { error?: boolean, headers?: Record<string, string> }): void {
-		this.constructQuickResponse(libRequest.Status.ContentTooLarge, `[${atLeastProvided}] > [${allowed}]`, options?.error, options?.headers, {
+	public respondContentTooLarge(allowed: number, atLeastProvided: number, options?: { headers?: Record<string, string> }): void {
+		this.constructQuickResponse(libRequest.Status.ContentTooLarge, `[${atLeastProvided}] > [${allowed}]`, options?.headers, {
 			media: libRequest.Media.Text, body: Buffer.from(`Content of at least size ${atLeastProvided} too large for [${this.url.pathname}].\nAt most ${allowed} bytes are allowed.`, 'utf-8')
 		});
 	}
 
 	/* respond with [see-other] to the given target and a default text response (forces method GET; ensure target is properly URI encoded) */
-	public respondSeeOther(target: string, options?: { error?: boolean, headers?: Record<string, string> }): void {
+	public respondSeeOther(target: string, options?: { headers?: Record<string, string> }): void {
 		const header = (options?.headers ?? {});
 		header['Location'] = target;
 
-		this.constructQuickResponse(libRequest.Status.SeeOther, target, options?.error, header, {
+		this.constructQuickResponse(libRequest.Status.SeeOther, target, header, {
 			media: libRequest.Media.Text, body: Buffer.from(`Continue at: ${target}`, 'utf-8')
 		});
 	}
 
 	/* respond with [temporary-redirect] to the given target and a default text response (preserves method; ensure target is properly URI encoded) */
-	public respondTemporaryRedirect(target: string, options?: { error?: boolean, headers?: Record<string, string> }): void {
+	public respondTemporaryRedirect(target: string, options?: { headers?: Record<string, string> }): void {
 		const header = (options?.headers ?? {});
 		header['Location'] = target;
 
-		this.constructQuickResponse(libRequest.Status.TemporaryRedirect, target, options?.error, header, {
+		this.constructQuickResponse(libRequest.Status.TemporaryRedirect, target, header, {
 			media: libRequest.Media.Text, body: Buffer.from(`Resource [${this.url.pathname}] temporarily redirects to:\n${target}`, 'utf-8')
 		});
 	}
 
 	/* respond with [permanent-redirect] to the given target and a default text response (preserves method; ensure target is properly URI encoded)  */
-	public respondPermanentRedirect(target: string, options?: { error?: boolean, headers?: Record<string, string> }): void {
+	public respondPermanentRedirect(target: string, options?: { headers?: Record<string, string> }): void {
 		const header = (options?.headers ?? {});
 		header['Location'] = target;
 
-		this.constructQuickResponse(libRequest.Status.PermanentRedirect, target, options?.error, header, {
+		this.constructQuickResponse(libRequest.Status.PermanentRedirect, target, header, {
 			media: libRequest.Media.Text, body: Buffer.from(`Resource [${this.url.pathname}] permanently redirects to:\n${target}`, 'utf-8')
 		});
 	}
@@ -687,9 +689,9 @@ export class HttpRequest extends IncomingBase {
 		this.receive = ReceiveState.none;
 	}
 
-	protected override finalizeBufferHeader(status: libRequest.StatusType, error: boolean, headers: Record<string, string>, content: { media: libRequest.MediaType, body: Buffer | null } | null): void {
+	protected override finalizeBufferHeader(status: libRequest.StatusType, headers: Record<string, string>, content: { media: libRequest.MediaType, body: Buffer | null } | null): void {
 		if (content == null)
-			this.closeHeader(status, null, null, false, '', headers, error);
+			this.closeHeader(status, null, null, '', headers);
 		else {
 			headers['Vary'] = 'Accept-Encoding';
 
@@ -700,7 +702,7 @@ export class HttpRequest extends IncomingBase {
 					content.body = encoding.encodeBuffer(content.body);
 				headers['Content-Encoding'] = encoding.name;
 			}
-			this.closeHeader(status, content.media, content.body?.byteLength ?? null, false, encoding?.name ?? '', headers, error);
+			this.closeHeader(status, content.media, content.body?.byteLength ?? null, encoding?.name ?? '', headers);
 		}
 
 		/* try to finalize the response (can throw an exception for invalid status or header content) */
@@ -721,12 +723,12 @@ export class HttpRequest extends IncomingBase {
 			*	reset to 'header-sent' to ensure the connection is properly marked as broken */
 			if (this.state == ResponseState.completed)
 				this.state = ResponseState.headerSent;
-			this.respondBadInternalUsage();
+			this.badClientUsage('Receive stream not consumed', false);
 		}
 
 		/* ensure that the response was properly sent */
 		if (this.state != ResponseState.completed && this.state != ResponseState.broken)
-			this.respondBadInternalUsage();
+			this.badClientUsage('Response not completed', false);
 
 		/* check if a definitive end of the connection has been reached */
 		if (this.state == ResponseState.broken || this.request.readableEnded || this.request.destroyed)
@@ -762,14 +764,11 @@ export class HttpRequest extends IncomingBase {
 			this.response.once('close', () => handler());
 		});
 	}
-	private closeHeader(status: libRequest.StatusType, media: libRequest.MediaType | null, contentSize: number | null, updateState: boolean, encoding: string, headers: Record<string, string>, error: boolean): void {
+	private closeHeader(status: libRequest.StatusType, media: libRequest.MediaType | null, contentSize: number | null, encoding: string, headers: Record<string, string>): void {
 		if (media == null)
 			this.trace(`Sending ${this.isHead ? 'HEAD for ' : ''}no content`);
 		else
 			this.trace(`Sending ${this.isHead ? 'HEAD' : 'content'} [${media?.mediaType ?? 'none'}] of size [${contentSize ?? 'unknown'}] ${encoding.length == 0 ? 'not encoded' : `encoded using [${encoding}]`}`);
-
-		if (updateState)
-			this.state = ResponseState.headerSent;
 
 		headers['Date'] = new Date().toUTCString();
 		if (libConfig.serverName != '')
@@ -787,7 +786,7 @@ export class HttpRequest extends IncomingBase {
 
 		/* perform the header post processing (in reverse order to ensure first added is last executed) */
 		for (let i = this.headerPatchers.length - 1; i >= 0; --i) {
-			try { this.headerPatchers[i](status, headers, error); }
+			try { this.headerPatchers[i](status, headers); }
 			catch (err: any) { this.error(`Unhandled exception in header patcher: ${err.message}`); }
 		}
 
@@ -809,7 +808,7 @@ export class HttpRequest extends IncomingBase {
 
 		/* check if the object is ready for receiving */
 		if (this.receive != ReceiveState.none) {
-			this.respondBadInternalUsage();
+			this.badClientUsage('Already receiving data', false);
 			return makeErrorStream('Connection is already being received');
 		}
 		if (this.state == ResponseState.broken)
@@ -825,7 +824,7 @@ export class HttpRequest extends IncomingBase {
 
 				/* check if the connection has been processed or marked as failed */
 				if (this.state == ResponseState.completed)
-					this.respondBadInternalUsage();
+					this.badClientUsage('Response completed during active receive', false);
 				if (this.state == ResponseState.broken)
 					return cb(new Error('Connection broken'));
 
@@ -834,7 +833,7 @@ export class HttpRequest extends IncomingBase {
 				accumulated += chunk.byteLength;
 				if (maxLength == null || accumulated <= maxLength)
 					return cb(null, chunk);
-				this.respondContentTooLarge(maxLength, accumulated, { error: true });
+				this.respondContentTooLarge(maxLength, accumulated);
 				cb(new Error('Request payload is too large'));
 			},
 			destroy: (err, cb) => {
@@ -856,7 +855,7 @@ export class HttpRequest extends IncomingBase {
 
 				if (encoding == null) {
 					output.destroy();
-					this.respondUnsupported(encodings[i], libRequest.SupportedEncodingNames().join(','), { error: true });
+					this.respondUnsupported(encodings[i], libRequest.SupportedEncodingNames().join(','));
 					return makeErrorStream('Unsupported content encoding');
 				}
 
@@ -865,7 +864,7 @@ export class HttpRequest extends IncomingBase {
 				stream = stream.pipe(decoder);
 				decoder.once('error', (err: any) => {
 					if (output.destroyed) return;
-					this.respondBadRequest('Invalid data encoding', { error: true });
+					this.respondBadRequest('Invalid data encoding');
 					output.destroy(err);
 				});
 
@@ -881,7 +880,7 @@ export class HttpRequest extends IncomingBase {
 			/* check if the length is valid and otherwise mark the request as 'consumed' */
 			if (!isFinite(contentSize) || contentSize < 0 || contentSize > maxLength) {
 				output.destroy();
-				this.respondContentTooLarge(maxLength, contentSize, { error: true });
+				this.respondContentTooLarge(maxLength, contentSize);
 				return makeErrorStream('Request payload is too large');
 			}
 		}
@@ -921,7 +920,8 @@ export class HttpRequest extends IncomingBase {
 		resp.headers['Vary'] = 'Accept-Encoding';
 		if (resp.contentEncoding != null) {
 			resp.headers['Content-Encoding'] = resp.contentEncoding;
-			this.closeHeader(resp.status, resp.contentType, fullContentSize, true, `pre-encoded:${resp.contentEncoding}`, resp.headers, false);
+			this.state = ResponseState.headerSent;
+			this.closeHeader(resp.status, resp.contentType, fullContentSize, `pre-encoded:${resp.contentEncoding}`, resp.headers);
 			return this.sendClientWrite(resp, chunk, last, cb);
 		}
 
@@ -931,7 +931,8 @@ export class HttpRequest extends IncomingBase {
 		if (encoding === undefined)
 			encoding = libRequest.NegotiateEncoding(this.headers['accept-encoding'] ?? null, fullContentSize ?? chunk?.byteLength ?? null, resp.contentType);
 		if (encoding == null) {
-			this.closeHeader(resp.status, resp.contentType, fullContentSize, true, '', resp.headers, false);
+			this.state = ResponseState.headerSent;
+			this.closeHeader(resp.status, resp.contentType, fullContentSize, '', resp.headers);
 			return this.sendClientWrite(resp, chunk, last, cb);
 		}
 		resp.headers['Content-Encoding'] = encoding.name;
@@ -959,7 +960,8 @@ export class HttpRequest extends IncomingBase {
 		}
 
 		/* send the final header away and write the content to the stream */
-		this.closeHeader(resp.status, resp.contentType, fullContentSize, true, encoding.name, resp.headers, false);
+		this.state = ResponseState.headerSent;
+		this.closeHeader(resp.status, resp.contentType, fullContentSize, encoding.name, resp.headers);
 		return this.sendClientWrite(resp, chunk, last, cb);
 	}
 	private sendClientWrite(resp: HttpRequestResponse, chunk: Buffer | null, last: boolean, cb: (err: any) => void): void {
@@ -978,8 +980,8 @@ export class HttpRequest extends IncomingBase {
 			this.updateThroughput(chunk.byteLength);
 			resp.totalSent += chunk.byteLength;
 			if (resp.contentSize != null && resp.totalSent > resp.contentSize) {
-				this.respondBadInternalUsage();
-				return cb(new Error('Sending more data than promised'));
+				this.badClientUsage('Sent more data than promised', false);
+				return cb(new Error('Sent more data than promised'));
 			}
 		}
 
@@ -991,8 +993,8 @@ export class HttpRequest extends IncomingBase {
 
 		/* check if all expected data have been provided */
 		if (resp.contentSize != null && resp.totalSent < resp.contentSize) {
-			this.respondBadInternalUsage();
-			return cb(new Error('Responded with too few data'));
+			this.badClientUsage('Sent fewer data than promised', false);
+			return cb(new Error('Sent fewer data than promised'));
 		}
 
 		/* mark the state as completed and sent the last package */
@@ -1030,7 +1032,7 @@ export class HttpRequest extends IncomingBase {
 		if (this.state == ResponseState.broken)
 			return makeErrorStream('Connection broken');
 		if (this.state != ResponseState.none) {
-			this.respondBadInternalUsage();
+			this.badClientUsage('Response on already claimed connection', false);
 			return makeErrorStream('Connection already responded');
 		}
 		this.state = ResponseState.acknowledged;
@@ -1048,10 +1050,10 @@ export class HttpRequest extends IncomingBase {
 					response.writer.destroy();
 
 				/* check if the error originated from the outside and ensure the connection is closed */
-				if (!this.response.destroyed) {
+				if (!this.response.destroyed && this.state != ResponseState.broken) {
 					const closing = (this.state == ResponseState.acknowledged);
 					if (closing)
-						this.respondBadInternalUsage({ headers: { 'Connection': 'close' } });
+						this.badClientUsage('Response closed prematurely', true);
 					this.markAsBroken(`Data transfer failed: ${err.message}`, closing);
 				}
 				return cb(err);
@@ -1100,7 +1102,7 @@ export class HttpRequest extends IncomingBase {
 	}
 
 	/* ensure the media-type is one of the list and otherwise return null and auto-respond with [unsupported-media-type] (defaults to first type, if [noneIsFirst]) */
-	public checkMediaType(types: libRequest.MediaType[] | libRequest.MediaType, options?: { noneIsFirst?: boolean, error?: boolean, headers?: Record<string, string> }): libRequest.MediaType | null {
+	public requireMediaType(types: libRequest.MediaType[] | libRequest.MediaType, options?: { noneIsFirst?: boolean, headers?: Record<string, string> }): libRequest.MediaType | null {
 		if (!Array.isArray(types))
 			types = [types];
 
@@ -1145,7 +1147,7 @@ export class HttpRequest extends IncomingBase {
 		try {
 			return buffer.toString(encoding as BufferEncoding);
 		} catch (err: any) {
-			this.respondBadRequest('Unable to decode content', { error: true });
+			this.respondBadRequest('Unable to decode content');
 			throw err;
 		}
 	}
@@ -1174,7 +1176,7 @@ export class HttpRequest extends IncomingBase {
 			});
 			destination.once('error', (err: any) => {
 				if (!sourceFailed)
-					this.respondFileSystemError();
+					this.respondInternalError(`Failed to write uploaded file: ${err.message}`);
 				fileFailed = true;
 
 				/* destroy the source to clean up the receiving pipeline (will
@@ -1210,7 +1212,7 @@ export class HttpRequest extends IncomingBase {
 	*	automatically adds Config.responseCacheControl, if no other cache control is specified */
 	public respondHtml(page: libBuilder.HtmlPage, options?: { status?: libRequest.StatusType, headers?: Record<string, string>, lightBuild?: boolean }): void {
 		if (this.state != ResponseState.none)
-			return this.respondBadInternalUsage();
+			return this.badClientUsage('HTML response on already claimed connection', false);
 
 		this.state = ResponseState.acknowledged;
 		const status = (options?.status ?? libRequest.Status.Ok);
@@ -1227,8 +1229,7 @@ export class HttpRequest extends IncomingBase {
 				if (this.state != ResponseState.acknowledged)
 					return;
 			} catch (err: any) {
-				this.error(`Unhandled exception in HTML patcher: ${err.message}`);
-				this.respondBadInternalUsage();
+				this.badClientUsage(`Unhandled exception in HTML patcher: ${err.message}`, false);
 				return;
 			}
 		}
@@ -1239,7 +1240,7 @@ export class HttpRequest extends IncomingBase {
 		/* mark first as completed now */
 		this.log(`Responding with HTML content and status [${status.msg}]${lightBuild ? ' as light-build' : ''}`);
 		this.state = ResponseState.completed;
-		this.finalizeBufferHeader(status, false, headers, { media: libRequest.Media.Html, body: content });
+		this.finalizeBufferHeader(status, headers, { media: libRequest.Media.Html, body: content });
 	}
 
 	/* [no-throw but errors] send data with [media type] and [status] and return a writable stream (default status is ok, media is unknown)
@@ -1259,26 +1260,26 @@ export class HttpRequest extends IncomingBase {
 	}
 
 	/* [no-throw] try to respond with the given file, return false, if the file does not exist (range aware, HEAD aware)
-	*	specify [stable] if the cache does not need to validate if the underlying file on disk has been modified
+	*	specify [checkFreshness] to re-validate the file stats on disk before serving from cache
 	*	the media type can be overwritten (defaults to extracting media-type from the file-path)
 	*	the encoding can be configured, if the file is pre-encoded (warning: no checks against accepted encodings performed!)
 	*	status will be [Ok], [partial-content], [not-modified] or according errors
 	*	cache aware and etag/last-modified aware; automatically adds Config.fileCacheControl, if no other cache control is specified */
-	public async tryRespondFile(filePath: string, stable: boolean, options?: { encoded?: string, media?: libRequest.MediaType, headers?: Record<string, string> }): Promise<boolean> {
+	public async tryRespondFile(filePath: string, options?: { encoded?: string, media?: libRequest.MediaType, headers?: Record<string, string>, checkFreshness?: boolean }): Promise<boolean> {
 		if (this.state != ResponseState.none) {
-			this.respondBadInternalUsage();
+			this.badClientUsage('File response on already claimed connection', false);
 			return true;
 		}
 
 		/* read the entry from the cache and check if it has been permanently moved and apply the move */
 		let cached: libCache.Cached | string | null = null;
 		try {
-			cached = libCache.GetImmutable(filePath, stable);
+			cached = libCache.GetImmutable(filePath, options?.checkFreshness ?? false);
 			if (cached == null)
 				return false;
 		}
-		catch (_) {
-			this.respondFileSystemError();
+		catch (err: any) {
+			this.respondInternalError(`Failed to read file: ${err.message}`);
 			return true;
 		}
 		if (typeof cached == 'string') {
@@ -1289,11 +1290,11 @@ export class HttpRequest extends IncomingBase {
 		/* parse the range and ensure that its well formed */
 		const range = libRequest.ParseRangeHeader(this.headers.range ?? null, cached.fileSize());
 		if (range.state == libRequest.RangeState.malformed) {
-			this.respondBadRequest(`Issues while parsing http-header range: [${this.headers.range}]`, { error: true });
+			this.respondBadRequest(`Issues while parsing http-header range: [${this.headers.range}]`);
 			return true;
 		}
 		else if (range.state == libRequest.RangeState.issue) {
-			this.respondRangeIssue(this.headers.range!, cached.fileSize(), { error: true });
+			this.respondRangeIssue(this.headers.range!, cached.fileSize());
 			return true;
 		}
 
@@ -1350,7 +1351,7 @@ export class HttpRequest extends IncomingBase {
 		if (cached.fileSize() == 0) {
 			this.log(`Sending empty content for [${filePath}]`);
 			this.state = ResponseState.completed;
-			this.finalizeBufferHeader(libRequest.Status.Ok, false, headers, { media, body: Buffer.alloc(0) });
+			this.finalizeBufferHeader(libRequest.Status.Ok, headers, { media, body: Buffer.alloc(0) });
 			return true;
 		}
 		if (range.state == libRequest.RangeState.valid)
@@ -1381,7 +1382,7 @@ export class HttpRequest extends IncomingBase {
 			source.pipe(stream);
 			source.once('error', (err: any) => {
 				if (settled) return; settled = true;
-				this.respondFileSystemError();
+				this.respondInternalError(`Failed to stream file: ${err.message}`);
 				stream.destroy(err);
 			});
 			stream.once('error', (err: any) => {
@@ -1446,7 +1447,7 @@ export class HttpUpgrade extends IncomingBase {
 		this.upgrade = UpgradeState.none;
 	}
 
-	protected override finalizeBufferHeader(status: libRequest.StatusType, error: boolean, headers: Record<string, string>, content: { media: libRequest.MediaType, body: Buffer | null } | null): void {
+	protected override finalizeBufferHeader(status: libRequest.StatusType, headers: Record<string, string>, content: { media: libRequest.MediaType, body: Buffer | null } | null): void {
 		if (content != null) {
 			if (content.body != null)
 				headers['Content-Length'] = content.body.byteLength.toString();
@@ -1462,7 +1463,7 @@ export class HttpUpgrade extends IncomingBase {
 
 		/* perform the header post processing (in reverse order to ensure first added is last executed) */
 		for (let i = this.headerPatchers.length - 1; i >= 0; --i) {
-			try { this.headerPatchers[i](status, headers, error); }
+			try { this.headerPatchers[i](status, headers); }
 			catch (err: any) { this.error(`Unhandled exception in header patcher: ${err.message}`); }
 		}
 
@@ -1492,7 +1493,7 @@ export class HttpUpgrade extends IncomingBase {
 	protected override handleFinishing(): void {
 		/* check if the upgrade was not fully awaited */
 		if (this.upgrade == UpgradeState.upgrading)
-			this.respondBadInternalUsage();
+			this.badClientUsage('Upgrade not fully awaited', false);
 
 		/* check if the connection was accepted (only reason to keep it alive,
 		*	as source web-server will not clean this connection up anymore) */
@@ -1502,7 +1503,7 @@ export class HttpUpgrade extends IncomingBase {
 		/* check if the state is incomplete and break the connection but ensure it is closed
 		*	either way (to ensure the connection is definitely closed, if not upgrade) */
 		if (this.state != ResponseState.completed && this.state != ResponseState.broken)
-			this.respondBadInternalUsage();
+			this.badClientUsage('Response not completed', false);
 		if (this.state != ResponseState.broken)
 			this.markAsBroken('Upgrade was not accepted', true);
 	}
@@ -1534,14 +1535,14 @@ export class HttpUpgrade extends IncomingBase {
 	*	automatically responds with a corresponding error and returns null */
 	public async acceptWebSocket(): Promise<ClientSocket | null> {
 		if (this.state != ResponseState.none) {
-			this.respondBadInternalUsage();
+			this.badClientUsage('WebSocket upgrade on already claimed connection', false);
 			return null;
 		}
 
 		/* check if the connection is a valid upgrade request */
 		let connection = libRequest.SplitAndTrimList(this.headers.connection?.toLowerCase() ?? null, ',', false);
 		if (connection.indexOf('upgrade') == -1 || this.headers?.upgrade?.toLowerCase() != 'websocket' || this.request.method != 'GET') {
-			this.respondBadRequest('Endpoint designed for WebSockets', { error: true });
+			this.respondBadRequest('Request is not a valid WebSocket upgrade');
 			return null;
 		}
 
@@ -1648,7 +1649,7 @@ export class ClientSocket extends ClientBase {
 		this.selfIsAlive();
 
 		/* perserve the log tags of the base */
-		base.log(`WebSocket acccepted: [${this.logIdentity}]`);
+		base.log(`WebSocket accepted: [${this.logIdentity}]`);
 		const logTagList = base.logIdentity.indexOf('.');
 		if (logTagList >= 0) {
 			this.logging.tags.push({ value: base.logIdentity.substring(logTagList + 1) });

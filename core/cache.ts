@@ -21,8 +21,7 @@ function ReadStats(path: string): null | [number, number] {
 	} catch (err: any) {
 		if (err.code == 'ENOENT')
 			return null;
-		logger.error(`Filesystem error while checking [${path}]: ${err.message}`);
-		throw new Error('File operation failed');
+		throw new Error(`Filesystem error while checking [${path}]: ${err.message}`);
 	}
 	return null;
 }
@@ -106,7 +105,7 @@ class CacheManager {
 		if (entry == null)
 			return null;
 
-		/* check if the entry can be considered stable and otherwise that the entry is still up-to-date and return it */
+		/* check if the entry is still up-to-date and return it */
 		if (stats == null || (entry.mtime == stats.mtime && entry.data.length == stats.size)) {
 			entry.touched = ++this.nextStamp;
 			return entry;
@@ -237,8 +236,8 @@ class ImmutableManager {
 			logger.error(`Immutable loaded state [${path}] contained [${corrupted}] malformed entires`);
 		return output;
 	}
-	private updateEntry(entry: ImmutableEntry, stable: boolean, firstAssign: boolean): boolean {
-		if (entry.fetched && stable && libConfig.cacheAllowStable)
+	private updateEntry(entry: ImmutableEntry, checkFreshness: boolean, firstAssign: boolean): boolean {
+		if (entry.fetched && !checkFreshness && !libConfig.cacheAlwaysValidate)
 			return true;
 
 		/* fetch the file states of the actual filesystem entry */
@@ -265,29 +264,35 @@ class ImmutableManager {
 		return true;
 	}
 
-	public make(handler: string, path: string, stable: boolean): string {
+	public make(handler: string, path: string, checkFreshness: boolean): string {
 		const identifier = `${handler}:${path}`;
-		if (!libConfig.cacheAllowImmutable)
+		if (!libConfig.cacheImmutableTagging)
 			return path;
 
-		/* check if the entry does not yet exist and the id-tagged path needs to be created */
-		let entry = this.map[identifier] ?? null;
-		if (entry == null) {
-			entry = (this.map[identifier] = { immutable: '', identifier, path, unique: '', fileSystem: null, size: 0, mtime: 0, fetched: false });
-			this.assignId(entry);
-			this.storeState();
+		while (true) {
+			/* check if the entry does not yet exist and the id-tagged path needs to be created */
+			let entry = this.map[identifier] ?? null;
+			if (entry == null) {
+				entry = (this.map[identifier] = { immutable: '', identifier, path, unique: '', fileSystem: null, size: 0, mtime: 0, fetched: false });
+				this.assignId(entry);
+				this.storeState();
+			}
+
+			/* check if the stats can actually be validated or if the entry should just be served (if
+			*	the file does not exist/has been removed, simply restart the loop with to get a fresh id) */
+			else if (entry.fileSystem != null) {
+				try {
+					if (!this.updateEntry(entry, checkFreshness, false))
+						continue;
+				} catch (err: any) {
+					logger.warning(`Failed to validate immutable entry [${identifier}] and assuming unmodified: ${err.message}`);
+				}
+			}
 			return entry.immutable;
 		}
-
-		/* check if the stats can actually be validated or if the entry should just be served */
-		if (entry.fileSystem == null)
-			return entry.immutable;
-		if (!this.updateEntry(entry, stable, false))
-			return path;
-		return entry.immutable;
 	}
-	public get(path: string, stable: boolean): [ImmutableEntry | null, boolean] {
-		if (!libConfig.cacheAllowImmutable)
+	public get(path: string, checkFreshness: boolean): [ImmutableEntry | null, boolean] {
+		if (!libConfig.cacheImmutableTagging)
 			return [null, false];
 
 		/* check if it might be an immutable-tagged path */
@@ -317,7 +322,7 @@ class ImmutableManager {
 			entry.fileSystem = `${base}${name}${extension}`;
 
 		/* update the entry and return the final stats/if the unique-id changed */
-		if (!this.updateEntry(entry, stable, firstAssign))
+		if (!this.updateEntry(entry, checkFreshness, firstAssign))
 			return [null, false];
 		return [entry, entry.unique != unique];
 	}
@@ -509,10 +514,10 @@ export class Cached {
 	}
 }
 
-function ResolveCache(path: string, stable: boolean, checkImmutable: boolean): Cached | string | null {
+function ResolveCache(path: string, checkFreshness: boolean, checkImmutable: boolean): Cached | string | null {
 	/* check if the entry is immutable and fetch its actual path or
 	*	if it has been moved (due to the id having been invalidated) */
-	const [immutable, immutableMoved] = (checkImmutable ? immutableManager.get(path, stable) : [null, false]);
+	const [immutable, immutableMoved] = (checkImmutable ? immutableManager.get(path, checkFreshness) : [null, false]);
 	if (immutable != null) {
 		path = immutable.fileSystem!;
 		if (immutableMoved)
@@ -520,8 +525,8 @@ function ResolveCache(path: string, stable: boolean, checkImmutable: boolean): C
 	}
 	const isImmutable = (immutable != null);
 
-	/* check if the entry is stable and already in the cache, in which case the file doesn't even need to be checked */
-	let entry = ((stable && libConfig.cacheAllowStable) ? cacheManager.find(path, null) : null);
+	/* check if does not need to be checked and the entry is already in the cache, in which case the file doesn't even need to be checked */
+	let entry = ((checkFreshness || libConfig.cacheAlwaysValidate) ? null : cacheManager.find(path, null));
 	if (entry != null && (immutable == null || (immutable.size == entry.data.byteLength && immutable.mtime == entry.mtime)))
 		return new Cached(path, entry.data.byteLength, entry.data, entry.mtime, entry.age, isImmutable);
 
@@ -540,25 +545,25 @@ function ResolveCache(path: string, stable: boolean, checkImmutable: boolean): C
 	return new Cached(path, fileSize, null, mtime, age, isImmutable);
 }
 
-/* [stable]: if cached as stable, dont re-validate the file stats before serving from cache; resolve
+/* [throws] if [checkFreshness] is true, re-validate the file stats on disk before serving from cache; resolve
 *	immutable ids automatically (Cached to interact with cache; null, if it does not exist, string if
 *	the immutable path has been permanently moved to the new path in source space) */
-export function GetImmutable(path: string, stable: boolean): Cached | string | null {
-	return ResolveCache(path, stable, true);
+export function GetImmutable(path: string, checkFreshness: boolean): Cached | string | null {
+	return ResolveCache(path, checkFreshness, true);
 }
 
-/* [stable]: if cached as stable, dont re-validate the file stats before serving from cache;
+/* [throws] if [checkFreshness] is true re-validate the file stats on disk before serving from cache;
 *	no immutable ids are resolved (Cached to interact with cache; null, if it does not exist) */
-export function GetActual(path: string, stable: boolean): Cached | null {
-	return ResolveCache(path, stable, false) as (Cached | null);
+export function GetActual(path: string, checkFreshness: boolean): Cached | null {
+	return ResolveCache(path, checkFreshness, false) as (Cached | null);
 }
 
-/* generate a unique tagged path for the given query path, which will change whenever the underlying file changes; [stable]: if
-*	created as stable, dont re-validate the file stats to detect changes (creates a path to a file, which looks similar to the
-*	source, except that the name includes a unique id, which will be used to identity the given file state; will be removed from the
-*	final target path to be served, to identify the actual source) */
-export function MakeImmutable(handler: string, path: string, stable: boolean): string {
-	return immutableManager.make(handler, path, stable);
+/* generate a unique tagged path for the given query path, which will change whenever the underlying file changes;
+*	[checkFreshness]: if true, re-validate the file stats on disk to detect changes (creates a path to a file, which
+*	looks similar to the source, except that the name includes a unique id, which will be used to identity the given
+*	file state; will be removed from the final target path to be served, to identify the actual source) */
+export function MakeImmutable(handler: string, path: string, checkFreshness: boolean): string {
+	return immutableManager.make(handler, path, checkFreshness);
 }
 
 /* flush all cached data and invalidate immutable stats so they are re-checked on next access */
