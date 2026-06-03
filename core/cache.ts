@@ -545,25 +545,25 @@ function ResolveCache(path: string, checkFreshness: boolean, checkImmutable: boo
 	return new Cached(path, fileSize, null, mtime, age, isImmutable);
 }
 
-/* [throws] if [checkFreshness] is true, re-validate the file stats on disk before serving from cache; resolve
-*	immutable ids automatically (Cached to interact with cache; null, if it does not exist, string if
-*	the immutable path has been permanently moved to the new path in source space) */
-export function GetImmutable(path: string, checkFreshness: boolean): Cached | string | null {
-	return ResolveCache(path, checkFreshness, true);
+/* [throws] if [checkFreshness] is true, re-validate the file stats on disk before serving from cache (defaults
+*	to false); resolve immutable ids automatically (Cached to interact with cache; null, if it does not exist,
+*	string if the immutable path has been permanently moved to the new path in source space) */
+export function GetImmutable(path: string, options?: { checkFreshness?: boolean }): Cached | string | null {
+	return ResolveCache(path, options?.checkFreshness ?? false, true);
 }
 
-/* [throws] if [checkFreshness] is true re-validate the file stats on disk before serving from cache;
-*	no immutable ids are resolved (Cached to interact with cache; null, if it does not exist) */
-export function GetActual(path: string, checkFreshness: boolean): Cached | null {
-	return ResolveCache(path, checkFreshness, false) as (Cached | null);
+/* [throws] if [checkFreshness] is true re-validate the file stats on disk before serving from cache (defaults
+*	to false); no immutable ids are resolved (Cached to interact with cache; null, if it does not exist) */
+export function GetActual(path: string, options?: { checkFreshness?: boolean }): Cached | null {
+	return ResolveCache(path, options?.checkFreshness ?? false, false) as (Cached | null);
 }
 
 /* generate a unique tagged path for the given query path, which will change whenever the underlying file changes;
-*	[checkFreshness]: if true, re-validate the file stats on disk to detect changes (creates a path to a file, which
-*	looks similar to the source, except that the name includes a unique id, which will be used to identity the given
-*	file state; will be removed from the final target path to be served, to identify the actual source) */
-export function MakeImmutable(handler: string, path: string, checkFreshness: boolean): string {
-	return immutableManager.make(handler, path, checkFreshness);
+*	[checkFreshness]: if true, re-validate the file stats on disk to detect changes (defaults to false); creates
+*	a path to a file, which looks similar to the source, except that the name includes a unique id, which will be used
+*	to identity the given file state (will be removed from the final target path to be served, to identify the actual source) */
+export function MakeImmutable(handler: string, path: string, options?: { checkFreshness?: boolean }): string {
+	return immutableManager.make(handler, path, options?.checkFreshness ?? false);
 }
 
 /* flush all cached data and invalidate immutable stats so they are re-checked on next access */

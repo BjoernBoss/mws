@@ -69,8 +69,13 @@ export class ClientBase extends libLog.LogIdentity {
 	}
 
 	/* check if the path relative to the current module is a sub path of the given test base path */
-	public isSubPath(base: string): boolean {
-		return libLocation.IsSubDirectory(base, this.relativePath);
+	public isSubPathOf(base: string): boolean {
+		return libLocation.IsSubPath(base, this.relativePath);
+	}
+
+	/* check if the path relative to the current module is inside of the given test base path */
+	public isInsideOf(base: string): boolean {
+		return libLocation.IsInside(base, this.relativePath);
 	}
 
 	/* create a path relative from the current module into the clients traversed server space */
@@ -85,7 +90,7 @@ export class ClientBase extends libLog.LogIdentity {
 			for (const [from, to] of Object.entries(this.pathTranslation[i])) {
 				if (to == null)
 					nullCheck = true;
-				else if (libLocation.IsSubDirectory(to, output) && (match == null || match[1]!.length < to.length))
+				else if (libLocation.IsSubPath(to, output) && (match == null || match[1]!.length < to.length))
 					match = [from, to];
 			}
 			if (match != null)
@@ -96,7 +101,7 @@ export class ClientBase extends libLog.LogIdentity {
 			if (nullCheck) {
 				match = null;
 				for (const [from, to] of Object.entries(this.pathTranslation[i])) {
-					if (libLocation.IsSubDirectory(from, output) && (match == null || match[0].length < from.length))
+					if (libLocation.IsSubPath(from, output) && (match == null || match[0].length < from.length))
 						match = [from, to];
 				}
 			}
@@ -114,9 +119,8 @@ export class ClientBase extends libLog.LogIdentity {
 /* look at the state and modify the headers accordingly (only add or remove headers, must not try to alter the response) */
 export type HeaderPatch = (status: libRequest.StatusType, headers: Record<string, string>) => void;
 
-/* look at the page and modify it or the headers accordingly (return true if this was only a light/shallow
-*	build, due to a HEAD request; can be interrupted by returning an alternate response marked as an error) */
-export type HtmlPatch = (page: libBuilder.HtmlPage, status: libRequest.StatusType, headers: Record<string, string>, shouldLightBuild: boolean) => boolean;
+/* look at the page and modify it or the headers accordingly (can be interrupted by returning an alternate response) */
+export type HtmlPatch = (page: libBuilder.HtmlPage, status: libRequest.StatusType, headers: Record<string, string>) => Promise<void>;
 
 enum ReceiveState {
 	none,
@@ -151,7 +155,7 @@ enum ResponseState {
 */
 export abstract class IncomingBase extends ClientBase {
 	protected request: libHttp.IncomingMessage;
-	protected headerPatchers: HeaderPatch[];
+	protected headerPatcher: HeaderPatch[];
 	protected htmlPatcher: HtmlPatch[];
 	protected state: ResponseState;
 	protected breakState: {
@@ -175,7 +179,7 @@ export abstract class IncomingBase extends ClientBase {
 	};
 
 	/* write the given header and content out (no need to update state; body may be null for HEAD responses of unknown size) */
-	protected abstract finalizeBufferHeader(status: libRequest.StatusType, headers: Record<string, string>, content: { media: libRequest.MediaType, body: Buffer | null } | null): void;
+	protected abstract sendContentResponse(status: libRequest.StatusType, headers: Record<string, string>, content: { media: libRequest.MediaType, body: Buffer | null } | null): void;
 
 	/* finish handling the request */
 	protected abstract handleFinishing(): void;
@@ -187,7 +191,7 @@ export abstract class IncomingBase extends ClientBase {
 		super(new libUrl.URL(`${protocol}//${host == '' ? '_' : host}${request.url}`), kind);
 		this.request = request;
 		this.state = ResponseState.none;
-		this.headerPatchers = [];
+		this.headerPatcher = [];
 		this.htmlPatcher = [];
 
 		let breakResolve: any = null;
@@ -273,8 +277,7 @@ export abstract class IncomingBase extends ClientBase {
 			if (override)
 				headers['Connection'] = 'close';
 
-			this.state = ResponseState.completed;
-			this.finalizeBufferHeader(status, headers, content);
+			this.sendContentResponse(status, headers, content);
 
 			if (override)
 				this.markAsBroken('Overridden in-progress response', true);
@@ -331,7 +334,6 @@ export abstract class IncomingBase extends ClientBase {
 				this.handleKilling(false);
 			return;
 		}
-
 		this.baseState.respondedResolve();
 
 		/* setup the promise beforehand to ensure the promise body does not recursively
@@ -360,6 +362,30 @@ export abstract class IncomingBase extends ClientBase {
 	}
 	protected badClientUsage(reason: string, close: boolean): void {
 		this.respondInternalError(`Bad Usage: ${reason}`, (close ? { headers: { 'Connection': 'close' } } : undefined));
+	}
+	protected finalizeResponseHeader(status: libRequest.StatusType, headers: Record<string, string>, media: libRequest.MediaType | null, length: number | null): void {
+		this.state = ResponseState.headerSent;
+
+		/* add the remaining common header types */
+		headers['Date'] = new Date().toUTCString();
+		if (libConfig.serverName != '')
+			headers['Server'] = libConfig.serverName;
+		for (const [key, value] of Object.entries(libConfig.commonHeaders)) {
+			if (!(key in headers))
+				headers[key] = value;
+		}
+		if (media != null)
+			headers['Content-Type'] = libRequest.BuildMediaTypeIdentifier(media);
+		if (length != null)
+			headers['Content-Length'] = length.toString();
+
+		/* perform the header post processing (in reverse order to ensure first added is last executed) */
+		for (let i = this.headerPatcher.length - 1; i >= 0; --i) {
+			try { this.headerPatcher[i](status, headers); }
+			catch (err: any) { this.error(`Unhandled exception in header patcher: ${err.message}`); }
+		}
+
+		this.baseState.respondedResolve();
 	}
 
 	public get headers(): libHttp.IncomingHttpHeaders {
@@ -434,7 +460,7 @@ export abstract class IncomingBase extends ClientBase {
 				sanitized[from] = to;
 
 				/* check if the mapping can be applied to the current path */
-				if (this.isSubPath(from) && (match == null || match[0].length < from.length))
+				if (this.isSubPathOf(from) && (match == null || match[0].length < from.length))
 					match = [from, to];
 			}
 			if (match == null || match[1] == null)
@@ -442,7 +468,7 @@ export abstract class IncomingBase extends ClientBase {
 		}
 
 		const current = new ClientContext(this.logIdentity, this.relativePath, this.pathTranslation.length,
-			this.throughput.busyCheck.length, this.headerPatchers.length, this.htmlPatcher.length);
+			this.throughput.busyCheck.length, this.headerPatcher.length, this.htmlPatcher.length);
 
 		/* setup the new path, all path translations, and the tagged logging identity */
 		this.relativePath = libLocation.Rebase(match[0], match[1]!, this.relativePath);
@@ -457,7 +483,7 @@ export abstract class IncomingBase extends ClientBase {
 		this.relativePath = snapshot.path;
 		this.pathTranslation.splice(snapshot.translationCount);
 		this.throughput.busyCheck.splice(snapshot.busyCount);
-		this.headerPatchers.splice(snapshot.headerPatchCount);
+		this.headerPatcher.splice(snapshot.headerPatchCount);
 		this.htmlPatcher.splice(snapshot.htmlPatchCount);
 	}
 
@@ -489,7 +515,7 @@ export abstract class IncomingBase extends ClientBase {
 	/* register a callback to be invoked once the response is sent, to adjust the
 	*	headers to be sent (will only be considered within this handler context) */
 	public patchHeaders(cb: HeaderPatch): void {
-		this.headerPatchers.push(cb);
+		this.headerPatcher.push(cb);
 	}
 
 	/* respond with [internal-error] and a default text response (always considered an error; reason is logged server-side only) */
@@ -689,7 +715,7 @@ export class HttpRequest extends IncomingBase {
 		this.receive = ReceiveState.none;
 	}
 
-	protected override finalizeBufferHeader(status: libRequest.StatusType, headers: Record<string, string>, content: { media: libRequest.MediaType, body: Buffer | null } | null): void {
+	protected override sendContentResponse(status: libRequest.StatusType, headers: Record<string, string>, content: { media: libRequest.MediaType, body: Buffer | null } | null): void {
 		if (content == null)
 			this.closeHeader(status, null, null, '', headers);
 		else {
@@ -704,6 +730,7 @@ export class HttpRequest extends IncomingBase {
 			}
 			this.closeHeader(status, content.media, content.body?.byteLength ?? null, encoding?.name ?? '', headers);
 		}
+		this.state = ResponseState.completed;
 
 		/* try to finalize the response (can throw an exception for invalid status or header content) */
 		try {
@@ -770,25 +797,11 @@ export class HttpRequest extends IncomingBase {
 		else
 			this.trace(`Sending ${this.isHead ? 'HEAD' : 'content'} [${media?.mediaType ?? 'none'}] of size [${contentSize ?? 'unknown'}] ${encoding.length == 0 ? 'not encoded' : `encoded using [${encoding}]`}`);
 
-		headers['Date'] = new Date().toUTCString();
-		if (libConfig.serverName != '')
-			headers['Server'] = libConfig.serverName;
-		for (const [key, value] of Object.entries(libConfig.commonHeaders))
-			headers[key] = value;
 		if (!('Accept-Ranges' in headers))
 			headers['Accept-Ranges'] = 'none';
 		if (!('Vary' in headers))
 			headers['Vary'] = 'Accept-Encoding';
-		if (contentSize != null)
-			headers['Content-Length'] = contentSize.toString();
-		if (media != null)
-			headers['Content-Type'] = libRequest.BuildMediaTypeIdentifier(media);
-
-		/* perform the header post processing (in reverse order to ensure first added is last executed) */
-		for (let i = this.headerPatchers.length - 1; i >= 0; --i) {
-			try { this.headerPatchers[i](status, headers); }
-			catch (err: any) { this.error(`Unhandled exception in header patcher: ${err.message}`); }
-		}
+		this.finalizeResponseHeader(status, headers, media, contentSize);
 
 		/* setup the response status and headers (guard against invalid header values from patchers or modules) */
 		this.response.statusCode = status.code;
@@ -800,8 +813,6 @@ export class HttpRequest extends IncomingBase {
 				this.error(`Failed to set header [${key}]: Bad header value`);
 			}
 		}
-
-		this.baseState.respondedResolve();
 	}
 	private receiveClientData(maxLength: number | null): libStream.Readable {
 		const makeErrorStream = (msg: string) => new libStream.Readable({ read() { this.destroy(new Error(msg)) } });
@@ -920,7 +931,6 @@ export class HttpRequest extends IncomingBase {
 		resp.headers['Vary'] = 'Accept-Encoding';
 		if (resp.contentEncoding != null) {
 			resp.headers['Content-Encoding'] = resp.contentEncoding;
-			this.state = ResponseState.headerSent;
 			this.closeHeader(resp.status, resp.contentType, fullContentSize, `pre-encoded:${resp.contentEncoding}`, resp.headers);
 			return this.sendClientWrite(resp, chunk, last, cb);
 		}
@@ -931,7 +941,6 @@ export class HttpRequest extends IncomingBase {
 		if (encoding === undefined)
 			encoding = libRequest.NegotiateEncoding(this.headers['accept-encoding'] ?? null, fullContentSize ?? chunk?.byteLength ?? null, resp.contentType);
 		if (encoding == null) {
-			this.state = ResponseState.headerSent;
 			this.closeHeader(resp.status, resp.contentType, fullContentSize, '', resp.headers);
 			return this.sendClientWrite(resp, chunk, last, cb);
 		}
@@ -959,8 +968,6 @@ export class HttpRequest extends IncomingBase {
 			});
 		}
 
-		/* send the final header away and write the content to the stream */
-		this.state = ResponseState.headerSent;
 		this.closeHeader(resp.status, resp.contentType, fullContentSize, encoding.name, resp.headers);
 		return this.sendClientWrite(resp, chunk, last, cb);
 	}
@@ -1207,10 +1214,9 @@ export class HttpRequest extends IncomingBase {
 	}
 
 	/* respond with html, can be built on by parent modules, sent once the client has been fully processed
-	*	(default status is ok, for HEAD builds, light build indicates that the actual content was not produced, but rather only
-	*	some shallow content; if at least one build is shallow, the HEAD response will only contain an estimage of the size)
+	*	(default status is ok; for HEAD builds, no actual content will be constructed or estimated in size)
 	*	automatically adds Config.responseCacheControl, if no other cache control is specified */
-	public respondHtml(page: libBuilder.HtmlPage, options?: { status?: libRequest.StatusType, headers?: Record<string, string>, lightBuild?: boolean }): void {
+	public async respondHtml(page: libBuilder.HtmlPage, options?: { status?: libRequest.StatusType, headers?: Record<string, string> }): Promise<void> {
 		if (this.state != ResponseState.none)
 			return this.badClientUsage('HTML response on already claimed connection', false);
 
@@ -1222,10 +1228,9 @@ export class HttpRequest extends IncomingBase {
 
 		/* invoke all registered html patcher to let them modify the content (in reverse order to ensure
 		*	first added is last executed, and check if one of them produced an alternate response) */
-		let lightBuild = (options?.lightBuild ?? false);
 		for (let i = this.htmlPatcher.length - 1; i >= 0; --i) {
 			try {
-				lightBuild = this.htmlPatcher[i](page, status, headers, this.isHead) || lightBuild;
+				await this.htmlPatcher[i](page, status, headers);
 				if (this.state != ResponseState.acknowledged)
 					return;
 			} catch (err: any) {
@@ -1233,14 +1238,11 @@ export class HttpRequest extends IncomingBase {
 				return;
 			}
 		}
-		if (!this.isHead)
-			lightBuild = false;
-		const content = (lightBuild ? null : Buffer.from(page.finalize(), 'utf-8'));
+		const content = (this.isHead ? null : Buffer.from(page.finalize(), 'utf-8'));
 
 		/* mark first as completed now */
-		this.log(`Responding with HTML content and status [${status.msg}]${lightBuild ? ' as light-build' : ''}`);
-		this.state = ResponseState.completed;
-		this.finalizeBufferHeader(status, headers, { media: libRequest.Media.Html, body: content });
+		this.log(`Responding with HTML content and status [${status.msg}]${this.isHead ? ' as light-build' : ''}`);
+		this.sendContentResponse(status, headers, { media: libRequest.Media.Html, body: content });
 	}
 
 	/* [no-throw but errors] send data with [media type] and [status] and return a writable stream (default status is ok, media is unknown)
@@ -1274,7 +1276,7 @@ export class HttpRequest extends IncomingBase {
 		/* read the entry from the cache and check if it has been permanently moved and apply the move */
 		let cached: libCache.Cached | string | null = null;
 		try {
-			cached = libCache.GetImmutable(filePath, options?.checkFreshness ?? false);
+			cached = libCache.GetImmutable(filePath, { checkFreshness: options?.checkFreshness });
 			if (cached == null)
 				return false;
 		}
@@ -1350,8 +1352,7 @@ export class HttpRequest extends IncomingBase {
 		/* check if the file is empty (can only happen for unused ranges, which would otherwise have issues) */
 		if (cached.fileSize() == 0) {
 			this.log(`Sending empty content for [${filePath}]`);
-			this.state = ResponseState.completed;
-			this.finalizeBufferHeader(libRequest.Status.Ok, headers, { media, body: Buffer.alloc(0) });
+			this.sendContentResponse(libRequest.Status.Ok, headers, { media, body: Buffer.alloc(0) });
 			return true;
 		}
 		if (range.state == libRequest.RangeState.valid)
@@ -1447,25 +1448,11 @@ export class HttpUpgrade extends IncomingBase {
 		this.upgrade = UpgradeState.none;
 	}
 
-	protected override finalizeBufferHeader(status: libRequest.StatusType, headers: Record<string, string>, content: { media: libRequest.MediaType, body: Buffer | null } | null): void {
-		if (content != null) {
-			if (content.body != null)
-				headers['Content-Length'] = content.body.byteLength.toString();
-			headers['Content-Type'] = libRequest.BuildMediaTypeIdentifier(content.media);
-		}
-		headers['Date'] = new Date().toUTCString();
-		if (libConfig.serverName != '')
-			headers['Server'] = libConfig.serverName;
-		for (const [key, value] of Object.entries(libConfig.commonHeaders))
-			headers[key] = value;
+	protected override sendContentResponse(status: libRequest.StatusType, headers: Record<string, string>, content: { media: libRequest.MediaType, body: Buffer | null } | null): void {
+		/* prepare the initial header response */
 		headers['Accept-Ranges'] = 'none';
 		headers['Connection'] = 'close';
-
-		/* perform the header post processing (in reverse order to ensure first added is last executed) */
-		for (let i = this.headerPatchers.length - 1; i >= 0; --i) {
-			try { this.headerPatchers[i](status, headers); }
-			catch (err: any) { this.error(`Unhandled exception in header patcher: ${err.message}`); }
-		}
+		this.finalizeResponseHeader(status, headers, content?.media ?? null, content?.body?.byteLength ?? null)
 
 		/* construct the entire header content and send it away (sanitize values to prevent response splitting) */
 		if (status.msg.match(BAD_HTTP_STRING_REGEX))
@@ -1481,14 +1468,13 @@ export class HttpUpgrade extends IncomingBase {
 		headerText += '\r\n';
 		this.socket.write(headerText, 'utf-8');
 
+		this.state = ResponseState.completed;
 		if (!this.isHead && content?.body != null) {
 			this.updateThroughput(content.body.length);
 			this.socket.end(content.body);
 		}
 		else
 			this.socket.end();
-
-		this.baseState.respondedResolve();
 	}
 	protected override handleFinishing(): void {
 		/* check if the upgrade was not fully awaited */

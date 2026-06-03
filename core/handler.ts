@@ -432,26 +432,29 @@ export abstract class ModuleHandler extends libLog.LogIdentity {
 	}
 }
 
-export type AttachLambda = (self: ModuleHandler) => Promise<void>;
-export type DetachLambda = () => Promise<void>;
-export type RequestLambda = (client: libClient.HttpRequest, params?: object) => Promise<void>;
-export type UpgradeLambda = (client: libClient.HttpUpgrade, params?: object) => Promise<void>;
-export type HandleLambda = (client: libClient.HttpClient, params?: object) => Promise<void>;
-export type StopLambda = () => Promise<void>;
-export type RequestWrap = (client: libClient.HttpRequest, handle: (params?: object, translate?: PathTranslation) => Promise<boolean>, params?: object) => Promise<void>;
-export type UpgradeWrap = (client: libClient.HttpUpgrade, handle: (params?: object, translate?: PathTranslation) => Promise<boolean>, params?: object) => Promise<void>;
-export type HandleWrap = (client: libClient.HttpClient, handle: (params?: object, translate?: PathTranslation) => Promise<boolean>, params?: object) => Promise<void>;
+export type AttachLambda = (this: ModuleHandler) => Promise<void>;
+export type DetachLambda = (this: ModuleHandler) => Promise<void>;
+export type RequestLambda = (this: ModuleHandler, client: libClient.HttpRequest, params?: object) => Promise<void>;
+export type UpgradeLambda = (this: ModuleHandler, client: libClient.HttpUpgrade, params?: object) => Promise<void>;
+export type HandleLambda = (this: ModuleHandler, client: libClient.HttpClient, params?: object) => Promise<void>;
+export type StopLambda = (this: ModuleHandler) => Promise<void>;
+export type RequestWrap = (this: ModuleHandler, client: libClient.HttpRequest, handle: (params?: object, translate?: PathTranslation) => Promise<boolean>, params?: object) => Promise<void>;
+export type UpgradeWrap = (this: ModuleHandler, client: libClient.HttpUpgrade, handle: (params?: object, translate?: PathTranslation) => Promise<boolean>, params?: object) => Promise<void>;
+export type HandleWrap = (this: ModuleHandler, client: libClient.HttpClient, handle: (params?: object, translate?: PathTranslation) => Promise<boolean>, params?: object) => Promise<void>;
 
 /*
 *	Simple module handler implementation, which dispatches requests to different children based on the request path (longest match).
 *	Stops itself once all children have been stopped.
 *	Forwards parameter to dispatched child.
 */
+export function Dispatch(map: Record<string, ModuleHandler>, options?: { name?: string }): DispatchModule {
+	return new DispatchModule(map, options);
+}
 export class DispatchModule extends ModuleHandler {
 	private mapping: Record<string, AttachedModule>;
 
-	constructor(map: Record<string, ModuleHandler>) {
-		super('dispatch');
+	constructor(map: Record<string, ModuleHandler>, options?: { name?: string }) {
+		super(options?.name ?? 'dispatch');
 		this.mapping = {};
 
 		for (const [key, handler] of Object.entries(map)) {
@@ -476,7 +479,7 @@ export class DispatchModule extends ModuleHandler {
 
 		/* iterate over the mappings and look for the corresponding best handler */
 		for (const path in this.mapping) {
-			if (!libLocation.IsSubDirectory(path, client.path))
+			if (!client.isSubPathOf(path))
 				continue;
 			if (bestMatch == null || bestMatch.length < path.length)
 				bestMatch = path;
@@ -496,11 +499,14 @@ export class DispatchModule extends ModuleHandler {
 *	Stops itself once all children have been stopped.
 *	Forwards parameter to dispatched child.
 */
+export function Host(map: Record<string, ModuleHandler>, options?: { name?: string }): HostModule {
+	return new HostModule(map, options);
+}
 export class HostModule extends ModuleHandler {
 	private mapping: Record<string, AttachedModule>;
 
-	constructor(map: Record<string, ModuleHandler>) {
-		super('host');
+	constructor(map: Record<string, ModuleHandler>, options?: { name?: string }) {
+		super(options?.name ?? 'host');
 
 		this.mapping = {};
 		for (const [host, handler] of Object.entries(map)) {
@@ -555,6 +561,9 @@ export class HostModule extends ModuleHandler {
 *	Forwards parameter to lambda functions.
 *	Requests/Upgrades can be handled by the combined uniform handler, or be implemented explicitly.
 */
+export function Lambda(options?: { attach?: AttachLambda, detach?: DetachLambda, handle?: HandleLambda, request?: RequestLambda, upgrade?: UpgradeLambda, stop?: StopLambda, name?: string }): LambdaModule {
+	return new LambdaModule(options);
+}
 export class LambdaModule extends ModuleHandler {
 	private attachLambda?: AttachLambda;
 	private detachLambda?: DetachLambda;
@@ -574,7 +583,7 @@ export class LambdaModule extends ModuleHandler {
 
 	protected override async handleAttached(): Promise<void> {
 		if (this.attachLambda != null)
-			await this.attachLambda(this);
+			await this.attachLambda();
 	}
 	protected override async handleRequest(client: libClient.HttpRequest, params?: object): Promise<void> {
 		if (this.requestLambda != null)
@@ -599,13 +608,16 @@ export class LambdaModule extends ModuleHandler {
 *	Stops itself once all children have been stopped. Forwards parameter to wrapper and handler.
 *	Requests/Upgrades can be handled by the combined uniform handler, or be implemented explicitly.
 */
+export function Unhandled(handler: ModuleHandler, options?: { handle?: HandleLambda, request?: RequestLambda, upgrade?: UpgradeLambda, name?: string }): UnhandledModule {
+	return new UnhandledModule(handler, options);
+}
 export class UnhandledModule extends ModuleHandler {
 	private handler: AttachedModule;
 	private requestLambda?: RequestLambda;
 	private upgradeLambda?: UpgradeLambda;
 
-	constructor(handler: ModuleHandler, options?: { handle?: HandleLambda, request?: RequestLambda, upgrade?: UpgradeLambda }) {
-		super('unhandler');
+	constructor(handler: ModuleHandler, options?: { handle?: HandleLambda, request?: RequestLambda, upgrade?: UpgradeLambda, name?: string }) {
+		super(options?.name ?? 'unhandler');
 
 		this.handler = this.linkChild(handler, () => this.stop());
 		this.requestLambda = options?.request ?? options?.handle;
@@ -629,13 +641,16 @@ export class UnhandledModule extends ModuleHandler {
 *	Stops itself once all children have been stopped. Forwards parameter to wrapper or handler.
 *	Requests/Upgrades can be handled by the combined uniform handler, or be implemented explicitly.
 */
+export function Wrap(handler: ModuleHandler, options?: { handle?: HandleWrap, request?: RequestWrap, upgrade?: UpgradeWrap, name?: string }): WrapModule {
+	return new WrapModule(handler, options);
+}
 export class WrapModule extends ModuleHandler {
 	private handler: AttachedModule;
 	private requestWrap?: RequestWrap;
 	private upgradeWrap?: UpgradeWrap;
 
-	constructor(handler: ModuleHandler, options?: { handle?: HandleWrap, request?: RequestWrap, upgrade?: UpgradeWrap }) {
-		super('wrap');
+	constructor(handler: ModuleHandler, options?: { handle?: HandleWrap, request?: RequestWrap, upgrade?: UpgradeWrap, name?: string }) {
+		super(options?.name ?? 'wrap');
 
 		this.handler = this.linkChild(handler, () => this.stop());
 		this.requestWrap = options?.request ?? options?.handle;
@@ -653,5 +668,32 @@ export class WrapModule extends ModuleHandler {
 			await this.upgradeWrap(client, (p?: object, t?: PathTranslation) => this.handler.handle(client, p, t), params);
 		else
 			await this.handler.handle(client, params);
+	}
+}
+
+/*
+*	Simple module interface implementation, which forwards any requests to a lambda.
+*	Stops itself once all children have been stopped. Forwards parameter to wrapper or handler.
+*	Requests/Upgrades can be handled by the combined uniform handler, or be implemented explicitly.
+*/
+export function Bind(handler: ModuleHandler, options?: { params?: object, translation?: PathTranslation, name?: string }): BindModule {
+	return new BindModule(handler, options);
+}
+export class BindModule extends ModuleHandler {
+	private handler: AttachedModule;
+	private params?: object;
+	private translation?: PathTranslation;
+
+	constructor(handler: ModuleHandler, options?: { params?: object, translation?: PathTranslation, name?: string }) {
+		super(options?.name ?? 'bind');
+
+		this.handler = this.linkChild(handler, () => this.stop());
+		this.params = options?.params;
+		if (options?.translation != null)
+			this.translation = { ...options?.translation };
+	}
+
+	protected override async handleClient(client: libClient.HttpClient, params?: object): Promise<void> {
+		await this.handler.handle(client, this.params ?? params, this.translation);
 	}
 }

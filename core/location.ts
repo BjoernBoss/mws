@@ -69,12 +69,21 @@ export function JoinSanitized(a: string, b: string): string {
 	return Sanitize(bSlash ? a + b : `${a}/${b}`, false);
 }
 
-/* check if the sanitized path is a true sub-path of the sanitized base path (same root is also a sub-directory) */
-export function IsSubDirectory(base: string, path: string): boolean {
+/* check if the sanitized path is a sub-path of or equal to the sanitized base path */
+export function IsSubPath(base: string, path: string): boolean {
 	if (base.length > path.length)
 		return false;
 	if (base.length == path.length)
 		return (base == path);
+	if (!path.startsWith(base))
+		return false;
+	return (path[base.length] == '/' || base.endsWith('/'));
+}
+
+/* check if the sanitized path is a true sub-path of the sanitized base path */
+export function IsInside(base: string, path: string): boolean {
+	if (base.length >= path.length)
+		return false;
 	if (!path.startsWith(base))
 		return false;
 	return (path[base.length] == '/' || base.endsWith('/'));
