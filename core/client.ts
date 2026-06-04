@@ -795,7 +795,7 @@ export class HttpRequest extends IncomingBase {
 		if (media == null)
 			this.trace(`Sending ${this.isHead ? 'HEAD for ' : ''}no content`);
 		else
-			this.trace(`Sending ${this.isHead ? 'HEAD' : 'content'} [${media?.mediaType ?? 'none'}] of size [${contentSize ?? 'unknown'}] ${encoding.length == 0 ? 'not encoded' : `encoded using [${encoding}]`}`);
+			this.trace(`Sending ${this.isHead ? 'HEAD' : 'content'} [${media?.mediaType ?? 'none'}] of size [${contentSize ?? 'unknown'}] ${encoding.length == 0 ? 'not dynamically encoded' : `dynamically encoded using [${encoding}]`}`);
 
 		if (!('Accept-Ranges' in headers))
 			headers['Accept-Ranges'] = 'none';
@@ -927,19 +927,16 @@ export class HttpRequest extends IncomingBase {
 		if (fullContentSize == null && last && !this.isHead)
 			fullContentSize = (chunk?.byteLength ?? 0);
 
-		/* check if the content comes pre-encoded */
-		resp.headers['Vary'] = 'Accept-Encoding';
-		if (resp.contentEncoding != null) {
-			resp.headers['Content-Encoding'] = resp.contentEncoding;
-			this.closeHeader(resp.status, resp.contentType, fullContentSize, `pre-encoded:${resp.contentEncoding}`, resp.headers);
+		/* check if the content should be dynamically encoded */
+		if (!resp.dynamicEncode) {
+			this.closeHeader(resp.status, resp.contentType, fullContentSize, '', resp.headers);
 			return this.sendClientWrite(resp, chunk, last, cb);
 		}
+		resp.headers['Vary'] = 'Accept-Encoding';
 
 		/* lookup the dynamic encoder (for [head] and no explicit content, default to size being valid to just
 		*	assume an encoding - can always be disabled in the real run, should the data be too short) */
-		let encoding = resp.dynamicEncoder;
-		if (encoding === undefined)
-			encoding = libRequest.NegotiateEncoding(this.headers['accept-encoding'] ?? null, fullContentSize ?? chunk?.byteLength ?? null, resp.contentType);
+		let encoding = libRequest.NegotiateEncoding(this.headers['accept-encoding'] ?? null, fullContentSize ?? chunk?.byteLength ?? null, resp.contentType);
 		if (encoding == null) {
 			this.closeHeader(resp.status, resp.contentType, fullContentSize, '', resp.headers);
 			return this.sendClientWrite(resp, chunk, last, cb);
@@ -963,7 +960,6 @@ export class HttpRequest extends IncomingBase {
 
 			resp.writer.once('error', (err: any) => {
 				if (resp.destroyed) return;
-				this.respondInternalError('Data encoding error encountered');
 				resp.destroy(err);
 			});
 		}
@@ -1032,7 +1028,7 @@ export class HttpRequest extends IncomingBase {
 			return cb(new Error('Connection broken'));
 		}
 	}
-	private sendClientData(status: libRequest.StatusType, media: libRequest.MediaType, headers: Record<string, string>, options: { encoded?: string, encoder?: libRequest.EncodingType | null, contentSize?: number }): libStream.Writable {
+	private sendClientData(status: libRequest.StatusType, media: libRequest.MediaType, headers: Record<string, string>, options: { dynamicEncode?: boolean, contentSize?: number }): libStream.Writable {
 		const makeErrorStream = (msg: string) => new libStream.Writable({ write(_0, _1, cb) { cb(new Error(msg)) }, final(cb) { cb(new Error(msg)) } });
 
 		/* check if the object is already responded */
@@ -1045,7 +1041,7 @@ export class HttpRequest extends IncomingBase {
 		this.state = ResponseState.acknowledged;
 
 		const response = new HttpRequestResponse(this.response, status, headers,
-			options.contentSize ?? null, media, options.encoded ?? null, options.encoder,
+			options.contentSize ?? null, media, options?.dynamicEncode ?? false,
 			(chunk: Buffer | null, cb: (err: any) => void) => this.sendClientHandle(response, chunk, cb),
 			(err: any, cb: (err: any) => void) => {
 				if (this.state == ResponseState.completed)
@@ -1056,7 +1052,7 @@ export class HttpRequest extends IncomingBase {
 				if (response.writer !== this.response)
 					response.writer.destroy();
 
-				/* check if the error originated from the outside and ensure the connection is closed */
+				/* check if the error originated from the data sender and ensure the connection is closed */
 				if (!this.response.destroyed && this.state != ResponseState.broken) {
 					const closing = (this.state == ResponseState.acknowledged);
 					if (closing)
@@ -1245,29 +1241,28 @@ export class HttpRequest extends IncomingBase {
 		this.sendContentResponse(status, headers, { media: libRequest.Media.Html, body: content });
 	}
 
-	/* [no-throw but errors] send data with [media type] and [status] and return a writable stream (default status is ok, media is unknown)
-	*	if a content size is provided, stream expects exactly this amount of bytes
-	*	the encoding can be configured, if the data is pre-encoded (warning: no checks against accepted encodings performed!)
-	*	if not pre-encoded, the encoder can be selected manually/disabled (warning: no checks against accepted encodings performed!)
-	*	otherwise, if encoder is undefined, it will be negotiated based on the content
-	*	for a HEAD request, no encoding will be negotiated, no lengths verified, and the written data will just be drained (can immediately be ended using '.end()')
-	*	automatically adds Config.responseCacheControl, if no other cache control is specified */
-	public respondData(options?: { status?: libRequest.StatusType, media?: libRequest.MediaType, encoded?: string, contentSize?: number, encoder?: libRequest.EncodingType | null, headers?: Record<string, string> }): libStream.Writable {
+	/* [no-throw but errors] send data with [media type] and [status] and return a writable stream (default status is ok, media is unknown);
+	*	if a content size is provided, stream expects exactly this amount of bytes; if [dynamicEncode], the encoder will be dynamically negotiated
+	*	based on the content; for a HEAD request, no encoding will be negotiated, no lengths verified, and the written data will just be drained
+	*	(can immediately be ended using '.end()'); automatically adds Config.responseCacheControl, if no other cache control is specified */
+	public respondData(options?: { status?: libRequest.StatusType, media?: libRequest.MediaType, contentSize?: number, dynamicEncode?: boolean, headers?: Record<string, string> }): libStream.Writable {
 		const status: libRequest.StatusType = options?.status ?? libRequest.Status.Ok;
-		this.log(`Responding with data and status [${status.msg}]`);
 		const headers = (options?.headers ?? {});
 		if (!('Cache-Control' in headers) && libConfig.responseCacheControl != '')
 			headers['Cache-Control'] = libConfig.responseCacheControl;
-		return this.sendClientData(status, options?.media ?? libRequest.Media.Unknown, headers, { encoded: options?.encoded, contentSize: options?.contentSize, encoder: options?.encoder });
+
+		this.log(`Responding with data and status [${status.msg}]`);
+		return this.sendClientData(status, options?.media ?? libRequest.Media.Unknown, headers, { contentSize: options?.contentSize, dynamicEncode: options?.dynamicEncode });
 	}
 
-	/* [no-throw] try to respond with the given file, return false, if the file does not exist (range aware, HEAD aware)
-	*	specify [checkFreshness] to re-validate the file stats on disk before serving from cache
-	*	the media type can be overwritten (defaults to extracting media-type from the file-path)
-	*	the encoding can be configured, if the file is pre-encoded (warning: no checks against accepted encodings performed!)
-	*	status will be [Ok], [partial-content], [not-modified] or according errors
-	*	cache aware and etag/last-modified aware; automatically adds Config.fileCacheControl, if no other cache control is specified */
+	/* try to respond with the given file, return false, if the file does not exist (range aware, HEAD aware); specify [checkFreshness] to
+	*	re-validate the file stats on disk before serving from cache; the media type can be overwritten (defaults to extracting media-type
+	*	from the file-path); [encoding] describes the encoding of a pre-encoded file (warning: no checks against accepted encodings
+	*	performed!); status will be [Ok], [partial-content], [not-modified] or according errors cache aware and etag/last-modified aware;
+	*	automatically adds Config.fileCacheControl, if no other cache control is specified */
 	public async tryRespondFile(filePath: string, options?: { encoded?: string, media?: libRequest.MediaType, headers?: Record<string, string>, checkFreshness?: boolean }): Promise<boolean> {
+		if (options == null)
+			options = {};
 		if (this.state != ResponseState.none) {
 			this.badClientUsage('File response on already claimed connection', false);
 			return true;
@@ -1276,7 +1271,7 @@ export class HttpRequest extends IncomingBase {
 		/* read the entry from the cache and check if it has been permanently moved and apply the move */
 		let cached: libCache.Cached | string | null = null;
 		try {
-			cached = libCache.GetImmutable(filePath, { checkFreshness: options?.checkFreshness });
+			cached = libCache.GetImmutable(filePath, { checkFreshness: options.checkFreshness });
 			if (cached == null)
 				return false;
 		}
@@ -1300,13 +1295,21 @@ export class HttpRequest extends IncomingBase {
 			return true;
 		}
 
-		/* mark byte-ranges to be supported in principle and add the caching properties (use a weak
-		*	ETag when dynamic compression may produce different byte representations; dont use a dynamic
-		*	encoder on range requests, as random access cannot be provided in that case) */
-		const headers = (options?.headers ?? {}), media = (options?.media ?? libRequest.LookupMediaTypeFromFile(filePath));
-		const dynamicEncoder = ((options?.encoded != null || range.state != libRequest.RangeState.noRange) ? null : libRequest.NegotiateEncoding(this.headers['accept-encoding'] ?? null, cached.fileSize(), media));
-		const etag = (dynamicEncoder != null ? `W/"${cached.uniqueId()}"` : `"${cached.uniqueId()}"`);
+		/* update the cached reader to read the encoded content (no encoding if already encoded or a range request has occurred,
+		*	as the encoded byte representation might not be stable; this is also the reason why the e-tag must be forced to weak,
+		*	as the content cannot be guaranteed to be stabled across cache flushes or reloads) */
+		const media = (options.media ?? libRequest.LookupMediaTypeFromFile(filePath));
+		let dynamicEncoder = ((options.encoded != null || range.state != libRequest.RangeState.noRange) ? null : libRequest.NegotiateEncoding(this.headers['accept-encoding'] ?? null, cached.fileSize(), media));
+		let reader: null | libCache.EncodedCache = null;
+		if (dynamicEncoder != null)
+			reader = cached.encoded(dynamicEncoder);
+
+		/* mark byte-ranges to be supported in principle and add the caching properties */
+		const headers = (options.headers ?? {});
+		const etag = `${(dynamicEncoder != null) ? 'W/' : ''}"${cached.uniqueId()}"`;
 		headers['Vary'] = 'Accept-Encoding';
+		if (dynamicEncoder != null || options.encoded != null)
+			headers['Content-Encoding'] = dynamicEncoder?.name ?? options.encoded!;
 		headers['Accept-Ranges'] = 'bytes';
 		headers['Last-Modified'] = cached.lastModified();
 		headers['ETag'] = etag;
@@ -1350,7 +1353,7 @@ export class HttpRequest extends IncomingBase {
 		}
 
 		/* check if the file is empty (can only happen for unused ranges, which would otherwise have issues) */
-		if (cached.fileSize() == 0) {
+		if ((reader == null ? cached.fileSize() : reader.contentSize()) === 0) {
 			this.log(`Sending empty content for [${filePath}]`);
 			this.sendContentResponse(libRequest.Status.Ok, headers, { media, body: Buffer.alloc(0) });
 			return true;
@@ -1358,14 +1361,19 @@ export class HttpRequest extends IncomingBase {
 		if (range.state == libRequest.RangeState.valid)
 			headers['Content-Range'] = `bytes ${range.first}-${range.last}/${cached.fileSize()}`;
 
-		/* create the writer stream (doesn't throw, but errors, enforce the selected encoder) */
+		/* create the writer stream (doesn't throw, but errors; enforce the selected encoder) */
 		const status = (range.state == libRequest.RangeState.noRange ? libRequest.Status.Ok : libRequest.Status.PartialContent);
 		let stream = this.sendClientData(status, media, headers, {
-			encoded: options?.encoded,
-			encoder: dynamicEncoder,
-			contentSize: range.last - range.first + 1
+			dynamicEncode: false, contentSize: (reader == null ? range.last - range.first + 1 : reader.contentSize() ?? undefined)
 		});
-		this.log(`Sending ${this.isHead ? 'HEAD' : 'content'} [${range.first} - ${range.last}/${cached.fileSize()}] from [${filePath}]`);
+
+		let logMsg = `Responding with file-${this.isHead ? 'HEAD' : 'content'} [${range.first} - ${range.last}/${cached.fileSize()}] from [${filePath}]`;
+		if (reader != null) {
+			logMsg += ` encoded using [${dynamicEncoder!.name}]`;
+			if (reader.contentSize() != null)
+				logMsg += ` from cache as [${reader.contentSize()}] bytes`;
+		}
+		this.log(logMsg);
 
 		/* check if this is a head request, in which case the stream can just immediately be closed again, to prevent
 		*	the file from consuming resources (null-catch any errors to ensure they are not propagated out of the connection) */
@@ -1375,7 +1383,7 @@ export class HttpRequest extends IncomingBase {
 		}
 
 		/* create the source stream of the file to read from (will not throw any exceptions) */
-		let source: libStream.Readable = cached.stream({ start: range.first, end: range.last });
+		let source: libStream.Readable = (reader != null ? reader.stream() : cached.stream({ start: range.first, end: range.last }));
 
 		/* pipe the components together and await completion */
 		let settled = false;
@@ -1405,27 +1413,25 @@ class HttpRequestResponse extends libStream.Writable {
 	public status: libRequest.StatusType;
 	public headers: Record<string, string>;
 	public contentSize: number | null;
-	public dynamicEncoder: libRequest.EncodingType | null | undefined;
+	public dynamicEncode: boolean;
 	public contentType: libRequest.MediaType;
-	public contentEncoding: string | null;
 
-	constructor(response: libStream.Writable, status: libRequest.StatusType, headers: Record<string, string>, contentSize: number | null, contentType: libRequest.MediaType,
-		contentEncoding: string | null, dynamicEncoder: libRequest.EncodingType | null | undefined, handleData: (chunk: Buffer | null, cb: (err: any) => void) => void, destroy: (err: any, cb: (err: any) => void) => void
+	constructor(writer: libStream.Writable, status: libRequest.StatusType, headers: Record<string, string>, contentSize: number | null, contentType: libRequest.MediaType,
+		dynamicEncode: boolean, handleData: (chunk: Buffer | null, cb: (err: any) => void) => void, destroy: (err: any, cb: (err: any) => void) => void
 	) {
 		super({
 			write: (chunk, _, cb) => handleData(chunk, cb),
 			final: (cb) => handleData(null, cb),
 			destroy: (err, cb) => destroy(err, cb)
 		});
-		this.writer = response;
+		this.writer = writer;
 		this.totalSent = 0;
 		this.cache = null;
 		this.status = status;
 		this.headers = headers;
 		this.contentSize = contentSize;
-		this.dynamicEncoder = dynamicEncoder;
+		this.dynamicEncode = dynamicEncode;
 		this.contentType = contentType;
-		this.contentEncoding = contentEncoding;
 	}
 }
 
@@ -1517,7 +1523,7 @@ export class HttpUpgrade extends IncomingBase {
 		});
 	}
 
-	/* [no-throw] marks the object as having been handled and returns a web socket or
+	/* marks the object as having been handled and returns a web socket or
 	*	automatically responds with a corresponding error and returns null */
 	public async acceptWebSocket(): Promise<ClientSocket | null> {
 		if (this.state != ResponseState.none) {

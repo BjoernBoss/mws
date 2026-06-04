@@ -3,6 +3,7 @@
 import { Config as libConfig } from "./config.js";
 import * as libLog from "./log.js";
 import * as libLocation from "./location.js";
+import * as libRequest from "./request.js";
 import * as libFs from "fs";
 import * as libStream from "stream";
 import * as libCrypto from "crypto";
@@ -28,6 +29,7 @@ function ReadStats(path: string): null | [number, number] {
 
 interface CacheEntry {
 	data: Buffer;
+	encodings: Record<string, Buffer>;
 	mtime: number;
 	age: number;
 	touched: number;
@@ -51,18 +53,15 @@ class CacheManager {
 
 		/* check if the cache needs to be reduced */
 		if (this.allocated > this.totalCapacity)
-			this.reduce(this.allocated - this.totalCapacity);
+			this.reduce(this.totalCapacity);
 	}
-	private reduce(capacity: number): void {
+	private reduce(maximum: number): void {
 		/* create the list of all cached objects sorted by the touched count */
 		const paths: string[] = Object.keys(this.map).sort((a, b) => this.map[a].touched - this.map[b].touched);
 
-		/* drop the first half of the entries or more, if the size has not yet been freed (valid as callers
-		*	guarantee capacity <= allocated, thus the capacity will reach <= 0 before i overflows the paths) */
-		for (let i = 0; i < (paths.length + 1) / 2 || capacity > 0; ++i) {
-			capacity -= this.map[paths[i]].data.byteLength;
+		/* drop the first half of the entries or more, if the size has not yet been freed */
+		for (let i = 0; i < (paths.length + 1) / 2 || this.allocated > maximum; ++i)
 			this.drop(paths[i]);
-		}
 	}
 
 	public add(path: string, data: Buffer, mtime: number, age: number): void {
@@ -79,18 +78,44 @@ class CacheManager {
 
 		/* check if space needs to be reserved */
 		if (this.allocated + data.byteLength > this.totalCapacity)
-			this.reduce(this.allocated + data.byteLength - this.totalCapacity);
+			this.reduce(this.totalCapacity - data.byteLength);
 
 		/* add the entry to the cache */
-		logger.log(`Added [${path}] to the cache`);
+		logger.log(`Added [${path}] to the cache (Size: ${data.byteLength})`);
 		this.allocated += data.byteLength;
-		this.map[path] = { data, mtime, touched: ++this.nextStamp, age };
+		this.map[path] = { data, encodings: {}, mtime, touched: ++this.nextStamp, age };
+	}
+	public addEncoding(path: string, data: Buffer, age: number, name: string): void {
+		if (!this.cacheable(data.byteLength))
+			return;
+
+		/* check if the entry is still in the cache */
+		if (!(path in this.map) || this.map[path].age != age)
+			return;
+
+		/* check if the encoding already exists */
+		if (name in this.map[path].encodings)
+			return;
+
+		/* check if space needs to be reserved */
+		if (this.allocated + data.byteLength > this.totalCapacity)
+			this.reduce(this.totalCapacity - data.byteLength);
+
+		/* add the entry to the cache */
+		logger.log(`Added encoding [${name}] of [${path}] to the cache (Size: ${data.byteLength})`);
+		this.allocated += data.byteLength;
+		this.map[path].encodings[name] = data;
 	}
 	public drop(path: string): void {
 		if (!(path in this.map))
 			return;
-		logger.log(`Dropped [${path}] from the cache`);
-		this.allocated -= this.map[path].data.byteLength;
+		logger.log(`Dropped [${path}] and encodings from the cache`);
+
+		/* remove all cached encodings and the entry itself */
+		const entry = this.map[path];
+		for (const key in entry.encodings)
+			this.allocated -= entry.encodings[key].byteLength;
+		this.allocated -= entry.data.byteLength;
 		delete this.map[path];
 	}
 	public cacheable(size: number): boolean {
@@ -377,27 +402,60 @@ class ImmutableManager {
 const cacheManager: CacheManager = new CacheManager();
 const immutableManager: ImmutableManager = new ImmutableManager();
 
-export class Cached {
+class AlreadyCached implements Cached {
+	private path: string;
+	private entry: CacheEntry;
+	private immutable: boolean;
+
+	public constructor(path: string, entry: CacheEntry, immutable: boolean) {
+		this.path = path;
+		this.entry = entry;
+		this.immutable = immutable;
+	}
+
+	public isImmutable(): boolean {
+		return this.immutable;
+	}
+	public filePath(): string {
+		return this.path;
+	}
+	public fileSize(): number {
+		return this.entry.data.byteLength;
+	}
+	public lastModified(): string {
+		return new Date(this.entry.mtime).toUTCString();
+	}
+	public uniqueId(): string {
+		return `${this.entry.mtime}-${this.entry.data.byteLength}`;
+	}
+	public stream(options?: { start?: number, end?: number }): libStream.Readable {
+		return libStream.Readable.from(this.entry.data.subarray(options?.start, (options?.end == null ? undefined : options.end + 1)));
+	}
+	public async readAsync(): Promise<Buffer> {
+		return this.entry.data;
+	}
+	public readSync(): Buffer {
+		return this.entry.data;
+	}
+	public encoded(encoding: libRequest.EncodingType): EncodedCache {
+		return EncodedCache(this, this.entry, encoding, this.entry.age);
+	}
+}
+class NotCached implements Cached {
 	private path: string;
 	private size: number;
-	private data: Buffer | null;
 	private mtime: number;
 	private immutable: boolean;
 	private age: number;
 
-	public constructor(path: string, size: number, data: Buffer | null, mtime: number, age: number, immutable: boolean) {
+	public constructor(path: string, size: number, mtime: number, age: number, immutable: boolean) {
 		this.path = path;
 		this.size = size;
-		this.data = data;
 		this.mtime = mtime;
 		this.immutable = immutable;
 		this.age = age;
 	}
 	private makeStream(options?: { start?: number, end?: number }): libStream.Readable {
-		/* check if the data have already been cached */
-		if (this.data != null)
-			return libStream.Readable.from(this.data.subarray(options?.start, (options?.end == null ? undefined : options.end + 1)));
-
 		/* create the data stream */
 		let stream: libFs.ReadStream | null = null;
 		try {
@@ -412,7 +470,7 @@ export class Cached {
 
 		/* create the transformer stream to cache the data */
 		let buffers: Buffer[] = [], settled: boolean = false, totalLength: number = 0;
-		const transformer = new libStream.Transform({
+		const sniffer = new libStream.Transform({
 			transform: (chunk, _, cb) => {
 				if (settled) return cb(new Error('Reading already completed'));
 				totalLength += chunk.byteLength;
@@ -421,99 +479,165 @@ export class Cached {
 			},
 			final: (cb) => {
 				if (settled) return cb(new Error('Reading already completed'));
-				if (totalLength == this.size && cacheManager.cacheable(this.size))
+				if (totalLength == this.size)
 					cacheManager.add(this.path, Buffer.concat(buffers), this.mtime, this.age);
 				cb(null);
 			}
 		});
 
 		/* setup the file exceptions to be propagated to the stream */
-		let wrapped = stream.pipe(transformer);
+		stream.pipe(sniffer);
 		stream.once('error', (err: any) => {
 			if (settled) return; settled = true;
-			wrapped.destroy(err);
+			sniffer.destroy(err);
 		});
-		wrapped.once('error', (err: any) => {
+		sniffer.once('error', (err: any) => {
 			if (settled) return; settled = true;
 			stream.destroy(err);
 		});
-		return wrapped;
+		return sniffer;
 	}
 
-	/* check if this is an immutable file entry */
 	public isImmutable(): boolean {
 		return this.immutable;
 	}
-
-	/* size in bytes of the file */
+	public filePath(): string {
+		return this.path;
+	}
 	public fileSize(): number {
 		return this.size;
 	}
-
-	/* fetch the last modified time formatted for the network */
 	public lastModified(): string {
 		return new Date(this.mtime).toUTCString();
 	}
-
-	/* fetch the unique-id to identify this version of the cached file (constructed,
-	*	just like the cache identifies them as equivalent: size+last-modified) */
 	public uniqueId(): string {
 		return `${this.mtime}-${this.size}`;
 	}
-
-	/* [no-throw] object must not be used anymore after reading or streaming from it */
 	public stream(options?: { start?: number, end?: number }): libStream.Readable {
 		return this.makeStream(options);
 	}
-
-	/* [throws] object must not be used anymore after reading or streaming from it */
+	public async readAsync(): Promise<Buffer> {
+		return StreamToAsync(this.makeStream());
+	}
 	public readSync(): Buffer {
-		/* just let reading exceptions propagate out */
-		if (this.data != null)
-			return this.data;
-		this.data = libFs.readFileSync(this.path);
+		/* just let the errors propagate out */
+		const data = libFs.readFileSync(this.path);
 
 		/* check if the file-size changed mid operation */
-		if (this.data.byteLength != this.size)
-			throw new Error(`File size changed mid operation: [${this.data.byteLength}] != [${this.size}]`);
+		if (data.byteLength != this.size)
+			throw new Error(`File size changed mid operation: [${data.byteLength}] != [${this.size}]`);
 
 		/* add the read buffer back to the cache (using the fetched data from before
 		*	reading the file - to detect a file-change since before reading the file) */
-		cacheManager.add(this.path, this.data, this.mtime, this.age);
-		return this.data;
+		cacheManager.add(this.path, data, this.mtime, this.age);
+		return data;
 	}
-
-	/* [throws] object must not be used anymore after reading or streaming from it */
-	public async readAsync(): Promise<Buffer> {
-		if (this.data != null)
-			return this.data;
-
-		return new Promise((resolve, reject) => {
-			const stream: libStream.Readable = this.makeStream();
-			const buffers: Buffer[] = [];
-			let settled: boolean = false;
-
-			/* register the handler to collect the data and stream them out */
-			stream.on("data", (chunk) => {
-				if (!settled)
-					buffers.push(chunk);
-			});
-			stream.once("error", (err) => {
-				if (!settled) {
-					settled = true;
-					reject(err);
-				}
-			});
-			stream.once("end", () => {
-				if (!settled) {
-					settled = true;
-					resolve(Buffer.concat(buffers));
-				}
-			});
-		});
+	public encoded(encoding: libRequest.EncodingType): EncodedCache {
+		return EncodedCache(this, null, encoding, this.age);
 	}
 }
 
+function StreamToAsync(stream: libStream.Readable): Promise<Buffer> {
+	return new Promise((resolve, reject) => {
+		const buffers: Buffer[] = [];
+		let settled: boolean = false;
+
+		/* register the handler to collect the data and stream them out */
+		stream.on("data", (chunk) => {
+			if (!settled)
+				buffers.push(chunk);
+		});
+		stream.once("error", (err) => {
+			if (!settled) {
+				settled = true;
+				reject(err);
+			}
+		});
+		stream.once("end", () => {
+			if (!settled) {
+				settled = true;
+				resolve(Buffer.concat(buffers));
+			}
+		});
+	});
+}
+function EncodedCache(reader: Cached, entry: CacheEntry | null, encoding: libRequest.EncodingType, age: number): EncodedCache {
+	/* check if the given encoding has already been cached */
+	if (entry != null && encoding.name in entry.encodings) {
+		const encoded = entry.encodings[encoding.name];
+		return {
+			contentSize: () => encoded.byteLength,
+			stream: () => libStream.Readable.from(encoded),
+			readSync: () => encoded,
+			readAsync: async () => encoded
+		};
+	}
+
+	const makeStream: () => libStream.Readable = () => {
+		let settled: boolean = false;
+
+		/* create the encoded pipe */
+		const stream = reader.stream();
+		const encoder = encoding.makeEncode();
+		let sniffer: libStream.Transform | null = null;
+		stream.pipe(encoder);
+
+		/* setup the stream exceptions to be propgated through */
+		stream.once('error', (err: any) => {
+			if (settled) return; settled = true;
+			encoder.destroy(err);
+			if (sniffer != null)
+				sniffer.destroy(err);
+		});
+		encoder.once('error', (err: any) => {
+			if (settled) return; settled = true;
+			stream.destroy(err);
+			if (sniffer != null)
+				sniffer.destroy(err);
+		});
+
+		/* check if there is even a chance for the data to be cached */
+		if (!cacheManager.cacheable(reader.fileSize()))
+			return encoder;
+
+		/* setup the sniffer stream to collect the cached data */
+		let buffers: Buffer[] = [];
+		sniffer = new libStream.Transform({
+			transform: (chunk, _, cb) => {
+				if (settled) return cb(new Error('Reading already completed'));
+				buffers.push(chunk);
+				cb(null, chunk);
+			},
+			final: (cb) => {
+				if (settled) return cb(new Error('Reading already completed'));
+				cacheManager.addEncoding(reader.filePath(), Buffer.concat(buffers), age, encoding.name);
+				cb(null);
+			}
+		});
+
+		/* setup the stream exceptions to be propgated through */
+		sniffer.once('error', (err: any) => {
+			if (settled) return; settled = true;
+			stream.destroy(err);
+			encoder.destroy(err);
+		});
+		return encoder.pipe(sniffer);
+	};
+
+	/* wrap the original reader around the encoder (let errors propagate out) */
+	return {
+		contentSize: () => null,
+		stream: () => makeStream(),
+		readAsync: () => StreamToAsync(makeStream()),
+		readSync: () => {
+			/* will be returned as buffer anyways, so might as well
+			*	try to write it back to the cache, no matter if its too large */
+			const data = encoding.encodeBuffer(reader.readSync());
+			cacheManager.addEncoding(reader.filePath(), data, age, encoding.name);
+			return data;
+		}
+	};
+}
 function ResolveCache(path: string, checkFreshness: boolean, checkImmutable: boolean): Cached | string | null {
 	/* check if the entry is immutable and fetch its actual path or
 	*	if it has been moved (due to the id having been invalidated) */
@@ -528,7 +652,7 @@ function ResolveCache(path: string, checkFreshness: boolean, checkImmutable: boo
 	/* check if does not need to be checked and the entry is already in the cache, in which case the file doesn't even need to be checked */
 	let entry = ((checkFreshness || libConfig.cacheAlwaysValidate) ? null : cacheManager.find(path, null));
 	if (entry != null && (immutable == null || (immutable.size == entry.data.byteLength && immutable.mtime == entry.mtime)))
-		return new Cached(path, entry.data.byteLength, entry.data, entry.mtime, entry.age, isImmutable);
+		return new AlreadyCached(path, entry, isImmutable);
 
 	/* check if the file exists and read its file-size and mtime (not necessary
 	*	for immutable entries, as their stats are already up-to-date) */
@@ -536,13 +660,12 @@ function ResolveCache(path: string, checkFreshness: boolean, checkImmutable: boo
 	if (stats == null)
 		return null;
 	const [fileSize, mtime] = stats;
-	const age = Date.now();
 
 	/* check if the path exists in the validated cache and otherwise return the uncached entry */
 	entry = cacheManager.find(path, { mtime, size: fileSize });
 	if (entry != null)
-		return new Cached(path, fileSize, entry.data, mtime, age, isImmutable);
-	return new Cached(path, fileSize, null, mtime, age, isImmutable);
+		return new AlreadyCached(path, entry, isImmutable);
+	return new NotCached(path, fileSize, mtime, Date.now(), isImmutable);
 }
 
 /* [throws] if [checkFreshness] is true, re-validate the file stats on disk before serving from cache (defaults
@@ -577,4 +700,48 @@ export function FlushCache(): void {
 *	(will be read upon configuring; if not configured, ids will be lost after a server restart) */
 export async function ConfigureWriteBack(path: string | null): Promise<void> {
 	await immutableManager.setWriteBack(path ?? '');
+}
+
+export interface Cached {
+	/* check if this is an immutable file entry */
+	isImmutable(): boolean;
+
+	/* path of the file */
+	filePath(): string;
+
+	/* size in bytes of the file */
+	fileSize(): number;
+
+	/* fetch the last modified time formatted for the network */
+	lastModified(): string;
+
+	/* fetch the unique-id to identify this version of the cached file (constructed,
+	*	just like the cache identifies them as equivalent: size+last-modified) */
+	uniqueId(): string;
+
+	/* [no-throw but errors] object or encoded entry must not be used anymore after reading or streaming from it */
+	stream(options?: { start?: number, end?: number }): libStream.Readable;
+
+	/* [throws] object or encoded entry must not be used anymore after reading or streaming from it */
+	readAsync(): Promise<Buffer>;
+
+	/* [throws] object or encoded entry must not be used anymore after reading or streaming from it */
+	readSync(): Buffer;
+
+	/* create an encoded version of this cached entry */
+	encoded(encoding: libRequest.EncodingType): EncodedCache;
+}
+
+export interface EncodedCache {
+	/* size in bytes of the encoding (null if not yet determined) */
+	contentSize(): number | null;
+
+	/* [no-throw but errors] object or encoded entry must not be used anymore after reading or streaming from it */
+	stream(): libStream.Readable;
+
+	/* [throws] object or encoded entry must not be used anymore after reading or streaming from it */
+	readAsync(): Promise<Buffer>;
+
+	/* [throws] object or encoded entry must not be used anymore after reading or streaming from it */
+	readSync(): Buffer;
 }

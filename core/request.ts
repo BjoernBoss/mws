@@ -208,7 +208,7 @@ export function BuildMediaTypeIdentifier(media: MediaType): string {
 	return `${media.mediaType}; ${media.encoding}`;
 }
 
-/* does not respect 'no-identity' encoding requests; unknown at-least-size is considered valid */
+/* does not respect 'no-identity' encoding requests; unknown at-least-size is considered valid (defaults 'identity' to null) */
 export const MIN_ENCODING_SIZE: number = 1_000;
 export function NegotiateEncoding(accept: string | null, atLeastSize: number | null, media: MediaType): EncodingType | null {
 	if (!media.compressible || accept == null)
