@@ -142,13 +142,19 @@ enum ResponseState {
 
 /*
 *	Does not throw any exceptions, unless explicitly stated.
+*	Http HEAD aware (will silently drain any data sent from a HEAD request).
 *
-*	Request is considered acknowledged, as soon as a response has been triggered or a preparation started
+*	Request is considered acknowledged, as soon as a response has been triggered or a preparation started.
 *	Path remains URI encoded, as it was received, and path building will use the same encoded paths.
-*	A request can only be responded to once, unless the response is marked as an error, in which
-*		case it will either be sent (if possible) or the connection will be flushed and closed
-*	Not responded to requests will result in [not-found]
+*	Repeated request responding may override any ongoing responses and may terminate the connection; depending on the prior state.
+*	Not responded to requests will result in [not-found].
 *
+*	Receiving data: Will automatically decode the stream and ensure a given maximum is not passed
+*		=> Any errors while receiving will either auto-respond or send the connection into the broken state, and fail the receive reader (stream user does not need to respond).
+*		=> Will terminate a connection, if the upload is not consumed or the client errors.
+*		=> Premature destroying of receive reader will result in the connection being gracefully terminated.
+*		=> All data must have been received before the response is completed.
+*	
 *	A response sent while another is being prepared (acknowledged) will override it and close the connection
 *	A response sent while data is already being streamed (header sent) will break the connection
 *	Responses automatically add Config.responseCacheControl, if no other cache control is specified
@@ -157,18 +163,16 @@ export abstract class IncomingBase extends ClientBase {
 	protected request: libHttp.IncomingMessage;
 	protected headerPatcher: HeaderPatch[];
 	protected htmlPatcher: HtmlPatch[];
-	protected breakState: {
-		breakPromise: Promise<void>;
-		breakResolve: () => void;
-		completed: Promise<void> | null;
-	};
 	protected baseState: {
 		respondedPromise: Promise<void>;
 		respondedResolve: () => void;
 		completedPromise: Promise<void>;
 		completedResolve: () => void;
+		breakPromise: Promise<void>;
+		breakResolve: () => void;
 		receive: ReceiveState;
 		response: ResponseState;
+		breaking: Promise<void> | null;
 	};
 	private throughput: {
 		timer: NodeJS.Timeout | null;
@@ -194,25 +198,21 @@ export abstract class IncomingBase extends ClientBase {
 		this.headerPatcher = [];
 		this.htmlPatcher = [];
 
-		let breakResolve: any = null;
-		this.breakState = {
-			breakPromise: new Promise<void>((resolve) => breakResolve = resolve),
-			breakResolve: () => { },
-			completed: null
-		};
-		this.breakState.breakResolve = breakResolve;
-
-		let respondedResolve: any = null, completedResolve: any = null;
+		let respondedResolve: any = null, completedResolve: any = null, breakResolve: any = null;
 		this.baseState = {
 			respondedPromise: new Promise<void>((resolve) => respondedResolve = resolve),
 			respondedResolve: () => { },
 			completedPromise: new Promise<void>((resolve) => completedResolve = resolve),
 			completedResolve: () => { },
+			breakPromise: new Promise<void>((resolve) => breakResolve = resolve),
+			breakResolve: () => { },
 			receive: ReceiveState.none,
-			response: ResponseState.none
+			response: ResponseState.none,
+			breaking: null
 		};
 		this.baseState.respondedResolve = respondedResolve;
 		this.baseState.completedResolve = completedResolve;
+		this.baseState.breakResolve = breakResolve;
 
 		/* setup the throughput measurement to detect any stalling connections */
 		this.throughput = {
@@ -353,7 +353,15 @@ export abstract class IncomingBase extends ClientBase {
 					this.baseState.receive = ReceiveState.completed;
 				}
 				cb(err);
-			}
+			},
+			final: (cb) => {
+				if (this.baseState.receive == ReceiveState.receiving) {
+					this.request.unpipe();
+					this.baseState.receive = ReceiveState.completed;
+				}
+				cb();
+			},
+
 		});
 
 		/* check if the content is encoded and create the chain of decoders (in reverse to ensure the nesting is correct) */
@@ -397,7 +405,7 @@ export abstract class IncomingBase extends ClientBase {
 		}
 
 		/* register the broken handler to detect closed or failed connections */
-		this.breakState.breakPromise.then(() => {
+		this.baseState.breakPromise.then(() => {
 			if (!output.destroyed)
 				output.destroy(new Error('Connection broken'));
 		});
@@ -423,7 +431,7 @@ export abstract class IncomingBase extends ClientBase {
 	protected markAsBroken(reason: string, graceful: boolean): void {
 		this.error(`Connection broken: [${reason}]`);
 		this.baseState.response = ResponseState.broken;
-		if (this.breakState.completed != null) {
+		if (this.baseState.breaking != null) {
 			if (!graceful)
 				this.handleKilling(false);
 			return;
@@ -433,7 +441,7 @@ export abstract class IncomingBase extends ClientBase {
 		/* setup the promise beforehand to ensure the promise body does not recursively
 		*	enter this handler again, and sees the completed object still being unset */
 		let resolver = () => { };
-		this.breakState.completed = new Promise<void>((res) => resolver = res);
+		this.baseState.breaking = new Promise<void>((res) => resolver = res);
 
 		/* setup the break promise to ensure the connection is killed properly with the given grace */
 		(async () => {
@@ -452,7 +460,7 @@ export abstract class IncomingBase extends ClientBase {
 			resolver();
 		})();
 
-		this.breakState.breakResolve();
+		this.baseState.breakResolve();
 	}
 	protected badClientUsage(reason: string, close: boolean): void {
 		this.respondInternalError(`Bad Usage: ${reason}`, (close ? { headers: { 'Connection': 'close' } } : undefined));
@@ -541,7 +549,7 @@ export abstract class IncomingBase extends ClientBase {
 
 		/* check if the connection is broken and await its grace cleanup completion */
 		if (this.baseState.response == ResponseState.broken)
-			await this.breakState.completed!;
+			await this.baseState.breaking!;
 
 		this.log('Request processing completed');
 		this.baseState.completedResolve();
@@ -999,18 +1007,11 @@ export abstract class IncomingBase extends ClientBase {
 }
 
 /*
-*	Http HEAD aware (will silently drain any data sent from a HEAD request)
 *
-*	Receiving data: Will automatically decode the stream and ensure a given maximum is not passed
-*		=> Will drain upload if it is not being received or the request enters a broken state
-*		=> Destroying receive reader will drain the remaining data
-*		=> Any errors while receiving will either auto-respond or send the connection into the broken state, and fail the receive reader (stream user does not need to respond)
-*		=> All data must have been received before the response is completed
 *	Responding data: Will automatically encode the stream and send the header accordingly
 *		=> Will automatically determine if encoding is to be used
 *		=> Checks if promised number of bytes is provided
 *		=> Will automatically error, if the broken state is detected, and will auto-respond or send the connection into the broken state (stream user does not need to respond)
-*	Cleanup: request detects incomplete responses (headers committed but body never finished) and will auto-respond or send the connection into the broken state
 *	Responding with files, data, or html can and will modify cache properties
 *
 *	Defaults [Accept-Ranges] to none
@@ -1245,7 +1246,7 @@ export class HttpRequest extends IncomingBase {
 		);
 
 		/* register the broken handler to detect closed or failed connections */
-		this.breakState.breakPromise.then(() => {
+		this.baseState.breakPromise.then(() => {
 			if (!response.destroyed)
 				response.destroy(new Error('Connection broken'));
 		});
@@ -1557,7 +1558,7 @@ export class HttpUpgrade extends IncomingBase {
 			let settled = false;
 
 			/* register the broken listener (to detect failures of the upgrading or network errors) */
-			this.breakState.breakPromise.then(() => {
+			this.baseState.breakPromise.then(() => {
 				if (settled) return; settled = true;
 				this.error('Failed to upgrade to WebSocket');
 				resolve(null);
