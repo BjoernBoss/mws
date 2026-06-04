@@ -157,7 +157,6 @@ export abstract class IncomingBase extends ClientBase {
 	protected request: libHttp.IncomingMessage;
 	protected headerPatcher: HeaderPatch[];
 	protected htmlPatcher: HtmlPatch[];
-	protected state: ResponseState;
 	protected breakState: {
 		breakPromise: Promise<void>;
 		breakResolve: () => void;
@@ -168,6 +167,8 @@ export abstract class IncomingBase extends ClientBase {
 		respondedResolve: () => void;
 		completedPromise: Promise<void>;
 		completedResolve: () => void;
+		receive: ReceiveState;
+		response: ResponseState;
 	};
 	private throughput: {
 		timer: NodeJS.Timeout | null;
@@ -190,7 +191,6 @@ export abstract class IncomingBase extends ClientBase {
 	constructor(request: libHttp.IncomingMessage, host: string, protocol: string, kind: string) {
 		super(new libUrl.URL(`${protocol}//${host == '' ? '_' : host}${request.url}`), kind);
 		this.request = request;
-		this.state = ResponseState.none;
 		this.headerPatcher = [];
 		this.htmlPatcher = [];
 
@@ -207,7 +207,9 @@ export abstract class IncomingBase extends ClientBase {
 			respondedPromise: new Promise<void>((resolve) => respondedResolve = resolve),
 			respondedResolve: () => { },
 			completedPromise: new Promise<void>((resolve) => completedResolve = resolve),
-			completedResolve: () => { }
+			completedResolve: () => { },
+			receive: ReceiveState.none,
+			response: ResponseState.none
 		};
 		this.baseState.respondedResolve = respondedResolve;
 		this.baseState.completedResolve = completedResolve;
@@ -228,15 +230,15 @@ export abstract class IncomingBase extends ClientBase {
 
 		/* register the necessary network error handlers */
 		const lostHandler = () => {
-			if (this.state != ResponseState.completed && this.state != ResponseState.broken)
+			if (this.baseState.response != ResponseState.completed && this.baseState.response != ResponseState.broken)
 				this.markAsBroken('Connection lost', false);
 		};
 		const closedHandler = () => {
-			if (this.state != ResponseState.completed && this.state != ResponseState.broken)
+			if (this.baseState.response != ResponseState.completed && this.baseState.response != ResponseState.broken)
 				this.markAsBroken('Connection closed by remote', false);
 		};
 		const timeoutHandler = () => {
-			if (this.state != ResponseState.completed && this.state != ResponseState.broken)
+			if (this.baseState.response != ResponseState.completed && this.baseState.response != ResponseState.broken)
 				this.markAsBroken('Connection timed out', false);
 		};
 		request.once('error', lostHandler);
@@ -265,8 +267,8 @@ export abstract class IncomingBase extends ClientBase {
 
 		/* check if the response can still be sent (acknowledged state can be overridden; the connection
 		*	will be closed afterwards to prevent the client from seeing inconsistent responses) */
-		const override = (this.state == ResponseState.acknowledged);
-		if (this.state == ResponseState.none || override) {
+		const override = (this.baseState.response == ResponseState.acknowledged);
+		if (this.baseState.response == ResponseState.none || override) {
 			if (status.code >= 500)
 				this.error(`Responding with ${description}`);
 			else if (override)
@@ -282,15 +284,15 @@ export abstract class IncomingBase extends ClientBase {
 			if (override)
 				this.markAsBroken('Overridden in-progress response', true);
 		}
-		else if (this.state == ResponseState.headerSent)
+		else if (this.baseState.response == ResponseState.headerSent)
 			this.markAsBroken(`Overlap with committed response ${description}`, false);
-		else if (this.state != ResponseState.broken)
+		else if (this.baseState.response != ResponseState.broken)
 			this.warning(`Request already completed, discarding response ${description}`);
 		else
 			this.trace(`Request broken, discarding response ${description}`);
 	}
 	private failThroughput(): void {
-		if (this.throughput.threshold <= 0 || this.state == ResponseState.broken)
+		if (this.throughput.threshold <= 0 || this.baseState.response == ResponseState.broken)
 			return;
 
 		/* check if the connection is still considered busy and should receive a grace delay */
@@ -307,10 +309,101 @@ export abstract class IncomingBase extends ClientBase {
 			return;
 		}
 
-		const closing = (this.state == ResponseState.none || this.state == ResponseState.acknowledged);
+		const closing = (this.baseState.response == ResponseState.none || this.baseState.response == ResponseState.acknowledged);
 		if (closing)
 			this.respondRequestTimeout(`Throughput below [${this.throughput.threshold}] bytes/sec`, { headers: { 'Connection': 'close' } });
 		this.markAsBroken(`Throughput below [${this.throughput.threshold}] bytes/sec`, closing);
+	}
+	private receiveClientData(maxLength: number | null): libStream.Readable {
+		const makeErrorStream = (msg: string) => new libStream.Readable({ read() { this.destroy(new Error(msg)) } });
+
+		/* check if the object is ready for receiving */
+		if (this.baseState.receive != ReceiveState.none) {
+			this.badClientUsage('Already receiving data', false);
+			return makeErrorStream('Connection is already being received');
+		}
+		if (this.baseState.response == ResponseState.broken)
+			return makeErrorStream('Connection broken');
+		this.baseState.receive = ReceiveState.receiving;
+
+		/* setup the accumulation transformer (which will also be returned in the end; mark receiving
+		*	as completed upon destroy - will automatically drain the request on cleanup) */
+		let accumulated = 0;
+		const output = new libStream.Transform({
+			transform: (chunk, _, cb) => {
+				if (output.destroyed) return cb(new Error('Already failed'));
+
+				/* check if the connection has been processed or marked as failed */
+				if (this.baseState.response == ResponseState.completed)
+					this.badClientUsage('Response completed during active receive', false);
+				if (this.baseState.response == ResponseState.broken)
+					return cb(new Error('Connection broken'));
+
+				/* check the maximum count (is violated) */
+				this.updateThroughput(chunk.byteLength);
+				accumulated += chunk.byteLength;
+				if (maxLength == null || accumulated <= maxLength)
+					return cb(null, chunk);
+				this.respondContentTooLarge(maxLength, accumulated);
+				cb(new Error('Request payload is too large'));
+			},
+			destroy: (err, cb) => {
+				if (this.baseState.receive == ReceiveState.receiving) {
+					this.request.unpipe();
+					this.baseState.receive = ReceiveState.completed;
+				}
+				cb(err);
+			}
+		});
+
+		/* check if the content is encoded and create the chain of decoders (in reverse to ensure the nesting is correct) */
+		let stream: libStream.Readable = this.request;
+		if (this.headers['content-encoding'] != null) {
+			const encodings = libRequest.SplitAndTrimList(this.headers['content-encoding'], ',', false);
+
+			for (let i = encodings.length - 1; i >= 0; --i) {
+				const encoding = libRequest.LookupEncoding(encodings[i]);
+
+				if (encoding == null) {
+					output.destroy();
+					this.respondUnsupported(encodings[i], libRequest.SupportedEncodingNames().join(','));
+					return makeErrorStream('Unsupported content encoding');
+				}
+
+				/* configure the piping accordingly */
+				const decoder = encoding.makeDecode();
+				stream = stream.pipe(decoder);
+				decoder.once('error', (err: any) => {
+					if (output.destroyed) return;
+					this.respondBadRequest('Invalid data encoding');
+					output.destroy(err);
+				});
+
+				/* register the cleanup handler to ensure the decoder is destroyed on completion */
+				output.once('close', () => decoder.destroy());
+			}
+		}
+
+		/* check if too many data have been promised (cannot be trusted if content-encoding is enabled) */
+		else if (maxLength != null && this.headers['content-length'] != null) {
+			const contentSize = parseInt(this.headers['content-length']);
+
+			/* check if the length is valid and otherwise mark the request as 'consumed' */
+			if (!isFinite(contentSize) || contentSize < 0 || contentSize > maxLength) {
+				output.destroy();
+				this.respondContentTooLarge(maxLength, contentSize);
+				return makeErrorStream('Request payload is too large');
+			}
+		}
+
+		/* register the broken handler to detect closed or failed connections */
+		this.breakState.breakPromise.then(() => {
+			if (!output.destroyed)
+				output.destroy(new Error('Connection broken'));
+		});
+
+		/* create the plumbing between stream and output (errors are already handled) */
+		return stream.pipe(output);
 	}
 
 	protected updateThroughput(delta: number): void {
@@ -329,7 +422,7 @@ export abstract class IncomingBase extends ClientBase {
 	}
 	protected markAsBroken(reason: string, graceful: boolean): void {
 		this.error(`Connection broken: [${reason}]`);
-		this.state = ResponseState.broken;
+		this.baseState.response = ResponseState.broken;
 		if (this.breakState.completed != null) {
 			if (!graceful)
 				this.handleKilling(false);
@@ -388,7 +481,7 @@ export abstract class IncomingBase extends ClientBase {
 				logMsg += ` dynamically encoded using [${content.encoding}]`;
 		}
 		this.trace(logMsg);
-		this.state = ResponseState.headerSent;
+		this.baseState.response = ResponseState.headerSent;
 
 		/* add the remaining common header types */
 		headers['Date'] = new Date().toUTCString();
@@ -413,41 +506,29 @@ export abstract class IncomingBase extends ClientBase {
 		this.baseState.respondedResolve();
 	}
 
-	public get headers(): libHttp.IncomingHttpHeaders {
-		return this.request.headers;
-	}
-	public get method(): string {
-		return this.request.method ?? '';
-	}
-	public get isHead(): boolean {
-		return (this.request.method == 'HEAD');
-	}
-
-	/* request has not yet been acknowledged in any way */
-	public get unhandled(): boolean {
-		return (this.state == ResponseState.none);
-	}
-
-	/* request has been acknowledged or already processed */
-	public get claimed(): boolean {
-		return (this.state != ResponseState.none);
-	}
-
-	/* resolves whenever the response has been determined (is broken or a response header has been sent) */
-	public get responded(): Promise<void> {
-		return this.baseState.respondedPromise;
-	}
-
-	/* resolves whenever the client has been fully processed */
-	public get completion(): Promise<void> {
-		return this.baseState.completedPromise;
-	}
-
 	public async _finishConnection(): Promise<void> {
 		try {
-			if (this.state == ResponseState.none)
+			if (this.baseState.response == ResponseState.none)
 				this.respondNotFound();
+
+			if (this.baseState.receive == ReceiveState.receiving) {
+				/* check if the response is already completed, in which case it can be silently
+				*	reset to 'header-sent' to ensure the connection is properly marked as broken */
+				if (this.baseState.response == ResponseState.completed)
+					this.baseState.response = ResponseState.headerSent;
+				this.badClientUsage('Receive stream not consumed', false);
+			}
+
 			this.handleFinishing();
+
+			/* check if data remain in the pipeline, in which case the connection needs
+			*	to be closed to ensure the sender does not pipe more data over */
+			if (this.baseState.response != ResponseState.broken && !this.request.readableEnded && !this.request.destroyed) {
+				const length = parseInt(this.headers['content-length'] ?? '0');
+				const chunked = (this.headers['transfer-encoding'] != null);
+				if (length != 0 || chunked)
+					this.markAsBroken((this.request.readableLength > 0 ? 'Uploaded data not consumed' : 'Potential uploaded data not consumed'), true);
+			}
 		} catch (_) { }
 
 		/* kill the throughput timer, as it either does not need to be checked anymore, or it
@@ -459,7 +540,7 @@ export abstract class IncomingBase extends ClientBase {
 		this.throughput.threshold = 0;
 
 		/* check if the connection is broken and await its grace cleanup completion */
-		if (this.state == ResponseState.broken)
+		if (this.baseState.response == ResponseState.broken)
 			await this.breakState.completed!;
 
 		this.log('Request processing completed');
@@ -512,6 +593,90 @@ export abstract class IncomingBase extends ClientBase {
 		this.htmlPatcher.splice(snapshot.htmlPatchCount);
 	}
 
+	/* request has not yet been acknowledged in any way */
+	public get unhandled(): boolean {
+		return (this.baseState.response == ResponseState.none);
+	}
+
+	/* request has been acknowledged or already processed */
+	public get claimed(): boolean {
+		return (this.baseState.response != ResponseState.none);
+	}
+
+	/* resolves whenever the response has been determined (is broken or a response header has been sent) */
+	public get responded(): Promise<void> {
+		return this.baseState.respondedPromise;
+	}
+
+	/* resolves whenever the client has been fully processed */
+	public get completion(): Promise<void> {
+		return this.baseState.completedPromise;
+	}
+
+	/* http request headers */
+	public get headers(): libHttp.IncomingHttpHeaders {
+		return this.request.headers;
+	}
+
+	/* http request method */
+	public get method(): string {
+		return this.request.method ?? '';
+	}
+
+	/* was the http request a head request */
+	public get isHead(): boolean {
+		return (this.request.method == 'HEAD');
+	}
+
+	/* return the string formatted media-type (or empty string for no media type) */
+	public getMediaType(): string {
+		const type = libRequest.SplitAndTrimList(this.headers['content-type'] ?? null, ';', true)[0] ?? '';
+		return type.toLowerCase();
+	}
+
+	/* check the content-type for a media-type and otherwise return the default type */
+	public getMediaTypeCharset(defEncoding: string): string {
+		const type = this.headers['content-type'];
+		if (type == null)
+			return defEncoding;
+
+		/* look for the first charset entry in the content-type list */
+		for (const part of libRequest.SplitAndTrimList(type, ';', true)) {
+			if (part.substring(0, 8).toLowerCase() != 'charset=')
+				continue;
+			let value = part.substring(8).trim();
+
+			/* remove the potential quotes around the charset value */
+			const quoted = value.startsWith('"');
+			if (quoted != value.endsWith('"'))
+				break;
+			if (quoted)
+				value = value.substring(1, value.length - 1).trim();
+
+			if (value.length == 0)
+				break;
+			return value.trim().toLowerCase();
+		}
+		return defEncoding;
+	}
+
+	/* ensure the media-type is one of the list and otherwise return null and auto-respond with [unsupported-media-type] (defaults to first type, if [noneIsFirst]) */
+	public requireMediaType(types: libRequest.MediaType[] | libRequest.MediaType, options?: { noneIsFirst?: boolean, headers?: Record<string, string> }): libRequest.MediaType | null {
+		if (!Array.isArray(types))
+			types = [types];
+
+		const type = this.getMediaType();
+		if (type == '' && options?.noneIsFirst === true)
+			return types[0];
+
+		for (let i = 0; i < types.length; ++i) {
+			if (type === types[i].mediaType)
+				return types[i];
+		}
+		this.respondUnsupported(type, types.map(t => t.mediaType).join(','), options);
+		return null;
+	}
+
 	/* ensure the method is one of the list and otherwise return null and auto-respond with [method-not-allowed]
 	*	if [headExplicit] is false, method will substitute HEAD for GET, framework will consume the remaining body */
 	public requireMethod(methods: string[] | string, options?: { headExplicit?: boolean, headers?: Record<string, string> }): string | null {
@@ -543,16 +708,22 @@ export abstract class IncomingBase extends ClientBase {
 		this.headerPatcher.push(cb);
 	}
 
+	/* register a callback to be invoked if html is built, to adjust the headers or
+	*	the content to be sent (will only be considered within this handler context) */
+	public patchHtmlPage(cb: HtmlPatch): void {
+		this.htmlPatcher.push(cb);
+	}
+
 	/* respond with [internal-error] and a default text response (always considered an error; reason is logged server-side only) */
 	public respondInternalError(reason: string, options?: { headers?: Record<string, string> }): void {
-		this.constructQuickResponse(libRequest.Status.InternalError, reason, options?.headers, {
+		this.constructQuickResponse(libRequest.Status.InternalError, `Failure Reason (not sent): ${reason}`, options?.headers, {
 			media: libRequest.Media.Text, body: Buffer.from(`An internal server error occurred while processing the request for [${this.url.pathname}].`, 'utf-8')
 		});
 	}
 
 	/* respond with [forbidden] and a default text response (reason is logged server-side only) */
 	public respondForbidden(reason: string, options?: { headers?: Record<string, string> }): void {
-		this.constructQuickResponse(libRequest.Status.Forbidden, reason, options?.headers, {
+		this.constructQuickResponse(libRequest.Status.Forbidden, `Forbidden Reason (not sent): ${reason}`, options?.headers, {
 			media: libRequest.Media.Text, body: Buffer.from(`Access to [${this.url.pathname}] denied.`, 'utf-8')
 		});
 	}
@@ -711,6 +882,120 @@ export abstract class IncomingBase extends ClientBase {
 			media: libRequest.Media.Text, body: Buffer.from(`Resource [${this.url.pathname}] permanently redirects to:\n${target}`, 'utf-8')
 		});
 	}
+
+	/* respond with html, can be built on by parent modules, sent once the client has been fully processed
+	*	(default status is ok; for HEAD builds, no actual content will be constructed or estimated in size)
+	*	automatically adds Config.responseCacheControl, if no other cache control is specified */
+	public async respondHtml(page: libBuilder.HtmlPage, options?: { status?: libRequest.StatusType, headers?: Record<string, string> }): Promise<void> {
+		if (this.baseState.response != ResponseState.none)
+			return this.badClientUsage('HTML response on already claimed connection', false);
+
+		this.baseState.response = ResponseState.acknowledged;
+		const status = (options?.status ?? libRequest.Status.Ok);
+		const headers = (options?.headers ?? {});
+		if (!('Cache-Control' in headers) && libConfig.responseCacheControl != '')
+			headers['Cache-Control'] = libConfig.responseCacheControl;
+
+		/* invoke all registered html patcher to let them modify the content (in reverse order to ensure
+		*	first added is last executed, and check if one of them produced an alternate response) */
+		for (let i = this.htmlPatcher.length - 1; i >= 0; --i) {
+			try {
+				await this.htmlPatcher[i](page, status, headers);
+				if (this.baseState.response != ResponseState.acknowledged)
+					return;
+			} catch (err: any) {
+				this.badClientUsage(`Unhandled exception in HTML patcher: ${err.message}`, false);
+				return;
+			}
+		}
+		const content = (this.isHead ? undefined : Buffer.from(page.finalize(), 'utf-8'));
+
+		/* mark first as completed now */
+		this.log(`Responding with HTML content and status [${status.msg}]${this.isHead ? ' as light-build' : ''}`);
+		this.sendFullResponse(status, headers, { media: libRequest.Media.Html, body: content });
+	}
+
+	/* [throws] receive the payload of given max length and write it directly to a file; will fail
+	*	if the file already exists and delete the file if it could not be received in full
+	*	automatically responds with given exceptions if the payload cannot be received properly or file operations fail */
+	public async receiveToFile(path: string, maxLength: number | null): Promise<void> {
+		this.trace(`Collecting data from [${this.url.pathname}] to: [${path}]`);
+		return new Promise((resolve, reject) => {
+			let source: libStream.Readable = this.receiveClientData(maxLength);
+
+			/* create the stream to the file to be written and setup the plumbing */
+			const destination = libFs.createWriteStream(path, { flags: 'wx' });
+			let fileFailed = false, sourceFailed = false, opened = false;
+			source.once('error', (err: any) => {
+				sourceFailed = true;
+				destination.destroy(err);
+			});
+			destination.once('open', () => {
+				opened = true;
+				if (!sourceFailed)
+					source.pipe(destination);
+				else
+					destination.destroy();
+			});
+			destination.once('error', (err: any) => {
+				if (!sourceFailed)
+					this.respondInternalError(`Failed to write uploaded file: ${err.message}`);
+				fileFailed = true;
+
+				/* destroy the source to clean up the receiving pipeline (will
+				*	not close the underlying request, just the pass-through reader) */
+				if (!source.destroyed)
+					source.destroy();
+
+				/* check if the file was opened and remove it */
+				if (!opened)
+					return reject(err);
+				libFs.unlink(path, (err2: any) => {
+					if (err2 != null)
+						this.error(`Failed to remove temporary file [${path}]: ${err2.message}`);
+					reject(err);
+				});
+			});
+			destination.once('close', () => {
+				if (!sourceFailed && !fileFailed)
+					resolve();
+			});
+		});
+	}
+
+	/* [no-throw but errors] receive the payload of given max length as a readable stream
+	*	automatically responds with given exceptions if the payload cannot be received properly
+	*	automatically drained if the readable stream is destroyed before reading all data */
+	public receiveData(maxLength: number | null): libStream.Readable {
+		return this.receiveClientData(maxLength);
+	}
+
+	/* [throws] receive the payload of given max length as a single complete buffer
+	*	automatically responds with given exceptions if the payload cannot be received properly */
+	public async receiveAllBuffer(maxLength: number | null): Promise<Buffer> {
+		return new Promise((resolve, reject) => {
+			let stream: libStream.Readable = this.receiveClientData(maxLength);
+
+			const buffers: Buffer[] = [];
+			stream.on('data', (chunk: Buffer) => buffers.push(chunk));
+			stream.once('end', () => resolve(Buffer.concat(buffers)));
+			stream.once('error', (err: any) => reject(err));
+		});
+	}
+
+	/* [throws] receive the payload of given max length as a single complete decoded string
+	*	automatically responds with given exceptions if the payload cannot be received properly */
+	public async receiveAllText(encoding: string, maxLength: number | null): Promise<string> {
+		/* wait for the buffer (let all errors propagate out) */
+		const buffer: Buffer = await this.receiveAllBuffer(maxLength);
+
+		try {
+			return buffer.toString(encoding as BufferEncoding);
+		} catch (err: any) {
+			this.respondBadRequest('Unable to decode content');
+			throw err;
+		}
+	}
 }
 
 /*
@@ -733,17 +1018,15 @@ export abstract class IncomingBase extends ClientBase {
 */
 export class HttpRequest extends IncomingBase {
 	private response: libHttp.ServerResponse;
-	private receive: ReceiveState;
 
 	constructor(request: libHttp.IncomingMessage, response: libHttp.ServerResponse, host: string, protocol: string) {
 		super(request, host, protocol, 'client');
 		this.response = response;
-		this.receive = ReceiveState.none;
 	}
 
 	protected override handleSendResponse(status: libRequest.StatusType, headers: Record<string, string>, content?: { media: libRequest.MediaType, body?: Buffer, encoding?: string }): void {
 		this.closeHeader(status, headers, (content == null ? undefined : { media: content.media, size: content.body?.byteLength, encoding: content.encoding }));
-		this.state = ResponseState.completed;
+		this.baseState.response = ResponseState.completed;
 
 		/* try to finalize the response (can throw an exception for invalid status or header content) */
 		try {
@@ -758,28 +1041,9 @@ export class HttpRequest extends IncomingBase {
 		}
 	}
 	protected override handleFinishing(): void {
-		if (this.receive == ReceiveState.receiving) {
-			/* check if the response is already completed, in which case it can be silently
-			*	reset to 'header-sent' to ensure the connection is properly marked as broken */
-			if (this.state == ResponseState.completed)
-				this.state = ResponseState.headerSent;
-			this.badClientUsage('Receive stream not consumed', false);
-		}
-
 		/* ensure that the response was properly sent */
-		if (this.state != ResponseState.completed && this.state != ResponseState.broken)
+		if (this.baseState.response != ResponseState.completed && this.baseState.response != ResponseState.broken)
 			this.badClientUsage('Response not completed', false);
-
-		/* check if a definitive end of the connection has been reached */
-		if (this.state == ResponseState.broken || this.request.readableEnded || this.request.destroyed)
-			return;
-
-		/* check if data remain in the pipeline, in which case the connection needs
-		*	to be closed to ensure the sender does not pipe more data over */
-		const length = parseInt(this.headers['content-length'] ?? '0');
-		const chunked = (this.headers['transfer-encoding'] != null);
-		if (length != 0 || chunked)
-			this.markAsBroken((this.request.readableLength > 0 ? 'Uploaded data not consumed' : 'Potential uploaded data not consumed'), true);
 	}
 	protected override async handleKilling(graceful: boolean): Promise<void> {
 		const closeConnection = () => {
@@ -821,97 +1085,6 @@ export class HttpRequest extends IncomingBase {
 				this.error(`Failed to set header [${key}]: Bad header value`);
 			}
 		}
-	}
-	private receiveClientData(maxLength: number | null): libStream.Readable {
-		const makeErrorStream = (msg: string) => new libStream.Readable({ read() { this.destroy(new Error(msg)) } });
-
-		/* check if the object is ready for receiving */
-		if (this.receive != ReceiveState.none) {
-			this.badClientUsage('Already receiving data', false);
-			return makeErrorStream('Connection is already being received');
-		}
-		if (this.state == ResponseState.broken)
-			return makeErrorStream('Connection broken');
-		this.receive = ReceiveState.receiving;
-
-		/* setup the accumulation transformer (which will also be returned in the end; mark receiving
-		*	as completed upon destroy - will automatically drain the request on cleanup) */
-		let accumulated = 0;
-		const output = new libStream.Transform({
-			transform: (chunk, _, cb) => {
-				if (output.destroyed) return cb(new Error('Already failed'));
-
-				/* check if the connection has been processed or marked as failed */
-				if (this.state == ResponseState.completed)
-					this.badClientUsage('Response completed during active receive', false);
-				if (this.state == ResponseState.broken)
-					return cb(new Error('Connection broken'));
-
-				/* check the maximum count (is violated) */
-				this.updateThroughput(chunk.byteLength);
-				accumulated += chunk.byteLength;
-				if (maxLength == null || accumulated <= maxLength)
-					return cb(null, chunk);
-				this.respondContentTooLarge(maxLength, accumulated);
-				cb(new Error('Request payload is too large'));
-			},
-			destroy: (err, cb) => {
-				if (this.receive == ReceiveState.receiving) {
-					this.request.unpipe();
-					this.receive = ReceiveState.completed;
-				}
-				cb(err);
-			}
-		});
-
-		/* check if the content is encoded and create the chain of decoders (in reverse to ensure the nesting is correct) */
-		let stream: libStream.Readable = this.request;
-		if (this.headers['content-encoding'] != null) {
-			const encodings = libRequest.SplitAndTrimList(this.headers['content-encoding'], ',', false);
-
-			for (let i = encodings.length - 1; i >= 0; --i) {
-				const encoding = libRequest.LookupEncoding(encodings[i]);
-
-				if (encoding == null) {
-					output.destroy();
-					this.respondUnsupported(encodings[i], libRequest.SupportedEncodingNames().join(','));
-					return makeErrorStream('Unsupported content encoding');
-				}
-
-				/* configure the piping accordingly */
-				const decoder = encoding.makeDecode();
-				stream = stream.pipe(decoder);
-				decoder.once('error', (err: any) => {
-					if (output.destroyed) return;
-					this.respondBadRequest('Invalid data encoding');
-					output.destroy(err);
-				});
-
-				/* register the cleanup handler to ensure the decoder is destroyed on completion */
-				output.once('close', () => decoder.destroy());
-			}
-		}
-
-		/* check if too many data have been promised (cannot be trusted if content-encoding is enabled) */
-		else if (maxLength != null && this.headers['content-length'] != null) {
-			const contentSize = parseInt(this.headers['content-length']);
-
-			/* check if the length is valid and otherwise mark the request as 'consumed' */
-			if (!isFinite(contentSize) || contentSize < 0 || contentSize > maxLength) {
-				output.destroy();
-				this.respondContentTooLarge(maxLength, contentSize);
-				return makeErrorStream('Request payload is too large');
-			}
-		}
-
-		/* register the broken handler to detect closed or failed connections */
-		this.breakState.breakPromise.then(() => {
-			if (!output.destroyed)
-				output.destroy(new Error('Connection broken'));
-		});
-
-		/* create the plumbing between stream and output (errors are already handled) */
-		return stream.pipe(output);
 	}
 	private sendClientSetupHeader(resp: HttpRequestResponse, chunk: Buffer | null, cb: (err: any) => void): void {
 		const last = (chunk == null);
@@ -979,9 +1152,9 @@ export class HttpRequest extends IncomingBase {
 		/* check if this is a head write, in which case the response can
 		*	just be marked as completed, and all other data can be drained */
 		if (this.isHead) {
-			if (this.state != ResponseState.headerSent)
+			if (this.baseState.response != ResponseState.headerSent)
 				return cb(null);
-			this.state = ResponseState.completed;
+			this.baseState.response = ResponseState.completed;
 			resp.writer.end(() => cb(null));
 			return;
 		}
@@ -1009,7 +1182,7 @@ export class HttpRequest extends IncomingBase {
 		}
 
 		/* mark the state as completed and sent the last package */
-		this.state = ResponseState.completed;
+		this.baseState.response = ResponseState.completed;
 		if (chunk != null)
 			resp.writer.end(chunk, () => cb(null));
 		else
@@ -1020,14 +1193,14 @@ export class HttpRequest extends IncomingBase {
 			return cb(new Error('Already failed'));
 
 		/* check if the connection has been marked as failed or completed */
-		if (this.state == ResponseState.completed)
+		if (this.baseState.response == ResponseState.completed)
 			return cb(new Error('Responding to completed response'));
-		if (this.state == ResponseState.broken)
+		if (this.baseState.response == ResponseState.broken)
 			return cb(new Error('Connection broken'));
 
 		/* handle the data accordingly and check for any errors due to malformed headers */
 		try {
-			if (this.state == ResponseState.headerSent)
+			if (this.baseState.response == ResponseState.headerSent)
 				return this.sendClientWrite(resp, chunk, chunk == null, cb);
 			this.sendClientSetupHeader(resp, chunk, cb);
 		}
@@ -1040,19 +1213,19 @@ export class HttpRequest extends IncomingBase {
 		const makeErrorStream = (msg: string) => new libStream.Writable({ write(_0, _1, cb) { cb(new Error(msg)) }, final(cb) { cb(new Error(msg)) } });
 
 		/* check if the object is already responded */
-		if (this.state == ResponseState.broken)
+		if (this.baseState.response == ResponseState.broken)
 			return makeErrorStream('Connection broken');
-		if (this.state != ResponseState.none) {
+		if (this.baseState.response != ResponseState.none) {
 			this.badClientUsage('Response on already claimed connection', false);
 			return makeErrorStream('Connection already responded');
 		}
-		this.state = ResponseState.acknowledged;
+		this.baseState.response = ResponseState.acknowledged;
 
 		const response = new HttpRequestResponse(this.response, status, headers,
 			options.contentSize ?? null, media, options?.dynamicEncode ?? false,
 			(chunk: Buffer | null, cb: (err: any) => void) => this.sendClientHandle(response, chunk, cb),
 			(err: any, cb: (err: any) => void) => {
-				if (this.state == ResponseState.completed)
+				if (this.baseState.response == ResponseState.completed)
 					return cb(err);
 
 				/* check if the output stream was an encoder, in which case it still needs to
@@ -1061,8 +1234,8 @@ export class HttpRequest extends IncomingBase {
 					response.writer.destroy();
 
 				/* check if the error originated from the data sender and ensure the connection is closed */
-				if (!this.response.destroyed && this.state != ResponseState.broken) {
-					const closing = (this.state == ResponseState.acknowledged);
+				if (!this.response.destroyed && this.baseState.response != ResponseState.broken) {
+					const closing = (this.baseState.response == ResponseState.acknowledged);
 					if (closing)
 						this.badClientUsage('Response closed prematurely', true);
 					this.markAsBroken(`Data transfer failed: ${err.message}`, closing);
@@ -1078,175 +1251,6 @@ export class HttpRequest extends IncomingBase {
 		});
 
 		return response;
-	}
-
-	/* return the string formatted media-type (or empty string for no media type) */
-	public getMediaType(): string {
-		const type = libRequest.SplitAndTrimList(this.headers['content-type'] ?? null, ';', true)[0] ?? '';
-		return type.toLowerCase();
-	}
-
-	/* check the content-type for a media-type and otherwise return the default type */
-	public getMediaTypeCharset(defEncoding: string): string {
-		const type = this.headers['content-type'];
-		if (type == null)
-			return defEncoding;
-
-		/* look for the first charset entry in the content-type list */
-		for (const part of libRequest.SplitAndTrimList(type, ';', true)) {
-			if (part.substring(0, 8).toLowerCase() != 'charset=')
-				continue;
-			let value = part.substring(8).trim();
-
-			/* remove the potential quotes around the charset value */
-			const quoted = value.startsWith('"');
-			if (quoted != value.endsWith('"'))
-				break;
-			if (quoted)
-				value = value.substring(1, value.length - 1).trim();
-
-			if (value.length == 0)
-				break;
-			return value.trim().toLowerCase();
-		}
-		return defEncoding;
-	}
-
-	/* ensure the media-type is one of the list and otherwise return null and auto-respond with [unsupported-media-type] (defaults to first type, if [noneIsFirst]) */
-	public requireMediaType(types: libRequest.MediaType[] | libRequest.MediaType, options?: { noneIsFirst?: boolean, headers?: Record<string, string> }): libRequest.MediaType | null {
-		if (!Array.isArray(types))
-			types = [types];
-
-		const type = this.getMediaType();
-		if (type == '' && options?.noneIsFirst === true)
-			return types[0];
-
-		for (let i = 0; i < types.length; ++i) {
-			if (type === types[i].mediaType)
-				return types[i];
-		}
-		this.respondUnsupported(type, types.map(t => t.mediaType).join(','), options);
-		return null;
-	}
-
-	/* [no-throw but errors] receive the payload of given max length as a readable stream
-	*	automatically responds with given exceptions if the payload cannot be received properly
-	*	automatically drained if the readable stream is destroyed before reading all data */
-	public receiveData(maxLength: number | null): libStream.Readable {
-		return this.receiveClientData(maxLength);
-	}
-
-	/* [throws] receive the payload of given max length as a single complete buffer
-	*	automatically responds with given exceptions if the payload cannot be received properly */
-	public async receiveAllBuffer(maxLength: number | null): Promise<Buffer> {
-		return new Promise((resolve, reject) => {
-			let stream: libStream.Readable = this.receiveClientData(maxLength);
-
-			const buffers: Buffer[] = [];
-			stream.on('data', (chunk: Buffer) => buffers.push(chunk));
-			stream.once('end', () => resolve(Buffer.concat(buffers)));
-			stream.once('error', (err: any) => reject(err));
-		});
-	}
-
-	/* [throws] receive the payload of given max length as a single complete decoded string
-	*	automatically responds with given exceptions if the payload cannot be received properly */
-	public async receiveAllText(encoding: string, maxLength: number | null): Promise<string> {
-		/* wait for the buffer (let all errors propagate out) */
-		const buffer: Buffer = await this.receiveAllBuffer(maxLength);
-
-		try {
-			return buffer.toString(encoding as BufferEncoding);
-		} catch (err: any) {
-			this.respondBadRequest('Unable to decode content');
-			throw err;
-		}
-	}
-
-	/* [throws] receive the payload of given max length and write it directly to a file; will fail
-	*	if the file already exists and delete the file if it could not be received in full
-	*	automatically responds with given exceptions if the payload cannot be received properly or file operations fail */
-	public async receiveToFile(path: string, maxLength: number | null): Promise<void> {
-		this.trace(`Collecting data from [${this.url.pathname}] to: [${path}]`);
-		return new Promise((resolve, reject) => {
-			let source: libStream.Readable = this.receiveClientData(maxLength);
-
-			/* create the stream to the file to be written and setup the plumbing */
-			const destination = libFs.createWriteStream(path, { flags: 'wx' });
-			let fileFailed = false, sourceFailed = false, opened = false;
-			source.once('error', (err: any) => {
-				sourceFailed = true;
-				destination.destroy(err);
-			});
-			destination.once('open', () => {
-				opened = true;
-				if (!sourceFailed)
-					source.pipe(destination);
-				else
-					destination.destroy();
-			});
-			destination.once('error', (err: any) => {
-				if (!sourceFailed)
-					this.respondInternalError(`Failed to write uploaded file: ${err.message}`);
-				fileFailed = true;
-
-				/* destroy the source to clean up the receiving pipeline (will
-				*	not close the underlying request, just the pass-through reader) */
-				if (!source.destroyed)
-					source.destroy();
-
-				/* check if the file was opened and remove it */
-				if (!opened)
-					return reject(err);
-				libFs.unlink(path, (err2: any) => {
-					if (err2 != null)
-						this.error(`Failed to remove temporary file [${path}]: ${err2.message}`);
-					reject(err);
-				});
-			});
-			destination.once('close', () => {
-				if (!sourceFailed && !fileFailed)
-					resolve();
-			});
-		});
-	}
-
-	/* register a callback to be invoked if html is built, to adjust the headers or
-	*	the content to be sent (will only be considered within this handler context) */
-	public patchHtmlPage(cb: HtmlPatch): void {
-		this.htmlPatcher.push(cb);
-	}
-
-	/* respond with html, can be built on by parent modules, sent once the client has been fully processed
-	*	(default status is ok; for HEAD builds, no actual content will be constructed or estimated in size)
-	*	automatically adds Config.responseCacheControl, if no other cache control is specified */
-	public async respondHtml(page: libBuilder.HtmlPage, options?: { status?: libRequest.StatusType, headers?: Record<string, string> }): Promise<void> {
-		if (this.state != ResponseState.none)
-			return this.badClientUsage('HTML response on already claimed connection', false);
-
-		this.state = ResponseState.acknowledged;
-		const status = (options?.status ?? libRequest.Status.Ok);
-		const headers = (options?.headers ?? {});
-		if (!('Cache-Control' in headers) && libConfig.responseCacheControl != '')
-			headers['Cache-Control'] = libConfig.responseCacheControl;
-
-		/* invoke all registered html patcher to let them modify the content (in reverse order to ensure
-		*	first added is last executed, and check if one of them produced an alternate response) */
-		for (let i = this.htmlPatcher.length - 1; i >= 0; --i) {
-			try {
-				await this.htmlPatcher[i](page, status, headers);
-				if (this.state != ResponseState.acknowledged)
-					return;
-			} catch (err: any) {
-				this.badClientUsage(`Unhandled exception in HTML patcher: ${err.message}`, false);
-				return;
-			}
-		}
-		const content = (this.isHead ? undefined : Buffer.from(page.finalize(), 'utf-8'));
-
-		/* mark first as completed now */
-		this.log(`Responding with HTML content and status [${status.msg}]${this.isHead ? ' as light-build' : ''}`);
-		this.sendFullResponse(status, headers, { media: libRequest.Media.Html, body: content });
 	}
 
 	/* [no-throw but errors] send data with [media type] and [status] and return a writable stream (default status is ok, media is unknown);
@@ -1271,7 +1275,7 @@ export class HttpRequest extends IncomingBase {
 	public async tryRespondFile(filePath: string, options?: { encoded?: string, media?: libRequest.MediaType, headers?: Record<string, string>, checkFreshness?: boolean }): Promise<boolean> {
 		if (options == null)
 			options = {};
-		if (this.state != ResponseState.none) {
+		if (this.baseState.response != ResponseState.none) {
 			this.badClientUsage('File response on already claimed connection', false);
 			return true;
 		}
@@ -1481,7 +1485,7 @@ export class HttpUpgrade extends IncomingBase {
 		headerText += '\r\n';
 		this.socket.write(headerText, 'utf-8');
 
-		this.state = ResponseState.completed;
+		this.baseState.response = ResponseState.completed;
 		if (!this.isHead && content?.body != null) {
 			this.updateThroughput(content.body.length);
 			this.socket.end(content.body);
@@ -1496,14 +1500,14 @@ export class HttpUpgrade extends IncomingBase {
 
 		/* check if the connection was accepted (only reason to keep it alive,
 		*	as source web-server will not clean this connection up anymore) */
-		if (this.state == ResponseState.completed && this.upgrade == UpgradeState.upgraded)
+		if (this.baseState.response == ResponseState.completed && this.upgrade == UpgradeState.upgraded)
 			return;
 
 		/* check if the state is incomplete and break the connection but ensure it is closed
 		*	either way (to ensure the connection is definitely closed, if not upgrade) */
-		if (this.state != ResponseState.completed && this.state != ResponseState.broken)
+		if (this.baseState.response != ResponseState.completed && this.baseState.response != ResponseState.broken)
 			this.badClientUsage('Response not completed', false);
-		if (this.state != ResponseState.broken)
+		if (this.baseState.response != ResponseState.broken)
 			this.markAsBroken('Upgrade was not accepted', true);
 	}
 	protected override async handleKilling(graceful: boolean): Promise<void> {
@@ -1533,7 +1537,7 @@ export class HttpUpgrade extends IncomingBase {
 	/* marks the object as having been handled and returns a web socket or
 	*	automatically responds with a corresponding error and returns null */
 	public async acceptWebSocket(): Promise<ClientSocket | null> {
-		if (this.state != ResponseState.none) {
+		if (this.baseState.response != ResponseState.none) {
 			this.badClientUsage('WebSocket upgrade on already claimed connection', false);
 			return null;
 		}
@@ -1546,7 +1550,7 @@ export class HttpUpgrade extends IncomingBase {
 		}
 
 		/* mark the connection as being accepted */
-		this.state = ResponseState.headerSent;
+		this.baseState.response = ResponseState.headerSent;
 		this.upgrade = UpgradeState.upgrading;
 		this.trace(`Performing upgrade on web socket connection: [${this.url.pathname}]`);
 		const ws = await new Promise<ClientSocket | null>((resolve) => {
@@ -1561,8 +1565,8 @@ export class HttpUpgrade extends IncomingBase {
 
 			/* start the upgrade process (web-socket upgrade handler will automatically send error messages) */
 			this.wss.handleUpgrade(this.request, this.socket, this.head, (ws, _) => {
-				if (!settled && this.state == ResponseState.headerSent) {
-					settled = true, this.state = ResponseState.completed;
+				if (!settled && this.baseState.response == ResponseState.headerSent) {
+					settled = true, this.baseState.response = ResponseState.completed;
 
 					/* ensure that the socket is valid as otherwise proper cleanup might not be guaranteed (no
 					*	need to log errors, as this will trigger the broken state, which will be logged) */
