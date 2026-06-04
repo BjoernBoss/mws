@@ -234,7 +234,7 @@ export const Config: CoreConfig = new CoreConfig();
 *	Initial root server configuration
 */
 export function Initialize(): void {
-	Config.serverName = 'modular-web-server';
+	Config.serverName = 'Modular Web Server';
 	Config.commonHeaders = { 'X-Content-Type-Options': 'nosniff' };
 	Config.webSocketTimeout = 180_000;
 	Config.webSocketAliveTimeout = 2_000;

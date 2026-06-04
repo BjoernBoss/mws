@@ -179,7 +179,7 @@ export abstract class IncomingBase extends ClientBase {
 	};
 
 	/* write the given header and content out (no need to update state; body may be null for HEAD responses of unknown size) */
-	protected abstract sendContentResponse(status: libRequest.StatusType, headers: Record<string, string>, content: { media: libRequest.MediaType, body: Buffer | null } | null): void;
+	protected abstract handleSendResponse(status: libRequest.StatusType, headers: Record<string, string>, content?: { media: libRequest.MediaType, body?: Buffer, encoding?: string }): void;
 
 	/* finish handling the request */
 	protected abstract handleFinishing(): void;
@@ -255,7 +255,7 @@ export abstract class IncomingBase extends ClientBase {
 		});
 	}
 
-	private constructQuickResponse(status: libRequest.StatusType, logReason: string | null, headers: Record<string, string> | undefined, content: { media: libRequest.MediaType, body: Buffer } | null): void {
+	private constructQuickResponse(status: libRequest.StatusType, logReason: string | null, headers: Record<string, string> | undefined, content?: { media: libRequest.MediaType, body?: Buffer } | null): void {
 		if (headers == null)
 			headers = {};
 		const description = `${this.isHead ? 'HEAD:' : ''}[${status.msg}]${logReason == null ? '' : `: ${logReason}`}`;
@@ -277,7 +277,7 @@ export abstract class IncomingBase extends ClientBase {
 			if (override)
 				headers['Connection'] = 'close';
 
-			this.sendContentResponse(status, headers, content);
+			this.sendFullResponse(status, headers, content ?? undefined);
 
 			if (override)
 				this.markAsBroken('Overridden in-progress response', true);
@@ -312,6 +312,7 @@ export abstract class IncomingBase extends ClientBase {
 			this.respondRequestTimeout(`Throughput below [${this.throughput.threshold}] bytes/sec`, { headers: { 'Connection': 'close' } });
 		this.markAsBroken(`Throughput below [${this.throughput.threshold}] bytes/sec`, closing);
 	}
+
 	protected updateThroughput(delta: number): void {
 		if (this.throughput.timer != null)
 			clearTimeout(this.throughput.timer);
@@ -363,7 +364,30 @@ export abstract class IncomingBase extends ClientBase {
 	protected badClientUsage(reason: string, close: boolean): void {
 		this.respondInternalError(`Bad Usage: ${reason}`, (close ? { headers: { 'Connection': 'close' } } : undefined));
 	}
-	protected finalizeResponseHeader(status: libRequest.StatusType, headers: Record<string, string>, media: libRequest.MediaType | null, length: number | null): void {
+	protected sendFullResponse(status: libRequest.StatusType, headers: Record<string, string>, content?: { media: libRequest.MediaType, body?: Buffer }): void {
+		if (content == null)
+			return this.handleSendResponse(status, headers, content);
+		headers['Vary'] = 'Accept-Encoding';
+
+		/* check if the data should be encoded (if the size is not known, pretend the buffer to be large enough) */
+		const encoding: libRequest.EncodingType | null = libRequest.NegotiateEncoding(this.headers['accept-encoding'] ?? null, content.body?.byteLength ?? null, content.media);
+		if (encoding != null) {
+			if (content.body != null)
+				content.body = encoding.encodeBuffer(content.body);
+			headers['Content-Encoding'] = encoding.name;
+		}
+		this.handleSendResponse(status, headers, { media: content.media, body: content.body, encoding: encoding?.name });;
+	}
+	protected finalizeResponseHeader(status: libRequest.StatusType, headers: Record<string, string>, content?: { media: libRequest.MediaType, length?: number, encoding?: string }): void {
+		let logMsg = `Sending [${status.msg}] ${this.isHead ? 'HEAD ' : ''}`;
+		if (content?.media == null)
+			logMsg += `for no content`;
+		else {
+			logMsg += `[${content.media.mediaType}] of size [${content?.length ?? 'unknown'}]`;
+			if (content.encoding != null)
+				logMsg += ` dynamically encoded using [${content.encoding}]`;
+		}
+		this.trace(logMsg);
 		this.state = ResponseState.headerSent;
 
 		/* add the remaining common header types */
@@ -374,10 +398,11 @@ export abstract class IncomingBase extends ClientBase {
 			if (!(key in headers))
 				headers[key] = value;
 		}
-		if (media != null)
-			headers['Content-Type'] = libRequest.BuildMediaTypeIdentifier(media);
-		if (length != null)
-			headers['Content-Length'] = length.toString();
+		if (content != null) {
+			headers['Content-Type'] = libRequest.BuildMediaTypeIdentifier(content.media);
+			if (content.length != null)
+				headers['Content-Length'] = content.length.toString();
+		}
 
 		/* perform the header post processing (in reverse order to ensure first added is last executed) */
 		for (let i = this.headerPatcher.length - 1; i >= 0; --i) {
@@ -532,8 +557,9 @@ export abstract class IncomingBase extends ClientBase {
 		});
 	}
 
-	/* respond with a any response of the given configuration (defaults to media-type: text/unknown/-, status: ok) */
-	public respond(content: string | Buffer | null, options?: { media?: libRequest.MediaType, status?: libRequest.StatusType, headers?: Record<string, string> }): void {
+	/* respond with a any response of the given configuration (defaults to media-type: text/unknown/-, status: ok);
+	*	if [lightResponse], the content length is suppressed for head responses (to accomodate short-circuiting responding) */
+	public respond(content: string | Buffer | null, options?: { media?: libRequest.MediaType, status?: libRequest.StatusType, headers?: Record<string, string>, lightResponse?: boolean }): void {
 		const status = options?.status ?? libRequest.Status.Ok;
 
 		if (content == null)
@@ -546,7 +572,7 @@ export abstract class IncomingBase extends ClientBase {
 			media = libRequest.Media.Unknown;
 
 		this.constructQuickResponse(status, `[${media.mediaType}] and size [${content.byteLength}]`, options?.headers, {
-			media, body: content
+			media, body: (options?.lightResponse && this.isHead ? undefined : content)
 		});
 	}
 
@@ -715,21 +741,8 @@ export class HttpRequest extends IncomingBase {
 		this.receive = ReceiveState.none;
 	}
 
-	protected override sendContentResponse(status: libRequest.StatusType, headers: Record<string, string>, content: { media: libRequest.MediaType, body: Buffer | null } | null): void {
-		if (content == null)
-			this.closeHeader(status, null, null, '', headers);
-		else {
-			headers['Vary'] = 'Accept-Encoding';
-
-			/* check if the data should be encoded (if the size is not known, pretend the buffer to be large enough) */
-			const encoding: libRequest.EncodingType | null = libRequest.NegotiateEncoding(this.headers['accept-encoding'] ?? null, content.body?.byteLength ?? null, content.media);
-			if (encoding != null) {
-				if (content.body != null)
-					content.body = encoding.encodeBuffer(content.body);
-				headers['Content-Encoding'] = encoding.name;
-			}
-			this.closeHeader(status, content.media, content.body?.byteLength ?? null, encoding?.name ?? '', headers);
-		}
+	protected override handleSendResponse(status: libRequest.StatusType, headers: Record<string, string>, content?: { media: libRequest.MediaType, body?: Buffer, encoding?: string }): void {
+		this.closeHeader(status, headers, (content == null ? undefined : { media: content.media, size: content.body?.byteLength, encoding: content.encoding }));
 		this.state = ResponseState.completed;
 
 		/* try to finalize the response (can throw an exception for invalid status or header content) */
@@ -791,17 +804,12 @@ export class HttpRequest extends IncomingBase {
 			this.response.once('close', () => handler());
 		});
 	}
-	private closeHeader(status: libRequest.StatusType, media: libRequest.MediaType | null, contentSize: number | null, encoding: string, headers: Record<string, string>): void {
-		if (media == null)
-			this.trace(`Sending ${this.isHead ? 'HEAD for ' : ''}no content`);
-		else
-			this.trace(`Sending ${this.isHead ? 'HEAD' : 'content'} [${media?.mediaType ?? 'none'}] of size [${contentSize ?? 'unknown'}] ${encoding.length == 0 ? 'not dynamically encoded' : `dynamically encoded using [${encoding}]`}`);
-
+	private closeHeader(status: libRequest.StatusType, headers: Record<string, string>, content?: { media: libRequest.MediaType, size?: number, encoding?: string }): void {
 		if (!('Accept-Ranges' in headers))
 			headers['Accept-Ranges'] = 'none';
 		if (!('Vary' in headers))
 			headers['Vary'] = 'Accept-Encoding';
-		this.finalizeResponseHeader(status, headers, media, contentSize);
+		this.finalizeResponseHeader(status, headers, (content == null ? undefined : { media: content.media, length: content.size, encoding: content.encoding }));
 
 		/* setup the response status and headers (guard against invalid header values from patchers or modules) */
 		this.response.statusCode = status.code;
@@ -929,7 +937,7 @@ export class HttpRequest extends IncomingBase {
 
 		/* check if the content should be dynamically encoded */
 		if (!resp.dynamicEncode) {
-			this.closeHeader(resp.status, resp.contentType, fullContentSize, '', resp.headers);
+			this.closeHeader(resp.status, resp.headers, { media: resp.contentType, size: fullContentSize ?? undefined });
 			return this.sendClientWrite(resp, chunk, last, cb);
 		}
 		resp.headers['Vary'] = 'Accept-Encoding';
@@ -938,7 +946,7 @@ export class HttpRequest extends IncomingBase {
 		*	assume an encoding - can always be disabled in the real run, should the data be too short) */
 		let encoding = libRequest.NegotiateEncoding(this.headers['accept-encoding'] ?? null, fullContentSize ?? chunk?.byteLength ?? null, resp.contentType);
 		if (encoding == null) {
-			this.closeHeader(resp.status, resp.contentType, fullContentSize, '', resp.headers);
+			this.closeHeader(resp.status, resp.headers, { media: resp.contentType, size: fullContentSize ?? undefined });
 			return this.sendClientWrite(resp, chunk, last, cb);
 		}
 		resp.headers['Content-Encoding'] = encoding.name;
@@ -964,7 +972,7 @@ export class HttpRequest extends IncomingBase {
 			});
 		}
 
-		this.closeHeader(resp.status, resp.contentType, fullContentSize, encoding.name, resp.headers);
+		this.closeHeader(resp.status, resp.headers, { media: resp.contentType, size: fullContentSize ?? undefined, encoding: encoding.name });
 		return this.sendClientWrite(resp, chunk, last, cb);
 	}
 	private sendClientWrite(resp: HttpRequestResponse, chunk: Buffer | null, last: boolean, cb: (err: any) => void): void {
@@ -1234,11 +1242,11 @@ export class HttpRequest extends IncomingBase {
 				return;
 			}
 		}
-		const content = (this.isHead ? null : Buffer.from(page.finalize(), 'utf-8'));
+		const content = (this.isHead ? undefined : Buffer.from(page.finalize(), 'utf-8'));
 
 		/* mark first as completed now */
 		this.log(`Responding with HTML content and status [${status.msg}]${this.isHead ? ' as light-build' : ''}`);
-		this.sendContentResponse(status, headers, { media: libRequest.Media.Html, body: content });
+		this.sendFullResponse(status, headers, { media: libRequest.Media.Html, body: content });
 	}
 
 	/* [no-throw but errors] send data with [media type] and [status] and return a writable stream (default status is ok, media is unknown);
@@ -1355,7 +1363,7 @@ export class HttpRequest extends IncomingBase {
 		/* check if the file is empty (can only happen for unused ranges, which would otherwise have issues) */
 		if ((reader == null ? cached.fileSize() : reader.contentSize()) === 0) {
 			this.log(`Sending empty content for [${filePath}]`);
-			this.sendContentResponse(libRequest.Status.Ok, headers, { media, body: Buffer.alloc(0) });
+			this.sendFullResponse(libRequest.Status.Ok, headers, { media, body: Buffer.alloc(0) });
 			return true;
 		}
 		if (range.state == libRequest.RangeState.valid)
@@ -1454,11 +1462,10 @@ export class HttpUpgrade extends IncomingBase {
 		this.upgrade = UpgradeState.none;
 	}
 
-	protected override sendContentResponse(status: libRequest.StatusType, headers: Record<string, string>, content: { media: libRequest.MediaType, body: Buffer | null } | null): void {
-		/* prepare the initial header response */
+	protected override handleSendResponse(status: libRequest.StatusType, headers: Record<string, string>, content?: { media: libRequest.MediaType, body?: Buffer, encoding?: string }): void {
 		headers['Accept-Ranges'] = 'none';
 		headers['Connection'] = 'close';
-		this.finalizeResponseHeader(status, headers, content?.media ?? null, content?.body?.byteLength ?? null)
+		this.finalizeResponseHeader(status, headers, (content == null ? undefined : { media: content.media, length: content.body?.byteLength, encoding: content.encoding }));
 
 		/* construct the entire header content and send it away (sanitize values to prevent response splitting) */
 		if (status.msg.match(BAD_HTTP_STRING_REGEX))
