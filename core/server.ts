@@ -88,7 +88,7 @@ export class Server {
 	}
 	private handleRequest(request: libHttp.IncomingMessage, response: libHttp.ServerResponse, check: CheckHost, handler: libHandler.AttachedModule, port: number, secure: boolean): void {
 		this.handleWrapper(true, request, check, handler, port, (host: string): libClient.HttpRequest => {
-			return new libClient.HttpRequest(request, response, host, (secure ? 'https:' : 'http:'));
+			return new libClient.HttpRequest(request, response, host, (secure ? 'https:' : 'http:'), this.wss);
 		}).catch((err: any) => {
 			logger.error(`Fatal error in request handler: ${err.message}`);
 			request.destroy(new Error('Unhandled exception'));

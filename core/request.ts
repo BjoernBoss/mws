@@ -9,7 +9,7 @@ export interface StatusType {
 	msg: string;
 }
 export const Status = {
-	Ok: { code: 200, msg: 'Ok' },
+	Ok: { code: 200, msg: 'OK' },
 	Created: { code: 201, msg: 'Created' },
 	PartialContent: { code: 206, msg: 'Partial Content' },
 	SeeOther: { code: 303, msg: 'See Other' },
@@ -20,12 +20,13 @@ export const Status = {
 	Forbidden: { code: 403, msg: 'Forbidden' },
 	NotFound: { code: 404, msg: 'Not Found' },
 	MethodNotAllowed: { code: 405, msg: 'Method Not Allowed' },
+	RequestTimeout: { code: 408, msg: 'Request Timeout' },
 	Conflict: { code: 409, msg: 'Conflict' },
 	PreconditionFailed: { code: 412, msg: 'Precondition Failed' },
 	ContentTooLarge: { code: 413, msg: 'Content Too Large' },
 	UnsupportedMediaType: { code: 415, msg: 'Unsupported Media Type' },
-	RequestTimeout: { code: 408, msg: 'Request Timeout' },
 	RangeIssue: { code: 416, msg: 'Range Not Satisfiable' },
+	UpgradeRequired: { code: 426, msg: 'Upgrade Required' },
 	InternalError: { code: 500, msg: 'Internal Server Error' }
 } as const satisfies Record<string, StatusType>
 

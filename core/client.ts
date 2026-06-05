@@ -156,9 +156,10 @@ enum ResponseState {
 *		=> Premature destroying of receive reader will result in the connection being gracefully terminated.
 *		=> All data must have been received before the response is completed.
 *	
-*	A response sent while another is being prepared (acknowledged) will override it and close the connection
-*	A response sent while data is already being streamed (header sent) will break the connection
-*	Responses automatically add Config.responseCacheControl, if no other cache control is specified
+*	A response sent while another is being prepared (acknowledged) will override it and close the connection.
+*	A response sent while data is already being streamed (header sent) will break the connection.
+*	Responses automatically add Config.responseCacheControl, if no other cache control is specified.
+*	Responses will either use the dedicated responder interface and its highWaterMark, or a responder interface, which caches up to socket.highWaterMark.
 */
 export abstract class IncomingBase extends ClientBase {
 	protected headerPatcher: HeaderPatch[];
@@ -172,6 +173,7 @@ export abstract class IncomingBase extends ClientBase {
 		breakResolve: () => void;
 		receive: ReceiveState;
 		response: ResponseState;
+		upgrade: UpgradeState;
 		breaking: Promise<void> | null;
 	};
 	private throughput: {
@@ -186,13 +188,11 @@ export abstract class IncomingBase extends ClientBase {
 		request: libHttp.IncomingMessage;
 		response: HttpResponseInterface;
 		writer: libStream.Writable;
+		wss: libWs.WebSocketServer;
 		socket?: { socket: libStream.Duplex, head: Buffer };
 	};
 
-	/* finish handling the request */
-	protected abstract handleFinishing(): void;
-
-	protected constructor(request: libHttp.IncomingMessage, host: string, protocol: string, kind: string, response: libHttp.ServerResponse | { socket: libStream.Duplex, head: Buffer }) {
+	protected constructor(request: libHttp.IncomingMessage, host: string, protocol: string, kind: string, response: libHttp.ServerResponse | { socket: libStream.Duplex, head: Buffer }, wss: libWs.WebSocketServer) {
 		super(new libUrl.URL(`${protocol}//${host == '' ? '_' : host}${request.url}`), kind);
 		this.headerPatcher = [];
 		this.htmlPatcher = [];
@@ -207,6 +207,7 @@ export abstract class IncomingBase extends ClientBase {
 			breakResolve: () => { },
 			receive: ReceiveState.none,
 			response: ResponseState.none,
+			upgrade: UpgradeState.none,
 			breaking: null
 		};
 		this.baseState.respondedResolve = respondedResolve;
@@ -266,7 +267,7 @@ export abstract class IncomingBase extends ClientBase {
 		}
 		else
 			[responseWrapper, writerWrapper] = this.wrapSocketWriter(response.socket);
-		this.nativeInterface = { request, response: responseWrapper, writer: writerWrapper, socket: (response instanceof libHttp.ServerResponse ? undefined : response) };
+		this.nativeInterface = { request, response: responseWrapper, writer: writerWrapper, socket: (response instanceof libHttp.ServerResponse ? undefined : response), wss };
 	}
 
 	private constructQuickResponse(status: libRequest.StatusType, logReason: string | null, headers: Record<string, string> | undefined, content?: { media: libRequest.MediaType, body?: Buffer } | null): void {
@@ -326,132 +327,19 @@ export abstract class IncomingBase extends ClientBase {
 			this.respondRequestTimeout(`Throughput below [${this.throughput.threshold}] bytes/sec`, { headers: { 'Connection': 'close' } });
 		this.markAsBroken(`Throughput below [${this.throughput.threshold}] bytes/sec`, closing);
 	}
-	private receiveClientData(maxLength: number | null): libStream.Readable {
-		const makeErrorStream = (msg: string) => new libStream.Readable({ read() { this.destroy(new Error(msg)) } });
+	private updateThroughput(delta: number): void {
+		if (this.throughput.timer != null)
+			clearTimeout(this.throughput.timer);
+		this.throughput.timer = null;
+		if (this.throughput.threshold <= 0)
+			return;
+		const _now = Date.now();
+		const now = Math.max(_now, this.throughput.start);
 
-		/* check if the object is ready for receiving */
-		if (this.baseState.receive != ReceiveState.none) {
-			this.badClientUsage('Already receiving data', false);
-			return makeErrorStream('Connection is already being received');
-		}
-		if (this.baseState.response == ResponseState.broken)
-			return makeErrorStream('Connection broken');
-		this.baseState.receive = ReceiveState.receiving;
-
-		/* setup the accumulation transformer (which will also be returned in the end; mark receiving
-		*	as completed upon destroy - will automatically drain the request on cleanup) */
-		let accumulated = 0;
-		const output = new libStream.Transform({
-			transform: (chunk, _, cb) => {
-				if (output.destroyed) return cb(new Error('Already failed'));
-
-				/* check if the connection has been processed or marked as failed */
-				if (this.baseState.response == ResponseState.completed)
-					this.badClientUsage('Response completed during active receive', false);
-				if (this.baseState.response == ResponseState.broken)
-					return cb(new Error('Connection broken'));
-
-				/* check the maximum count (is violated) */
-				this.updateThroughput(chunk.byteLength);
-				accumulated += chunk.byteLength;
-				if (maxLength == null || accumulated <= maxLength)
-					return cb(null, chunk);
-				this.respondContentTooLarge(maxLength, accumulated);
-				cb(new Error('Request payload is too large'));
-			},
-			destroy: (err, cb) => {
-				if (this.baseState.receive == ReceiveState.receiving) {
-					this.nativeInterface.request.unpipe();
-					this.baseState.receive = ReceiveState.completed;
-				}
-				cb(err);
-			},
-			final: (cb) => {
-				if (this.baseState.receive == ReceiveState.receiving) {
-					this.nativeInterface.request.unpipe();
-					this.baseState.receive = ReceiveState.completed;
-				}
-				cb();
-			},
-
-		});
-
-		/* check if the content is encoded and create the chain of decoders (in reverse to ensure the nesting is correct) */
-		let stream: libStream.Readable = this.nativeInterface.request;
-		if (this.headers['content-encoding'] != null) {
-			const encodings = libRequest.SplitAndTrimList(this.headers['content-encoding'], ',', false);
-
-			for (let i = encodings.length - 1; i >= 0; --i) {
-				const encoding = libRequest.LookupEncoding(encodings[i]);
-
-				if (encoding == null) {
-					output.destroy();
-					this.respondUnsupported(encodings[i], libRequest.SupportedEncodingNames().join(','));
-					return makeErrorStream('Unsupported content encoding');
-				}
-
-				/* configure the piping accordingly */
-				const decoder = encoding.makeDecode();
-				stream = stream.pipe(decoder);
-				decoder.once('error', (err: any) => {
-					if (output.destroyed) return;
-					this.respondBadRequest('Invalid data encoding');
-					output.destroy(err);
-				});
-
-				/* register the cleanup handler to ensure the decoder is destroyed on completion */
-				output.once('close', () => decoder.destroy());
-			}
-		}
-
-		/* check if too many data have been promised (cannot be trusted if content-encoding is enabled) */
-		else if (maxLength != null && this.headers['content-length'] != null) {
-			const contentSize = parseInt(this.headers['content-length']);
-
-			/* check if the length is valid and otherwise mark the request as 'consumed' */
-			if (!isFinite(contentSize) || contentSize < 0 || contentSize > maxLength) {
-				output.destroy();
-				this.respondContentTooLarge(maxLength, contentSize);
-				return makeErrorStream('Request payload is too large');
-			}
-		}
-
-		/* register the broken handler to detect closed or failed connections */
-		this.baseState.breakPromise.then(() => {
-			if (!output.destroyed)
-				output.destroy(new Error('Connection broken'));
-		});
-
-		/* create the plumbing between stream and output (errors are already handled) */
-		return stream.pipe(output);
-	}
-	private async killNativeConnection(graceful: boolean): Promise<void> {
-		const native = this.nativeInterface;
-
-		/* raw closer, which will fully destroy the connection */
-		const closeConnection = () => {
-			if (native.request.destroyed && native.writer.destroyed)
-				return;
-			const error = new Error('Connection broken');
-
-			native.request.destroy(error);
-			native.writer.destroy(error);
-		};
-
-		if (!graceful || native.writer.writableFinished || native.writer.destroyed)
-			return closeConnection();
-
-		/* if graceful, wait for the last queued data to be sent; may be called multiple times */
-		return new Promise<void>((resolve) => {
-			let settled = false, handler = () => {
-				if (settled) return; settled = true;
-				closeConnection();
-				resolve();
-			};
-			native.writer.once('finish', () => handler());
-			native.writer.once('error', () => handler());
-			native.writer.once('close', () => handler());
-		});
+		/* shift the deadline according to the bought time by the throughput */
+		const bought = (delta / this.throughput.threshold) * 1000;
+		this.throughput.deadline = now + Math.min(this.throughput.window, Math.max(0, this.throughput.deadline - now) + bought);
+		this.throughput.timer = setTimeout(() => this.failThroughput(), this.throughput.deadline - _now);
 	}
 	private wrapSocketWriter(socket: libStream.Duplex): [HttpResponseInterface, libStream.Writable] {
 		let headers: Record<string, string> = {}, status: number = 0, message: string = '';
@@ -522,7 +410,8 @@ export abstract class IncomingBase extends ClientBase {
 
 		/* note: writer cannot interfere with later web-socket native socket, as the web-socket will only be instantiated,
 		*	if response-state is none, and vice versa, all writers will fail once web-socket has started, as response-state
-		*	will be header-sent (writer itself can never fail, as no error handlers will be attached to it) */
+		*	will be header-sent (writer itself can never fail, and no error handlers will be attached to it; it uses the
+		*	underlying sockets watermark as buffering capacity) */
 		const writer = new libStream.Writable({
 			destroy: (err, cb) => {
 				if (settled) return; settled = true;
@@ -532,33 +421,47 @@ export abstract class IncomingBase extends ClientBase {
 			write: (chunk, _, cb) => {
 				if (settled) return;
 				buffer = (buffer == null ? chunk as Buffer : Buffer.concat([buffer, chunk]));
-				if (buffer.byteLength < 16000)
+				if (buffer.byteLength < writer.writableHighWaterMark)
 					return cb(null);
 				flushBuffer(cb, false);
 			},
 			final: (cb) => {
 				if (settled) return; settled = true;
 				flushBuffer(cb, true);
-			}
+			},
+			highWaterMark: socket.writableHighWaterMark
 		});
 		return [response, writer];
 	}
+	private async killNativeConnection(graceful: boolean): Promise<void> {
+		const native = this.nativeInterface;
 
-	private updateThroughput(delta: number): void {
-		if (this.throughput.timer != null)
-			clearTimeout(this.throughput.timer);
-		this.throughput.timer = null;
-		if (this.throughput.threshold <= 0)
-			return;
-		const _now = Date.now();
-		const now = Math.max(_now, this.throughput.start);
+		/* raw closer, which will fully destroy the connection */
+		const closeConnection = () => {
+			if (native.request.destroyed && native.writer.destroyed)
+				return;
+			const error = new Error('Connection broken');
 
-		/* shift the deadline according to the bought time by the throughput */
-		const bought = (delta / this.throughput.threshold) * 1000;
-		this.throughput.deadline = now + Math.min(this.throughput.window, Math.max(0, this.throughput.deadline - now) + bought);
-		this.throughput.timer = setTimeout(() => this.failThroughput(), this.throughput.deadline - _now);
+			native.request.destroy(error);
+			native.writer.destroy(error);
+		};
+
+		if (!graceful || native.writer.writableFinished || native.writer.destroyed)
+			return closeConnection();
+
+		/* if graceful, wait for the last queued data to be sent; may be called multiple times */
+		return new Promise<void>((resolve) => {
+			let settled = false, handler = () => {
+				if (settled) return; settled = true;
+				closeConnection();
+				resolve();
+			};
+			native.writer.once('finish', () => handler());
+			native.writer.once('error', () => handler());
+			native.writer.once('close', () => handler());
+		});
 	}
-	protected markAsBroken(reason: string, graceful: boolean): void {
+	private markAsBroken(reason: string, graceful: boolean): void {
 		this.error(`Connection broken: [${reason}]`);
 		this.baseState.response = ResponseState.broken;
 		if (this.baseState.breaking != null) {
@@ -592,9 +495,10 @@ export abstract class IncomingBase extends ClientBase {
 
 		this.baseState.breakResolve();
 	}
-	protected badClientUsage(reason: string, close: boolean): void {
+	private badClientUsage(reason: string, close: boolean): void {
 		this.respondInternalError(`Bad Usage: ${reason}`, (close ? { headers: { 'Connection': 'close' } } : undefined));
 	}
+
 	private closeHeader(status: libRequest.StatusType, headers: Record<string, string>, content?: { media: libRequest.MediaType, size?: number, encoding?: string }): void {
 		let logMsg = `Sending [${status.msg}] ${this.isHead ? 'HEAD ' : ''}`;
 		if (content?.media == null)
@@ -629,7 +533,8 @@ export abstract class IncomingBase extends ClientBase {
 				headers['Content-Length'] = content.size.toString();
 		}
 
-		/* check if its an upgrade request, which is always marked as being closed */
+		/* check if its an upgrade request, which is always marked as being closed, as the
+		*	underlying web-server will not take it back into the queue for keep-alive sockets */
 		if (this.nativeInterface.socket != null)
 			headers['Connection'] = 'close';
 
@@ -847,31 +752,141 @@ export abstract class IncomingBase extends ClientBase {
 
 		return output;
 	}
+	private receiveClientData(maxLength: number | null): libStream.Readable {
+		const makeErrorStream = (msg: string) => new libStream.Readable({ read() { this.destroy(new Error(msg)) } });
+
+		/* check if the object is ready for receiving */
+		if (this.baseState.receive != ReceiveState.none) {
+			this.badClientUsage('Already receiving data', false);
+			return makeErrorStream('Connection is already being received');
+		}
+		if (this.baseState.response == ResponseState.broken)
+			return makeErrorStream('Connection broken');
+		this.baseState.receive = ReceiveState.receiving;
+
+		/* setup the accumulation transformer (which will also be returned in the end; mark receiving
+		*	as completed upon destroy - will automatically drain the request on cleanup) */
+		let accumulated = 0;
+		const output = new libStream.Transform({
+			transform: (chunk, _, cb) => {
+				if (output.destroyed) return cb(new Error('Already failed'));
+
+				/* check if the connection has been processed or marked as failed */
+				if (this.baseState.response == ResponseState.completed)
+					this.badClientUsage('Response completed during active receive', false);
+				if (this.baseState.response == ResponseState.broken)
+					return cb(new Error('Connection broken'));
+
+				/* check the maximum count (is violated) */
+				this.updateThroughput(chunk.byteLength);
+				accumulated += chunk.byteLength;
+				if (maxLength == null || accumulated <= maxLength)
+					return cb(null, chunk);
+				this.respondContentTooLarge(maxLength, accumulated);
+				cb(new Error('Request payload is too large'));
+			},
+			destroy: (err, cb) => {
+				if (this.baseState.receive == ReceiveState.receiving) {
+					this.nativeInterface.request.unpipe();
+					this.baseState.receive = ReceiveState.completed;
+				}
+				cb(err);
+			},
+			final: (cb) => {
+				if (this.baseState.receive == ReceiveState.receiving) {
+					this.nativeInterface.request.unpipe();
+					this.baseState.receive = ReceiveState.completed;
+				}
+				cb();
+			},
+
+		});
+
+		/* check if the content is encoded and create the chain of decoders (in reverse to ensure the nesting is correct) */
+		let stream: libStream.Readable = this.nativeInterface.request;
+		if (this.headers['content-encoding'] != null) {
+			const encodings = libRequest.SplitAndTrimList(this.headers['content-encoding'], ',', false);
+
+			for (let i = encodings.length - 1; i >= 0; --i) {
+				const encoding = libRequest.LookupEncoding(encodings[i]);
+
+				if (encoding == null) {
+					output.destroy();
+					this.respondUnsupported(encodings[i], libRequest.SupportedEncodingNames().join(','));
+					return makeErrorStream('Unsupported content encoding');
+				}
+
+				/* configure the piping accordingly */
+				const decoder = encoding.makeDecode();
+				stream = stream.pipe(decoder);
+				decoder.once('error', (err: any) => {
+					if (output.destroyed) return;
+					this.respondBadRequest('Invalid data encoding');
+					output.destroy(err);
+				});
+
+				/* register the cleanup handler to ensure the decoder is destroyed on completion */
+				output.once('close', () => decoder.destroy());
+			}
+		}
+
+		/* check if too many data have been promised (cannot be trusted if content-encoding is enabled) */
+		else if (maxLength != null && this.headers['content-length'] != null) {
+			const contentSize = parseInt(this.headers['content-length']);
+
+			/* check if the length is valid and otherwise mark the request as 'consumed' */
+			if (!isFinite(contentSize) || contentSize < 0 || contentSize > maxLength) {
+				output.destroy();
+				this.respondContentTooLarge(maxLength, contentSize);
+				return makeErrorStream('Request payload is too large');
+			}
+		}
+
+		/* register the broken handler to detect closed or failed connections */
+		this.baseState.breakPromise.then(() => {
+			if (!output.destroyed)
+				output.destroy(new Error('Connection broken'));
+		});
+
+		/* create the plumbing between stream and output (errors are already handled) */
+		return stream.pipe(output);
+	}
 
 	public async _finishConnection(): Promise<void> {
-		try {
-			if (this.baseState.response == ResponseState.none)
-				this.respondNotFound();
+		/* ensure the connection is default replied with not-found */
+		if (this.baseState.response == ResponseState.none)
+			this.respondNotFound();
 
-			if (this.baseState.receive == ReceiveState.receiving) {
-				/* check if the response is already completed, in which case it can be silently
-				*	reset to 'header-sent' to ensure the connection is properly marked as broken */
-				if (this.baseState.response == ResponseState.completed)
-					this.baseState.response = ResponseState.headerSent;
-				this.badClientUsage('Receive stream not consumed', false);
-			}
+		/* ensure that the data have been fully received (if the response is already completed,
+		*	silently reset to 'header-sent' to ensure the connection is properly marked as broken) */
+		if (this.baseState.receive == ReceiveState.receiving && this.baseState.response != ResponseState.broken) {
+			if (this.baseState.response == ResponseState.completed)
+				this.baseState.response = ResponseState.headerSent;
+			this.badClientUsage('Receive stream not consumed', false);
+		}
 
-			this.handleFinishing();
+		/* check if data remain in the pipeline, in which case the connection needs
+		*	to be closed to ensure the sender does not pipe more data over */
+		const request = this.nativeInterface.request;
+		if (!request.readableEnded && !request.destroyed && this.baseState.response != ResponseState.broken) {
+			const length = parseInt(this.headers['content-length'] ?? '0');
+			const chunked = (this.headers['transfer-encoding'] != null);
+			if (length != 0 || chunked)
+				this.markAsBroken((request.readableLength > 0 ? 'Uploaded data not consumed' : 'Potential uploaded data not consumed'), true);
+		}
 
-			/* check if data remain in the pipeline, in which case the connection needs
-			*	to be closed to ensure the sender does not pipe more data over */
-			if (this.baseState.response != ResponseState.broken && !this.nativeInterface.request.readableEnded && !this.nativeInterface.request.destroyed) {
-				const length = parseInt(this.headers['content-length'] ?? '0');
-				const chunked = (this.headers['transfer-encoding'] != null);
-				if (length != 0 || chunked)
-					this.markAsBroken((this.nativeInterface.request.readableLength > 0 ? 'Uploaded data not consumed' : 'Potential uploaded data not consumed'), true);
-			}
-		} catch (_) { }
+		/* check if the upgrade was not fully awaited */
+		if (this.baseState.upgrade == UpgradeState.upgrading && this.baseState.response != ResponseState.broken)
+			this.badClientUsage('Upgrade not fully awaited', false);
+
+		/* ensure that the response was properly sent */
+		if (this.baseState.response != ResponseState.completed && this.baseState.response != ResponseState.broken)
+			this.badClientUsage('Response not completed', false);
+
+		/* check if the connection was an upgrade but was not was accepted, which needs to be
+		*	killed, as the underlying web-server will not clean this connection up anymore */
+		if (this.nativeInterface.socket != null && this.baseState.upgrade != UpgradeState.upgraded && this.baseState.response != ResponseState.broken)
+			this.markAsBroken('Upgrade was not accepted', true);
 
 		/* kill the throughput timer, as it either does not need to be checked anymore, or it
 		*	will have left the connection as broken, and will automatically be closed now
@@ -1174,7 +1189,7 @@ export abstract class IncomingBase extends ClientBase {
 		header['Allow'] = allowed;
 
 		this.constructQuickResponse(libRequest.Status.MethodNotAllowed, `Allowed was [${allowed}] but [${method}] was used`, header, {
-			media: libRequest.Media.Text, body: Buffer.from(`Method ${method} not allowed for [${this.url.pathname}].\nAllowed: ${allowed}`, 'utf-8')
+			media: libRequest.Media.Text, body: Buffer.from(`Method ${method} not allowed for [${this.url.pathname}].\nAllowed: ${allowed}.`, 'utf-8')
 		});
 	}
 
@@ -1192,6 +1207,18 @@ export abstract class IncomingBase extends ClientBase {
 	public respondContentTooLarge(allowed: number, atLeastProvided: number, options?: { headers?: Record<string, string> }): void {
 		this.constructQuickResponse(libRequest.Status.ContentTooLarge, `[${atLeastProvided}] > [${allowed}]`, options?.headers, {
 			media: libRequest.Media.Text, body: Buffer.from(`Content of at least size ${atLeastProvided} too large for [${this.url.pathname}].\nAt most ${allowed} bytes are allowed.`, 'utf-8')
+		});
+	}
+
+	/* respond with [update-required] and a default text response */
+	public respondUpdateRequired(upgrade: string, options?: { headers?: Record<string, string> }): void {
+		const header = (options?.headers ?? {});
+		if (!('Connection' in header))
+			header['Connection'] = 'upgrade';
+		header['Upgrade'] = upgrade;
+
+		this.constructQuickResponse(libRequest.Status.UpgradeRequired, `Required: ${upgrade}`, options?.headers, {
+			media: libRequest.Media.Text, body: Buffer.from(`Endpoint [${this.url.pathname}] requires an upgrade.\nRequired: ${upgrade}`, 'utf-8')
 		});
 	}
 
@@ -1502,6 +1529,65 @@ export abstract class IncomingBase extends ClientBase {
 			throw err;
 		}
 	}
+
+	/* marks the object as having been handled and returns a web socket or
+	*	automatically responds with a corresponding error and returns null */
+	public async acceptWebSocket(): Promise<ClientSocket | null> {
+		if (this.baseState.response != ResponseState.none) {
+			this.badClientUsage('WebSocket upgrade on already claimed connection', false);
+			return null;
+		}
+
+		/* check if the connection is a valid upgrade request (and ensure that the underlying web-server, also detected it) */
+		let connection = libRequest.SplitAndTrimList(this.headers.connection?.toLowerCase() ?? null, ',', false);
+		if (connection.indexOf('upgrade') == -1 || this.headers?.upgrade?.toLowerCase() != 'websocket' || this.method != 'GET') {
+			this.respondUpdateRequired('websocket');
+			return null;
+		}
+		if (this.nativeInterface.socket == null) {
+			this.respondInternalError('Request was not constructed as upgradable');
+			return null;
+		}
+		const native = this.nativeInterface.socket;
+
+		/* mark the connection as being accepted */
+		this.baseState.response = ResponseState.headerSent;
+		this.baseState.respondedResolve();
+		this.baseState.upgrade = UpgradeState.upgrading;
+		this.trace(`Performing upgrade on web socket connection: [${this.url.pathname}]`);
+
+		/* await the actual websocket upgrade */
+		const ws = await new Promise<ClientSocket | null>((resolve) => {
+			let settled = false;
+
+			/* register the broken listener (to detect failures of the upgrading or network errors) */
+			this.baseState.breakPromise.then(() => {
+				if (settled) return; settled = true;
+				this.error('Failed to upgrade to WebSocket');
+				resolve(null);
+			});
+
+			/* start the upgrade process (web-socket upgrade handler will automatically send error messages) */
+			this.nativeInterface.wss.handleUpgrade(this.nativeInterface.request, native.socket, native.head, (ws, _) => {
+				if (!settled && this.baseState.response == ResponseState.headerSent) {
+					settled = true, this.baseState.response = ResponseState.completed;
+
+					/* ensure that the socket is valid as otherwise proper cleanup might not be guaranteed (no
+					*	need to log errors, as this will trigger the broken state, which will be logged) */
+					if (native.socket.destroyed)
+						return resolve(null);
+					return resolve(new ClientSocket(ws, this));
+				}
+				const settler = !settled;
+				settled = true;
+				this.markAsBroken('Broken connection upgraded', false);
+				if (settler)
+					resolve(null);
+			});
+		});
+		this.baseState.upgrade = UpgradeState.upgraded;
+		return ws;
+	}
 }
 
 /*
@@ -1516,14 +1602,8 @@ export abstract class IncomingBase extends ClientBase {
 *	Defaults [Vary] to 'Accept-Encoding'
 */
 export class HttpRequest extends IncomingBase {
-	constructor(request: libHttp.IncomingMessage, response: libHttp.ServerResponse, host: string, protocol: string) {
-		super(request, host, protocol, 'client', response);
-	}
-
-	protected override handleFinishing(): void {
-		/* ensure that the response was properly sent */
-		if (this.baseState.response != ResponseState.completed && this.baseState.response != ResponseState.broken)
-			this.badClientUsage('Response not completed', false);
+	constructor(request: libHttp.IncomingMessage, response: libHttp.ServerResponse, host: string, protocol: string, wss: libWs.WebSocketServer) {
+		super(request, host, protocol, 'client', response, wss);
 	}
 }
 
@@ -1568,84 +1648,10 @@ class HttpRequestResponse extends libStream.Writable {
 */
 export class HttpUpgrade extends IncomingBase {
 	private wss: libWs.WebSocketServer;
-	private upgrade: UpgradeState;
 
 	constructor(request: libHttp.IncomingMessage, socket: libStream.Duplex, head: Buffer, host: string, protocol: string, wss: libWs.WebSocketServer) {
-		super(request, host, protocol, 'upgrade', { socket, head });
+		super(request, host, protocol, 'upgrade', { socket, head }, wss);
 		this.wss = wss;
-		this.upgrade = UpgradeState.none;
-	}
-
-	protected override handleFinishing(): void {
-		/* check if the upgrade was not fully awaited */
-		if (this.upgrade == UpgradeState.upgrading)
-			this.badClientUsage('Upgrade not fully awaited', false);
-
-		/* check if the connection was accepted (only reason to keep it alive,
-		*	as source web-server will not clean this connection up anymore) */
-		if (this.baseState.response == ResponseState.completed && this.upgrade == UpgradeState.upgraded)
-			return;
-
-		/* check if the state is incomplete and break the connection but ensure it is closed
-		*	either way (to ensure the connection is definitely closed, if not upgrade) */
-		if (this.baseState.response != ResponseState.completed && this.baseState.response != ResponseState.broken)
-			this.badClientUsage('Response not completed', false);
-		if (this.baseState.response != ResponseState.broken)
-			this.markAsBroken('Upgrade was not accepted', true);
-	}
-
-	/* marks the object as having been handled and returns a web socket or
-	*	automatically responds with a corresponding error and returns null */
-	public async acceptWebSocket(): Promise<ClientSocket | null> {
-		if (this.baseState.response != ResponseState.none) {
-			this.badClientUsage('WebSocket upgrade on already claimed connection', false);
-			return null;
-		}
-
-		/* check if the connection is a valid upgrade request */
-		let connection = libRequest.SplitAndTrimList(this.headers.connection?.toLowerCase() ?? null, ',', false);
-		if (connection.indexOf('upgrade') == -1 || this.headers?.upgrade?.toLowerCase() != 'websocket' || this.nativeInterface.request.method != 'GET') {
-			this.respondBadRequest('Request is not a valid WebSocket upgrade');
-			return null;
-		}
-
-		/* mark the connection as being accepted */
-		this.baseState.response = ResponseState.headerSent;
-		this.upgrade = UpgradeState.upgrading;
-		this.trace(`Performing upgrade on web socket connection: [${this.url.pathname}]`);
-		const ws = await new Promise<ClientSocket | null>((resolve) => {
-			let settled = false;
-
-			/* register the broken listener (to detect failures of the upgrading or network errors) */
-			this.baseState.breakPromise.then(() => {
-				if (settled) return; settled = true;
-				this.error('Failed to upgrade to WebSocket');
-				resolve(null);
-			});
-
-			/* start the upgrade process (web-socket upgrade handler will automatically send error messages) */
-			const native = this.nativeInterface.socket!;
-			this.wss.handleUpgrade(this.nativeInterface.request, native.socket, native.head, (ws, _) => {
-				if (!settled && this.baseState.response == ResponseState.headerSent) {
-					settled = true, this.baseState.response = ResponseState.completed;
-
-					/* ensure that the socket is valid as otherwise proper cleanup might not be guaranteed (no
-					*	need to log errors, as this will trigger the broken state, which will be logged) */
-					if (native.socket.destroyed)
-						return resolve(null);
-					return resolve(new ClientSocket(ws, this));
-				}
-				const settler = !settled;
-				settled = true;
-				this.markAsBroken('Broken connection upgraded', false);
-				if (settler)
-					resolve(null);
-			});
-		});
-
-		this.baseState.respondedResolve();
-		this.upgrade = UpgradeState.upgraded;
-		return ws;
 	}
 }
 
@@ -1668,7 +1674,7 @@ export class ClientSocket extends ClientBase {
 	public ondata?: (data: libWs.RawData, isBinary: boolean) => void;
 	public onclose?: () => void;
 
-	constructor(ws: libWs.WebSocket, base: HttpUpgrade) {
+	constructor(ws: libWs.WebSocket, base: IncomingBase) {
 		super(base, 'socket');
 		this.ws = ws;
 		this.timer = null;
