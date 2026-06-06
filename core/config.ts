@@ -4,7 +4,7 @@ import * as libLog from "./log.js";
 
 const logger = libLog.Logger('config');
 
-export class CoreConfig {
+class CoreConfig {
 	private _subscriber: (() => void)[] = [];
 	private _serverName: string = '';
 	private _webSocketTimeout: number = 0;
@@ -233,7 +233,7 @@ export const Config: CoreConfig = new CoreConfig();
 /*
 *	Initial root server configuration
 */
-export function Initialize(): void {
+export function InitializeConfig(): void {
 	Config.serverName = 'Modular Web Server';
 	Config.commonHeaders = { 'X-Content-Type-Options': 'nosniff' };
 	Config.webSocketTimeout = 180_000;

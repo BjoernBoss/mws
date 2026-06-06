@@ -2,7 +2,6 @@
 /* Copyright (c) 2024-2026 Bjoern Boss Henrichsen */
 import { Config as libConfig } from "./config.js";
 import * as libLog from "./log.js";
-import * as libLocation from "./location.js";
 import * as libBuilder from "./builder.js";
 import * as libCache from "./cache.js";
 import * as libHelper from "./helper.js";
@@ -49,7 +48,7 @@ class ClientBase extends libLog.LogIdentity {
 
 		if (arg instanceof libUrl.URL) {
 			this.pathTranslation = [];
-			this.relativePath = libLocation.Sanitize(arg.pathname, false);
+			this.relativePath = libHelper.Sanitize(arg.pathname, false);
 			this.url = arg;
 		}
 		else {
@@ -72,17 +71,17 @@ class ClientBase extends libLog.LogIdentity {
 
 	/* check if the path relative to the current module is a sub path of the given test base path */
 	public isSubPathOf(base: string): boolean {
-		return libLocation.IsSubPath(base, this.relativePath);
+		return libHelper.IsSubPath(base, this.relativePath);
 	}
 
 	/* check if the path relative to the current module is inside of the given test base path */
 	public isInsideOf(base: string): boolean {
-		return libLocation.IsInside(base, this.relativePath);
+		return libHelper.IsInside(base, this.relativePath);
 	}
 
 	/* create a path relative from the current module into the clients traversed server space */
 	public makePath(path: string): string {
-		path = libLocation.Sanitize(path, false);
+		path = libHelper.Sanitize(path, false);
 		let output = path;
 
 		for (let i = this.pathTranslation.length - 1; i >= 0; --i) {
@@ -92,18 +91,18 @@ class ClientBase extends libLog.LogIdentity {
 			for (const [from, to] of Object.entries(this.pathTranslation[i])) {
 				if (to == null)
 					nullCheck = true;
-				else if (libLocation.IsSubPath(to, output) && (match == null || match[1]!.length < to.length))
+				else if (libHelper.IsSubPath(to, output) && (match == null || match[1]!.length < to.length))
 					match = [from, to];
 			}
 			if (match != null)
-				output = libLocation.Rebase(match[1]!, match[0], output);
+				output = libHelper.Rebase(match[1]!, match[0], output);
 
 			/* check if the translation contained null-mappings and check if
 			*	the final unpacked path re-maps into the null-mapping */
 			if (nullCheck) {
 				match = null;
 				for (const [from, to] of Object.entries(this.pathTranslation[i])) {
-					if (libLocation.IsSubPath(from, output) && (match == null || match[0].length < from.length))
+					if (libHelper.IsSubPath(from, output) && (match == null || match[0].length < from.length))
 						match = [from, to];
 				}
 			}
@@ -970,8 +969,8 @@ export class ClientRequest extends ClientBase {
 		else {
 			sanitized = {};
 			for (const [_from, _to] of Object.entries(map)) {
-				const from = libLocation.Sanitize(_from, false);
-				const to = (_to == null ? null : libLocation.Sanitize(_to, false));
+				const from = libHelper.Sanitize(_from, false);
+				const to = (_to == null ? null : libHelper.Sanitize(_to, false));
 				sanitized[from] = to;
 
 				/* check if the mapping can be applied to the current path */
@@ -986,7 +985,7 @@ export class ClientRequest extends ClientBase {
 			this.throughput.busyCheck.length, this.headerPatcher.length, this.htmlPatcher.length);
 
 		/* setup the new path, all path translations, and the tagged logging identity */
-		this.relativePath = libLocation.Rebase(match[0], match[1]!, this.relativePath);
+		this.relativePath = libHelper.Rebase(match[0], match[1]!, this.relativePath);
 		if (sanitized != null)
 			this.pathTranslation.push(sanitized);
 		if (identity != '')

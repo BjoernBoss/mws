@@ -2,7 +2,7 @@
 /* Copyright (c) 2026 Bjoern Boss Henrichsen */
 import { Config as libConfig } from "./config.js";
 import * as libLog from "./log.js";
-import * as libLocation from "./location.js";
+import * as libHelper from "./helper.js";
 import * as libBase from "./base.js";
 import * as libFs from "fs";
 import * as libStream from "stream";
@@ -176,7 +176,7 @@ class ImmutableManager {
 			entry.unique += UNIQUE_ID_CHARS[libCrypto.randomInt(UNIQUE_ID_CHARS.length)];
 
 		/* patch the state up to contain the new id */
-		const [base, name, extension] = libLocation.SplitFilePath(entry.path);
+		const [base, name, extension] = libHelper.SplitFilePath(entry.path);
 		entry.immutable = `${base}${name}.${entry.unique}${extension}`;
 		this.reverse[entry.unique] = entry.identifier;
 
@@ -212,7 +212,7 @@ class ImmutableManager {
 			const content: string = JSON.stringify(output);
 
 			/* ignore any read/write failures */
-			await libLocation.AtomicWrite(this.writeBack.path, content, 'immutable state', logger);
+			await libHelper.AtomicWrite(this.writeBack.path, content, 'immutable state', logger);
 		}
 
 		this.writeBack.writing = null;
@@ -321,8 +321,8 @@ class ImmutableManager {
 			return [null, false];
 
 		/* check if it might be an immutable-tagged path */
-		const [base, temp, extension] = libLocation.SplitFilePath(path);
-		const [_, name, tempId] = libLocation.SplitFilePath(temp);
+		const [base, temp, extension] = libHelper.SplitFilePath(path);
+		const [_, name, tempId] = libHelper.SplitFilePath(temp);
 		if (!tempId.match(ID_EXTENSION_REGEX))
 			return [null, false];
 		const unique = tempId.substring(1);
@@ -376,7 +376,7 @@ class ImmutableManager {
 				continue;
 			logger.trace(`Recovering immutable unique id [${state.unique}] for [${state.identifier}]`);
 
-			const [base, name, extension] = libLocation.SplitFilePath(state.path);
+			const [base, name, extension] = libHelper.SplitFilePath(state.path);
 			this.map[state.identifier] = {
 				immutable: `${base}${name}.${state.unique}${extension}`,
 				identifier: state.identifier,

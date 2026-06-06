@@ -1,8 +1,9 @@
 {
 	"type": "module",
 	"private": true,
-	"name": "core",
+	"name": "mws",
 	"scripts": {
 		"build": "tsc"
-	}
+	},
+	"main": "index.js"
 }
