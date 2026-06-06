@@ -3,7 +3,6 @@
 export * from "./base.js";;
 export * from "./cache.js";
 export * from "./client.js";
-export * from "./config.js";
 export * from "./handler.js";
 export * from "./helper.js"
 export * from "./log.js";

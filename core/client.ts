@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 /* Copyright (c) 2024-2026 Bjoern Boss Henrichsen */
-import { Config as libConfig } from "./config.js";
 import * as libLog from "./log.js";
 import * as libBuilder from "./builder.js";
 import * as libCache from "./cache.js";
@@ -208,9 +207,9 @@ export type HtmlPatch = (page: libBuilder.HtmlPage, status: libBase.StatusType, 
 *	Defaults [Connection] to 'close' for upgrade requests.
 */
 export class ClientRequest extends ClientBase {
-	private headerPatcher: HeaderPatch[];
-	private htmlPatcher: HtmlPatch[];
-	private baseState: {
+	private _headerPatcher: HeaderPatch[];
+	private _htmlPatcher: HtmlPatch[];
+	private _state: {
 		respondedPromise: Promise<void>;
 		respondedResolve: () => void;
 		completedPromise: Promise<void>;
@@ -222,29 +221,29 @@ export class ClientRequest extends ClientBase {
 		upgrade: UpgradeState;
 		breaking: Promise<void> | null;
 	};
-	private throughput: {
+	private _throughput: {
 		timer: NodeJS.Timeout | null;
 		deadline: number;
 		start: number;
-		threshold: number;
-		window: number;
+		active: boolean;
 		busyCheck: (() => boolean)[];
 	};
-	private nativeInterface: {
-		cache: libCache.CacheHost;
-		request: libHttp.IncomingMessage;
+	private _native: {
 		response: HttpResponseInterface;
 		writer: libStream.Writable;
 		socket?: { socket: libStream.Duplex, head: Buffer, wss: libWs.WebSocketServer };
 	};
+	private _request: libHttp.IncomingMessage;
+	private _config: BurntClientConfig;
+	private _cache: libCache.CacheHost;
 
-	private constructor(cache: libCache.CacheHost, host: string, protocol: string, request: libHttp.IncomingMessage, response: libHttp.ServerResponse | { socket: libStream.Duplex, head: Buffer, wss: libWs.WebSocketServer }) {
+	private constructor(cache: libCache.CacheHost, config: BurntClientConfig, host: string, protocol: string, request: libHttp.IncomingMessage, response: libHttp.ServerResponse | { socket: libStream.Duplex, head: Buffer, wss: libWs.WebSocketServer }) {
 		super(new libUrl.URL(`${protocol}//${host == '' ? '_' : host}${request.url}`), 'request');
-		this.headerPatcher = [];
-		this.htmlPatcher = [];
+		this._headerPatcher = [];
+		this._htmlPatcher = [];
 
 		let respondedResolve: any = null, completedResolve: any = null, breakResolve: any = null;
-		this.baseState = {
+		this._state = {
 			respondedPromise: new Promise<void>((resolve) => respondedResolve = resolve),
 			respondedResolve: () => { },
 			completedPromise: new Promise<void>((resolve) => completedResolve = resolve),
@@ -256,35 +255,32 @@ export class ClientRequest extends ClientBase {
 			upgrade: UpgradeState.none,
 			breaking: null
 		};
-		this.baseState.respondedResolve = respondedResolve;
-		this.baseState.completedResolve = completedResolve;
-		this.baseState.breakResolve = breakResolve;
+		this._state.respondedResolve = respondedResolve;
+		this._state.completedResolve = completedResolve;
+		this._state.breakResolve = breakResolve;
+
+		this._request = request;
+		this._cache = cache;
+		this._config = config;
 
 		/* setup the throughput measurement to detect any stalling connections */
-		this.throughput = {
-			timer: null,
-			deadline: 0,
-			start: 0,
-			threshold: libConfig.throughputThreshold,
-			window: libConfig.throughputWindow,
-			busyCheck: []
-		};
-		if (this.throughput.threshold > 0) {
-			this.throughput.start = Date.now() + libConfig.throughputGrace;
+		this._throughput = { timer: null, deadline: 0, start: 0, active: true, busyCheck: [] };
+		if (this._config.throughputThreshold > 0) {
+			this._throughput.start = Date.now() + this._config.throughputGrace;
 			this.updateThroughput(0);
 		}
 
 		/* register the necessary network error handlers */
 		const lostHandler = () => {
-			if (this.baseState.response != ResponseState.completed && this.baseState.response != ResponseState.broken)
+			if (this._state.response != ResponseState.completed && this._state.response != ResponseState.broken)
 				this.markAsBroken('Connection lost', false);
 		};
 		const closedHandler = () => {
-			if (this.baseState.response != ResponseState.completed && this.baseState.response != ResponseState.broken)
+			if (this._state.response != ResponseState.completed && this._state.response != ResponseState.broken)
 				this.markAsBroken('Connection closed by remote', false);
 		};
 		const timeoutHandler = () => {
-			if (this.baseState.response != ResponseState.completed && this.baseState.response != ResponseState.broken)
+			if (this._state.response != ResponseState.completed && this._state.response != ResponseState.broken)
 				this.markAsBroken('Connection timed out', false);
 		};
 		request.once('error', lostHandler);
@@ -294,7 +290,7 @@ export class ClientRequest extends ClientBase {
 		request.socket.once('close', closedHandler);
 
 		/* ensure to remove the events again once the processing has completed */
-		this.baseState.completedPromise.then(() => {
+		this._state.completedPromise.then(() => {
 			request.removeListener('error', lostHandler);
 			request.removeListener('aborted', closedHandler);
 			request.socket.removeListener('timeout', timeoutHandler);
@@ -313,7 +309,7 @@ export class ClientRequest extends ClientBase {
 		}
 		else
 			[responseWrapper, writerWrapper] = this.wrapSocketWriter(response.socket);
-		this.nativeInterface = { cache, request, response: responseWrapper, writer: writerWrapper, socket: (response instanceof libHttp.ServerResponse ? undefined : response) };
+		this._native = { response: responseWrapper, writer: writerWrapper, socket: (response instanceof libHttp.ServerResponse ? undefined : response) };
 	}
 
 	private constructQuickResponse(status: libBase.StatusType, logReason: string | null, headers: Record<string, string> | undefined, content?: { media: libBase.MediaType, body?: Buffer } | null): void {
@@ -321,13 +317,13 @@ export class ClientRequest extends ClientBase {
 			headers = {};
 		const description = `${this.isHead ? 'HEAD:' : ''}[${status.msg}]${logReason == null ? '' : `: ${logReason}`}`;
 
-		if (!('Cache-Control' in headers) && libConfig.responseCacheControl != '')
-			headers['Cache-Control'] = libConfig.responseCacheControl;
+		if (!('Cache-Control' in headers) && this._config.responseCacheControl != '')
+			headers['Cache-Control'] = this._config.responseCacheControl;
 
 		/* check if the response can still be sent (acknowledged state can be overridden; the connection
 		*	will be closed afterwards to prevent the client from seeing inconsistent responses) */
-		const override = (this.baseState.response == ResponseState.acknowledged);
-		if (this.baseState.response == ResponseState.none || override) {
+		const override = (this._state.response == ResponseState.acknowledged);
+		if (this._state.response == ResponseState.none || override) {
 			if (status.code >= 500)
 				this.error(`Responding with ${description}`);
 			else if (override)
@@ -343,49 +339,49 @@ export class ClientRequest extends ClientBase {
 			if (override)
 				this.markAsBroken('Overridden in-progress response', true);
 		}
-		else if (this.baseState.response == ResponseState.headerSent)
+		else if (this._state.response == ResponseState.headerSent)
 			this.markAsBroken(`Overlap with committed response ${description}`, false);
-		else if (this.baseState.response != ResponseState.broken)
+		else if (this._state.response != ResponseState.broken)
 			this.warning(`Request already completed, discarding response ${description}`);
 		else
 			this.trace(`Request broken, discarding response ${description}`);
 	}
 	private failThroughput(): void {
-		if (this.throughput.threshold <= 0 || this.baseState.response == ResponseState.broken)
+		if (this._config.throughputThreshold <= 0 || !this._throughput.active || this._state.response == ResponseState.broken)
 			return;
 
 		/* check if the connection is still considered busy and should receive a grace delay */
-		for (const cb of this.throughput.busyCheck) {
+		for (const cb of this._throughput.busyCheck) {
 			let result = false;
 			try { result = cb(); }
 			catch (err: any) { this.error(`Unhandled exception in busy check: ${err.message}`); }
 			if (!result) continue;
 
 			this.trace(`Deferring throughput closing as connection is busy`);
-			this.throughput.start = Date.now() + libConfig.throughputGrace;
+			this._throughput.start = Date.now() + this._config.throughputGrace;
 			this.updateThroughput(0);
-			this.nativeInterface.request.socket.setTimeout(libConfig.connectionTimeout);
+			this._request.socket.setTimeout(this._request.socket.timeout ?? 0);
 			return;
 		}
 
-		const closing = (this.baseState.response == ResponseState.none || this.baseState.response == ResponseState.acknowledged);
+		const closing = (this._state.response == ResponseState.none || this._state.response == ResponseState.acknowledged);
 		if (closing)
-			this.respondRequestTimeout(`Throughput below [${this.throughput.threshold}] bytes/sec`, { headers: { 'Connection': 'close' } });
-		this.markAsBroken(`Throughput below [${this.throughput.threshold}] bytes/sec`, closing);
+			this.respondRequestTimeout(`Throughput below [${this._config.throughputThreshold}] bytes/sec`, { headers: { 'Connection': 'close' } });
+		this.markAsBroken(`Throughput below [${this._config.throughputThreshold}] bytes/sec`, closing);
 	}
 	private updateThroughput(delta: number): void {
-		if (this.throughput.timer != null)
-			clearTimeout(this.throughput.timer);
-		this.throughput.timer = null;
-		if (this.throughput.threshold <= 0)
+		if (this._throughput.timer != null)
+			clearTimeout(this._throughput.timer);
+		this._throughput.timer = null;
+		if (this._config.throughputThreshold <= 0 || !this._throughput.active)
 			return;
 		const _now = Date.now();
-		const now = Math.max(_now, this.throughput.start);
+		const now = Math.max(_now, this._throughput.start);
 
 		/* shift the deadline according to the bought time by the throughput */
-		const bought = (delta / this.throughput.threshold) * 1000;
-		this.throughput.deadline = now + Math.min(this.throughput.window, Math.max(0, this.throughput.deadline - now) + bought);
-		this.throughput.timer = setTimeout(() => this.failThroughput(), this.throughput.deadline - _now);
+		const bought = (delta / this._config.throughputThreshold) * 1000;
+		this._throughput.deadline = now + Math.min(this._config.throughputWindow, Math.max(0, this._throughput.deadline - now) + bought);
+		this._throughput.timer = setTimeout(() => this.failThroughput(), this._throughput.deadline - _now);
 	}
 	private wrapSocketWriter(socket: libStream.Duplex): [HttpResponseInterface, libStream.Writable] {
 		let headers: Record<string, string> = {}, status: number = 0, message: string = '';
@@ -480,19 +476,19 @@ export class ClientRequest extends ClientBase {
 		return [response, writer];
 	}
 	private async killNativeConnection(graceful: boolean): Promise<void> {
-		const native = this.nativeInterface;
+		const writer = this._native.writer;
 
 		/* raw closer, which will fully destroy the connection */
 		const closeConnection = () => {
-			if (native.request.destroyed && native.writer.destroyed)
+			if (this._request.destroyed && writer.destroyed)
 				return;
 			const error = new Error('Connection broken');
 
-			native.request.destroy(error);
-			native.writer.destroy(error);
+			this._request.destroy(error);
+			writer.destroy(error);
 		};
 
-		if (!graceful || native.writer.writableFinished || native.writer.destroyed)
+		if (!graceful || writer.writableFinished || writer.destroyed)
 			return closeConnection();
 
 		/* if graceful, wait for the last queued data to be sent; may be called multiple times */
@@ -502,25 +498,25 @@ export class ClientRequest extends ClientBase {
 				closeConnection();
 				resolve();
 			};
-			native.writer.once('finish', () => handler());
-			native.writer.once('error', () => handler());
-			native.writer.once('close', () => handler());
+			writer.once('finish', () => handler());
+			writer.once('error', () => handler());
+			writer.once('close', () => handler());
 		});
 	}
 	private markAsBroken(reason: string, graceful: boolean): void {
 		this.error(`Connection broken: [${reason}]`);
-		this.baseState.response = ResponseState.broken;
-		if (this.baseState.breaking != null) {
+		this._state.response = ResponseState.broken;
+		if (this._state.breaking != null) {
 			if (!graceful)
 				this.killNativeConnection(false);
 			return;
 		}
-		this.baseState.respondedResolve();
+		this._state.respondedResolve();
 
 		/* setup the promise beforehand to ensure the promise body does not recursively
 		*	enter this handler again, and sees the completed object still being unset */
 		let resolver = () => { };
-		this.baseState.breaking = new Promise<void>((res) => resolver = res);
+		this._state.breaking = new Promise<void>((res) => resolver = res);
 
 		/* setup the break promise to ensure the connection is killed properly with the given grace */
 		(async () => {
@@ -530,7 +526,7 @@ export class ClientRequest extends ClientBase {
 				if (settled) return; settled = true;
 				this.killNativeConnection(false);
 				resolver();
-			}, libConfig.killGraceTimeout);
+			}, this._config.killGraceTimeout);
 
 			await this.killNativeConnection(graceful);
 			clearTimeout(forceDestroy);
@@ -539,7 +535,7 @@ export class ClientRequest extends ClientBase {
 			resolver();
 		})();
 
-		this.baseState.breakResolve();
+		this._state.breakResolve();
 	}
 	private badClientUsage(reason: string, close: boolean): void {
 		this.respondInternalError(`Bad Usage: ${reason}`, (close ? { headers: { 'Connection': 'close' } } : undefined));
@@ -557,8 +553,8 @@ export class ClientRequest extends ClientBase {
 		this.trace(logMsg);
 
 		/* mark the response as determined as it will now be sent this way */
-		this.baseState.response = ResponseState.headerSent;
-		this.baseState.respondedResolve();
+		this._state.response = ResponseState.headerSent;
+		this._state.respondedResolve();
 
 		/* configure the default header values */
 		if (!('Accept-Ranges' in headers))
@@ -567,12 +563,12 @@ export class ClientRequest extends ClientBase {
 			headers['Vary'] = 'Accept-Encoding';
 		if (!('Date' in headers))
 			headers['Date'] = new Date().toUTCString();
-		if (libConfig.serverName != '' && !('Server' in headers))
-			headers['Server'] = libConfig.serverName;
-		for (const [key, value] of Object.entries(libConfig.commonHeaders)) {
+		for (const [key, value] of Object.entries(this._config.commonHeaders)) {
 			if (!(key in headers))
 				headers[key] = value;
 		}
+		if (this._config.serverName != '' && !('Server' in headers))
+			headers['Server'] = this._config.serverName;
 		if (content != null) {
 			headers['Content-Type'] = libHelper.BuildMediaTypeIdentifier(content.media);
 			if (content.size != null)
@@ -581,21 +577,21 @@ export class ClientRequest extends ClientBase {
 
 		/* check if its an upgrade request, which is always marked as being closed, as the
 		*	underlying web-server will not take it back into the queue for keep-alive sockets */
-		if (this.nativeInterface.socket != null)
+		if (this._native.socket != null)
 			headers['Connection'] = 'close';
 
 		/* perform the header post processing (in reverse order to ensure first added is last executed) */
-		for (let i = this.headerPatcher.length - 1; i >= 0; --i) {
-			try { this.headerPatcher[i](status, headers); }
+		for (let i = this._headerPatcher.length - 1; i >= 0; --i) {
+			try { this._headerPatcher[i](status, headers); }
 			catch (err: any) { this.error(`Unhandled exception in header patcher: ${err.message}`); }
 		}
 
 		/* setup the response status and headers (guard against invalid header values) */
-		try { this.nativeInterface.response.setStatus(status.code, status.msg); } catch (_) {
+		try { this._native.response.setStatus(status.code, status.msg); } catch (_) {
 			return this.markAsBroken(`Failed to finalize response: Bad status message`, false);
 		}
 		for (const [key, value] of Object.entries(headers)) {
-			try { this.nativeInterface.response.setHeader(key, value); } catch (_) {
+			try { this._native.response.setHeader(key, value); } catch (_) {
 				this.error(`Failed to set header [${key}]: Bad header value`);
 			}
 		}
@@ -615,16 +611,16 @@ export class ClientRequest extends ClientBase {
 		}
 
 		this.closeHeader(status, headers, (content == null ? undefined : { media: content.media, size: content.body?.byteLength, encoding: encoding?.name }));
-		this.baseState.response = ResponseState.completed;
+		this._state.response = ResponseState.completed;
 
 		/* try to finalize the response (can throw an exception for invalid status or header content) */
 		try {
 			if (!this.isHead && content?.body != null) {
 				this.updateThroughput(content.body.length);
-				this.nativeInterface.writer.end(content.body);
+				this._native.writer.end(content.body);
 			}
 			else
-				this.nativeInterface.writer.end();
+				this._native.writer.end();
 		} catch (err: any) {
 			this.markAsBroken(`Failed to finalize response: ${err.message}`, false);
 		}
@@ -696,9 +692,9 @@ export class ClientRequest extends ClientBase {
 		/* check if this is a head write, in which case the response can
 		*	just be marked as completed, and all other data can be drained */
 		if (this.isHead) {
-			if (this.baseState.response != ResponseState.headerSent)
+			if (this._state.response != ResponseState.headerSent)
 				return cb(null);
-			this.baseState.response = ResponseState.completed;
+			this._state.response = ResponseState.completed;
 			resp.writer.end(() => cb(null));
 			return;
 		}
@@ -726,7 +722,7 @@ export class ClientRequest extends ClientBase {
 		}
 
 		/* mark the state as completed and sent the last package */
-		this.baseState.response = ResponseState.completed;
+		this._state.response = ResponseState.completed;
 		if (chunk != null)
 			resp.writer.end(chunk, () => cb(null));
 		else
@@ -736,29 +732,29 @@ export class ClientRequest extends ClientBase {
 		const makeErrorStream = (msg: string) => new libStream.Writable({ write(_0, _1, cb) { cb(new Error(msg)) }, final(cb) { cb(new Error(msg)) } });
 
 		/* check if the object is already responded */
-		if (this.baseState.response == ResponseState.broken)
+		if (this._state.response == ResponseState.broken)
 			return makeErrorStream('Connection broken');
-		if (this.baseState.response != ResponseState.none) {
+		if (this._state.response != ResponseState.none) {
 			this.badClientUsage('Response on already claimed connection', false);
 			return makeErrorStream('Connection already responded');
 		}
-		this.baseState.response = ResponseState.acknowledged;
+		this._state.response = ResponseState.acknowledged;
 
 		/* construct the actual response wrapper, which takes care of dynamic encoding and error handling */
-		const output = new HttpRequestResponse(this.nativeInterface.writer, status, headers, contentSize, media, dynamicEncode,
+		const output = new HttpRequestResponse(this._native.writer, status, headers, contentSize, media, dynamicEncode,
 			(chunk: Buffer | null, cb: (err: any) => void) => {
 				if (output.destroyed)
 					return cb(new Error('Already failed'));
 
 				/* check if the connection has been marked as failed or completed */
-				if (this.baseState.response == ResponseState.completed)
+				if (this._state.response == ResponseState.completed)
 					return cb(new Error('Responding to completed response'));
-				if (this.baseState.response == ResponseState.broken)
+				if (this._state.response == ResponseState.broken)
 					return cb(new Error('Connection broken'));
 
 				/* handle the data accordingly and check for any errors due to malformed headers */
 				try {
-					if (this.baseState.response == ResponseState.headerSent)
+					if (this._state.response == ResponseState.headerSent)
 						return this.sendClientWrite(output, chunk, chunk == null, cb);
 					this.sendClientSetupHeader(output, chunk, cb);
 				}
@@ -768,19 +764,19 @@ export class ClientRequest extends ClientBase {
 				}
 			},
 			(err: any, cb: (err: any) => void) => {
-				if (this.baseState.response == ResponseState.completed)
+				if (this._state.response == ResponseState.completed)
 					return cb(err);
 
 				/* check if the output stream was an encoder, in which case it still needs to be destroyed
 				*	(only if an error occurred and the response was not completed, as the decoder might otherwise
 				*	still queue data waiting to be sent out, which the response writer already passed on) */
-				if (output.writer !== this.nativeInterface.writer)
+				if (output.writer !== this._native.writer)
 					output.writer.destroy();
 
 				/* check if the error originated from the data sender and ensure the connection is closed
 				*	(cannot be acknowledged for failed encodings, as they can first trigger on already header-sent) */
-				if (this.baseState.response != ResponseState.broken) {
-					const closing = (this.baseState.response == ResponseState.acknowledged);
+				if (this._state.response != ResponseState.broken) {
+					const closing = (this._state.response == ResponseState.acknowledged);
 					if (closing)
 						this.badClientUsage('Response closed prematurely', true);
 					this.markAsBroken(`Data transfer failed: ${err.message}`, closing);
@@ -790,7 +786,7 @@ export class ClientRequest extends ClientBase {
 		);
 
 		/* register the broken handler to detect closed or failed connections */
-		this.baseState.breakPromise.then(() => {
+		this._state.breakPromise.then(() => {
 			if (!output.destroyed)
 				output.destroy(new Error('Connection broken'));
 		});
@@ -801,13 +797,13 @@ export class ClientRequest extends ClientBase {
 		const makeErrorStream = (msg: string) => new libStream.Readable({ read() { this.destroy(new Error(msg)) } });
 
 		/* check if the object is ready for receiving */
-		if (this.baseState.receive != ReceiveState.none) {
+		if (this._state.receive != ReceiveState.none) {
 			this.badClientUsage('Already receiving data', false);
 			return makeErrorStream('Connection is already being received');
 		}
-		if (this.baseState.response == ResponseState.broken)
+		if (this._state.response == ResponseState.broken)
 			return makeErrorStream('Connection broken');
-		this.baseState.receive = ReceiveState.receiving;
+		this._state.receive = ReceiveState.receiving;
 
 		/* setup the accumulation transformer (which will also be returned in the end; mark receiving
 		*	as completed upon destroy - will automatically drain the request on cleanup) */
@@ -817,9 +813,9 @@ export class ClientRequest extends ClientBase {
 				if (output.destroyed) return cb(new Error('Already failed'));
 
 				/* check if the connection has been processed or marked as failed */
-				if (this.baseState.response == ResponseState.completed)
+				if (this._state.response == ResponseState.completed)
 					this.badClientUsage('Response completed during active receive', false);
-				if (this.baseState.response == ResponseState.broken)
+				if (this._state.response == ResponseState.broken)
 					return cb(new Error('Connection broken'));
 
 				/* check the maximum count (is violated) */
@@ -831,16 +827,16 @@ export class ClientRequest extends ClientBase {
 				cb(new Error('Request payload is too large'));
 			},
 			destroy: (err, cb) => {
-				if (this.baseState.receive == ReceiveState.receiving) {
-					this.nativeInterface.request.unpipe();
-					this.baseState.receive = ReceiveState.completed;
+				if (this._state.receive == ReceiveState.receiving) {
+					this._request.unpipe();
+					this._state.receive = ReceiveState.completed;
 				}
 				cb(err);
 			},
 			final: (cb) => {
-				if (this.baseState.receive == ReceiveState.receiving) {
-					this.nativeInterface.request.unpipe();
-					this.baseState.receive = ReceiveState.completed;
+				if (this._state.receive == ReceiveState.receiving) {
+					this._request.unpipe();
+					this._state.receive = ReceiveState.completed;
 				}
 				cb();
 			},
@@ -848,7 +844,7 @@ export class ClientRequest extends ClientBase {
 		});
 
 		/* check if the content is encoded and create the chain of decoders (in reverse to ensure the nesting is correct) */
-		let stream: libStream.Readable = this.nativeInterface.request;
+		let stream: libStream.Readable = this._request;
 		if (this.headers['content-encoding'] != null) {
 			const encodings = libHelper.SplitAndTrimList(this.headers['content-encoding'], ',', false);
 
@@ -888,7 +884,7 @@ export class ClientRequest extends ClientBase {
 		}
 
 		/* register the broken handler to detect closed or failed connections */
-		this.baseState.breakPromise.then(() => {
+		this._state.breakPromise.then(() => {
 			if (!output.destroyed)
 				output.destroy(new Error('Connection broken'));
 		});
@@ -897,29 +893,29 @@ export class ClientRequest extends ClientBase {
 		return stream.pipe(output);
 	}
 
-	public static _fromRequest(cache: libCache.CacheHost, host: string, protocol: string, request: libHttp.IncomingMessage, response: libHttp.ServerResponse): ClientRequest {
-		return new ClientRequest(cache, host, protocol, request, response);
+	public static _fromRequest(cache: libCache.CacheHost, config: BurntClientConfig, host: string, protocol: string, request: libHttp.IncomingMessage, response: libHttp.ServerResponse): ClientRequest {
+		return new ClientRequest(cache, config, host, protocol, request, response);
 	}
-	public static _fromUpgrade(cache: libCache.CacheHost, host: string, protocol: string, request: libHttp.IncomingMessage, socket: libStream.Duplex, head: Buffer, wss: libWs.WebSocketServer): ClientRequest {
-		return new ClientRequest(cache, host, protocol, request, { socket, head, wss });
+	public static _fromUpgrade(cache: libCache.CacheHost, config: BurntClientConfig, host: string, protocol: string, request: libHttp.IncomingMessage, socket: libStream.Duplex, head: Buffer, wss: libWs.WebSocketServer): ClientRequest {
+		return new ClientRequest(cache, config, host, protocol, request, { socket, head, wss });
 	}
 	public async _finishConnection(): Promise<void> {
 		/* ensure the connection is default replied with not-found */
-		if (this.baseState.response == ResponseState.none)
+		if (this._state.response == ResponseState.none)
 			this.respondNotFound();
 
 		/* ensure that the data have been fully received (if the response is already completed,
 		*	silently reset to 'header-sent' to ensure the connection is properly marked as broken) */
-		if (this.baseState.receive == ReceiveState.receiving && this.baseState.response != ResponseState.broken) {
-			if (this.baseState.response == ResponseState.completed)
-				this.baseState.response = ResponseState.headerSent;
+		if (this._state.receive == ReceiveState.receiving && this._state.response != ResponseState.broken) {
+			if (this._state.response == ResponseState.completed)
+				this._state.response = ResponseState.headerSent;
 			this.badClientUsage('Receive stream not consumed', false);
 		}
 
 		/* check if data remain in the pipeline, in which case the connection needs
 		*	to be closed to ensure the sender does not pipe more data over */
-		const request = this.nativeInterface.request;
-		if (!request.readableEnded && !request.destroyed && this.baseState.response != ResponseState.broken) {
+		const request = this._request;
+		if (!request.readableEnded && !request.destroyed && this._state.response != ResponseState.broken) {
 			const length = parseInt(this.headers['content-length'] ?? '0');
 			const chunked = (this.headers['transfer-encoding'] != null);
 			if (length != 0 || chunked)
@@ -927,32 +923,31 @@ export class ClientRequest extends ClientBase {
 		}
 
 		/* check if the upgrade was not fully awaited */
-		if (this.baseState.upgrade == UpgradeState.upgrading && this.baseState.response != ResponseState.broken)
+		if (this._state.upgrade == UpgradeState.upgrading && this._state.response != ResponseState.broken)
 			this.badClientUsage('Upgrade not fully awaited', false);
 
 		/* ensure that the response was properly sent */
-		if (this.baseState.response != ResponseState.completed && this.baseState.response != ResponseState.broken)
+		if (this._state.response != ResponseState.completed && this._state.response != ResponseState.broken)
 			this.badClientUsage('Response not completed', false);
 
 		/* check if the connection was an upgrade but was not was accepted, which needs to be
 		*	killed, as the underlying web-server will not clean this connection up anymore */
-		if (this.nativeInterface.socket != null && this.baseState.upgrade != UpgradeState.upgraded && this.baseState.response != ResponseState.broken)
+		if (this._native.socket != null && this._state.upgrade != UpgradeState.upgraded && this._state.response != ResponseState.broken)
 			this.markAsBroken('Upgrade was not accepted', true);
 
 		/* kill the throughput timer, as it either does not need to be checked anymore, or it
-		*	will have left the connection as broken, and will automatically be closed now
-		*	(reset the threshold timer to ensure no new timers will be started anymore) */
-		if (this.throughput.timer != null)
-			clearTimeout(this.throughput.timer);
-		this.throughput.timer = null;
-		this.throughput.threshold = 0;
+		*	will have left the connection as broken, and will automatically be closed now */
+		if (this._throughput.timer != null)
+			clearTimeout(this._throughput.timer);
+		this._throughput.timer = null;
+		this._throughput.active = false;
 
 		/* check if the connection is broken and await its grace cleanup completion */
-		if (this.baseState.response == ResponseState.broken)
-			await this.baseState.breaking!;
+		if (this._state.response == ResponseState.broken)
+			await this._state.breaking!;
 
 		this.log('Request processing completed');
-		this.baseState.completedResolve();
+		this._state.completedResolve();
 	}
 	public _killConnection(): void {
 		this.markAsBroken('Closing connection', false);
@@ -982,7 +977,7 @@ export class ClientRequest extends ClientBase {
 		}
 
 		const current = new ClientContext(this.logIdentity, this.relativePath, this.pathTranslation.length,
-			this.throughput.busyCheck.length, this.headerPatcher.length, this.htmlPatcher.length);
+			this._throughput.busyCheck.length, this._headerPatcher.length, this._htmlPatcher.length);
 
 		/* setup the new path, all path translations, and the tagged logging identity */
 		this.relativePath = libHelper.Rebase(match[0], match[1]!, this.relativePath);
@@ -996,49 +991,49 @@ export class ClientRequest extends ClientBase {
 		this.logIdentity = snapshot.logIdentity;
 		this.relativePath = snapshot.path;
 		this.pathTranslation.splice(snapshot.translationCount);
-		this.throughput.busyCheck.splice(snapshot.busyCount);
-		this.headerPatcher.splice(snapshot.headerPatchCount);
-		this.htmlPatcher.splice(snapshot.htmlPatchCount);
+		this._throughput.busyCheck.splice(snapshot.busyCount);
+		this._headerPatcher.splice(snapshot.headerPatchCount);
+		this._htmlPatcher.splice(snapshot.htmlPatchCount);
 	}
 
 	/* cache host to be used with this client */
 	public get cache(): libCache.CacheHost {
-		return this.nativeInterface.cache;
+		return this._cache;
 	}
 
 	/* request has not yet been acknowledged in any way */
 	public get unhandled(): boolean {
-		return (this.baseState.response == ResponseState.none);
+		return (this._state.response == ResponseState.none);
 	}
 
 	/* request has been acknowledged or already processed */
 	public get claimed(): boolean {
-		return (this.baseState.response != ResponseState.none);
+		return (this._state.response != ResponseState.none);
 	}
 
 	/* resolves whenever the response has been determined (is broken or a response header has been sent) */
 	public get responded(): Promise<void> {
-		return this.baseState.respondedPromise;
+		return this._state.respondedPromise;
 	}
 
 	/* resolves whenever the request has been fully processed */
 	public get completion(): Promise<void> {
-		return this.baseState.completedPromise;
+		return this._state.completedPromise;
 	}
 
 	/* http request headers */
 	public get headers(): libHttp.IncomingHttpHeaders {
-		return this.nativeInterface.request.headers;
+		return this._request.headers;
 	}
 
 	/* http request method */
 	public get method(): string {
-		return this.nativeInterface.request.method ?? '';
+		return this._request.method ?? '';
 	}
 
 	/* was the http request a head request */
 	public get isHead(): boolean {
-		return (this.nativeInterface.request.method == 'HEAD');
+		return (this._request.method == 'HEAD');
 	}
 
 	/* return the string formatted media-type (or empty string for no media type) */
@@ -1112,19 +1107,19 @@ export class ClientRequest extends ClientBase {
 	/* register a callback to check if the request is still being processed (delays throughput
 	*	termintion and resets connection timeout; will only be considered within this handler context) */
 	public busyCheck(cb: () => boolean): void {
-		this.throughput.busyCheck.push(cb);
+		this._throughput.busyCheck.push(cb);
 	}
 
 	/* register a callback to be invoked once the response is sent, to adjust the
 	*	headers to be sent (will only be considered within this handler context) */
 	public patchHeaders(cb: HeaderPatch): void {
-		this.headerPatcher.push(cb);
+		this._headerPatcher.push(cb);
 	}
 
 	/* register a callback to be invoked if html is built, to adjust the headers or
 	*	the content to be sent (will only be considered within this handler context) */
 	public patchHtmlPage(cb: HtmlPatch): void {
-		this.htmlPatcher.push(cb);
+		this._htmlPatcher.push(cb);
 	}
 
 	/* respond with [internal-error] and a default text response (always considered an error; reason is logged server-side only) */
@@ -1312,21 +1307,21 @@ export class ClientRequest extends ClientBase {
 	*	(default status is ok; for HEAD builds, no actual content will be constructed or estimated in size)
 	*	automatically adds Config.responseCacheControl, if no other cache control is specified */
 	public async respondHtml(page: libBuilder.HtmlPage, options?: { status?: libBase.StatusType, headers?: Record<string, string> }): Promise<void> {
-		if (this.baseState.response != ResponseState.none)
+		if (this._state.response != ResponseState.none)
 			return this.badClientUsage('HTML response on already claimed connection', false);
 
-		this.baseState.response = ResponseState.acknowledged;
+		this._state.response = ResponseState.acknowledged;
 		const status = (options?.status ?? libBase.Status.Ok);
 		const headers = (options?.headers ?? {});
-		if (!('Cache-Control' in headers) && libConfig.responseCacheControl != '')
-			headers['Cache-Control'] = libConfig.responseCacheControl;
+		if (!('Cache-Control' in headers) && this._config.responseCacheControl != '')
+			headers['Cache-Control'] = this._config.responseCacheControl;
 
 		/* invoke all registered html patcher to let them modify the content (in reverse order to ensure
 		*	first added is last executed, and check if one of them produced an alternate response) */
-		for (let i = this.htmlPatcher.length - 1; i >= 0; --i) {
+		for (let i = this._htmlPatcher.length - 1; i >= 0; --i) {
 			try {
-				await this.htmlPatcher[i](page, status, headers);
-				if (this.baseState.response != ResponseState.acknowledged)
+				await this._htmlPatcher[i](page, status, headers);
+				if (this._state.response != ResponseState.acknowledged)
 					return;
 			} catch (err: any) {
 				this.badClientUsage(`Unhandled exception in HTML patcher: ${err.message}`, false);
@@ -1347,8 +1342,8 @@ export class ClientRequest extends ClientBase {
 	public respondData(options?: { status?: libBase.StatusType, media?: libBase.MediaType, contentSize?: number, dynamicEncode?: boolean, headers?: Record<string, string> }): libStream.Writable {
 		const status: libBase.StatusType = options?.status ?? libBase.Status.Ok;
 		const headers = (options?.headers ?? {});
-		if (!('Cache-Control' in headers) && libConfig.responseCacheControl != '')
-			headers['Cache-Control'] = libConfig.responseCacheControl;
+		if (!('Cache-Control' in headers) && this._config.responseCacheControl != '')
+			headers['Cache-Control'] = this._config.responseCacheControl;
 
 		this.log(`Responding with data and status [${status.msg}]`);
 		return this.sendClientData(status, options?.media ?? libBase.Media.Unknown, headers, options?.dynamicEncode ?? true, options?.contentSize ?? null);
@@ -1362,7 +1357,7 @@ export class ClientRequest extends ClientBase {
 	public async tryRespondFile(filePath: string, options?: { encoded?: string, media?: libBase.MediaType, headers?: Record<string, string>, checkFreshness?: boolean }): Promise<boolean> {
 		if (options == null)
 			options = {};
-		if (this.baseState.response != ResponseState.none) {
+		if (this._state.response != ResponseState.none) {
 			this.badClientUsage('File response on already claimed connection', false);
 			return true;
 		}
@@ -1413,10 +1408,10 @@ export class ClientRequest extends ClientBase {
 		headers['Last-Modified'] = cached.lastModified();
 		headers['ETag'] = etag;
 		if (!('Cache-Control' in headers)) {
-			if (cached.isImmutable() && libConfig.immutableCacheControl != '')
-				headers['Cache-Control'] = libConfig.immutableCacheControl;
-			else if (libConfig.fileCacheControl != '')
-				headers['Cache-Control'] = libConfig.fileCacheControl;
+			if (cached.isImmutable() && this._config.immutableCacheControl != '')
+				headers['Cache-Control'] = this._config.immutableCacheControl;
+			else if (this._config.fileCacheControl != '')
+				headers['Cache-Control'] = this._config.fileCacheControl;
 		}
 
 		/* validate the conditions (e-tag more relevant than last-modified; invalid times are not
@@ -1587,7 +1582,7 @@ export class ClientRequest extends ClientBase {
 	/* marks the object as having been handled and returns a web socket or
 	*	automatically responds with a corresponding error and returns null */
 	public async acceptWebSocket(): Promise<ClientSocket | null> {
-		if (this.baseState.response != ResponseState.none) {
+		if (this._state.response != ResponseState.none) {
 			this.badClientUsage('WebSocket upgrade on already claimed connection', false);
 			return null;
 		}
@@ -1598,16 +1593,16 @@ export class ClientRequest extends ClientBase {
 			this.respondUpdateRequired('websocket');
 			return null;
 		}
-		if (this.nativeInterface.socket == null) {
+		if (this._native.socket == null) {
 			this.respondInternalError('Request was not provided as upgradable');
 			return null;
 		}
-		const native = this.nativeInterface.socket;
+		const native = this._native.socket;
 
 		/* mark the connection as being accepted */
-		this.baseState.response = ResponseState.headerSent;
-		this.baseState.respondedResolve();
-		this.baseState.upgrade = UpgradeState.upgrading;
+		this._state.response = ResponseState.headerSent;
+		this._state.respondedResolve();
+		this._state.upgrade = UpgradeState.upgrading;
 		this.trace(`Performing upgrade on web socket connection: [${this.url.pathname}]`);
 
 		/* await the actual websocket upgrade */
@@ -1615,22 +1610,22 @@ export class ClientRequest extends ClientBase {
 			let settled = false;
 
 			/* register the broken listener (to detect failures of the upgrading or network errors) */
-			this.baseState.breakPromise.then(() => {
+			this._state.breakPromise.then(() => {
 				if (settled) return; settled = true;
 				this.error('Failed to upgrade to WebSocket');
 				resolve(null);
 			});
 
 			/* start the upgrade process (web-socket upgrade handler will automatically send error messages) */
-			native.wss.handleUpgrade(this.nativeInterface.request, native.socket, native.head, (ws, _) => {
-				if (!settled && this.baseState.response == ResponseState.headerSent) {
-					settled = true, this.baseState.response = ResponseState.completed;
+			native.wss.handleUpgrade(this._request, native.socket, native.head, (ws, _) => {
+				if (!settled && this._state.response == ResponseState.headerSent) {
+					settled = true, this._state.response = ResponseState.completed;
 
 					/* ensure that the socket is valid as otherwise proper cleanup might not be guaranteed (no
 					*	need to log errors, as this will trigger the broken state, which will be logged) */
 					if (native.socket.destroyed)
 						return resolve(null);
-					return resolve(new ClientSocket(ws, this));
+					return resolve(ClientSocket._fromRequest(ws, this, this._config));
 				}
 				const settler = !settled;
 				settled = true;
@@ -1639,68 +1634,77 @@ export class ClientRequest extends ClientBase {
 					resolve(null);
 			});
 		});
-		this.baseState.upgrade = UpgradeState.upgraded;
+		this._state.upgrade = UpgradeState.upgraded;
 		return ws;
 	}
 }
 
 /*
-*	WebSocket with integrated alive checks
+*	WebSocket with integrated alive checks.
 *	Structured WebSocket, which takes care of error handling.
 *	close() is guaranteed to be called exactly once and no data or others will follow.
 *	Closing promise resolves once the close callback has been fully invoked.
 */
 export class ClientSocket extends ClientBase {
-	private ws: libWs.WebSocket;
-	private timer: null | NodeJS.Timeout;
-	private isAlive: boolean;
-	private closing: { promise: Promise<void> | null, closed: (() => void) | null, defer: number };
-	private logging: {
-		root: libLog.LogIdentity,
-		tags: { value: string }[]
+	private _ws: libWs.WebSocket;
+	private _alive: {
+		timer: null | NodeJS.Timeout;
+		isAlive: boolean;
 	};
+	private _closing: {
+		promise: Promise<void> | null;
+		closed: (() => void) | null, defer: number;
+	};
+	private _logging: {
+		root: libLog.LogIdentity;
+		tags: { value: string }[];
+	};
+	private _config: BurntClientConfig;
 
+	/* invoked whenever data is available */
 	public ondata?: (data: libWs.RawData, isBinary: boolean) => void;
+
+	/* invoked once when the connection has been closed or failed (no more data will be received afterwards) */
 	public onclose?: () => void;
 
-	constructor(ws: libWs.WebSocket, base: ClientRequest) {
-		super(base, 'socket');
-		this.ws = ws;
-		this.timer = null;
-		this.isAlive = true;
-		this.closing = { promise: null, closed: null, defer: 0 };
-		this.logging = { root: libLog.Logger(this.logIdentity), tags: [] };
+	private constructor(ws: libWs.WebSocket, source: ClientRequest, config: BurntClientConfig) {
+		super(source, 'socket');
+		this._ws = ws;
+		this._alive = { timer: null, isAlive: true };
+		this._closing = { promise: null, closed: null, defer: 0 };
+		this._logging = { root: libLog.Logger(this.logIdentity), tags: [] };
+		this._config = config;
 
-		this.ws.on('pong', () => {
-			this.logging.root.trace(`Alive check pong received`);
+		this._ws.on('pong', () => {
+			this._logging.root.trace(`Alive check pong received`);
 			this.selfIsAlive();
 		});
-		this.ws.on('message', (data, isBinary) => {
+		this._ws.on('message', (data, isBinary) => {
 			this.selfIsAlive();
-			if (this.closing.promise != null || this.ondata == null)
+			if (this._closing.promise != null || this.ondata == null)
 				return;
 
-			++this.closing.defer;
+			++this._closing.defer;
 			try { this.ondata(data, isBinary); }
 			catch (err: any) {
 				this.handleClosing(`Unhandled exception in message handler: ${err.message}`);
 			}
-			--this.closing.defer;
+			--this._closing.defer;
 
-			if (this.closing.promise != null)
+			if (this._closing.promise != null)
 				this.handleClosing();
 		});
-		this.ws.once('close', () => {
+		this._ws.once('close', () => {
 			this.handleClosing();
 
 			/* check if any timers remain (must be the grace-kill timer, can be stopped, as this point can
 			*	only be reached with an active timer, if defer was somehow still > 0, in which case its
 			*	nested leaving will trigger the proper cleanup, but the timer is not necessary anymore) */
-			if (this.timer != null)
-				clearTimeout(this.timer);
-			this.timer = null;
+			if (this._alive.timer != null)
+				clearTimeout(this._alive.timer);
+			this._alive.timer = null;
 		});
-		this.ws.once('error', (err: any) => {
+		this._ws.once('error', (err: any) => {
 			this.handleClosing(`WebSocket error: ${err.message}`);
 		});
 
@@ -1708,90 +1712,94 @@ export class ClientSocket extends ClientBase {
 		this.selfIsAlive();
 
 		/* perserve the log tags of the base */
-		base.log(`WebSocket accepted: [${this.logIdentity}]`);
-		const logTagList = base.logIdentity.indexOf('.');
+		source.log(`WebSocket accepted: [${this.logIdentity}]`);
+		const logTagList = source.logIdentity.indexOf('.');
 		if (logTagList >= 0) {
-			this.logging.tags.push({ value: base.logIdentity.substring(logTagList + 1) });
+			this._logging.tags.push({ value: source.logIdentity.substring(logTagList + 1) });
 			this.updateLogging();
 		}
 	}
 
+	public static _fromRequest(ws: libWs.WebSocket, source: ClientRequest, config: BurntClientConfig) {
+		return new ClientSocket(ws, source, config);
+	}
+
 	private checkIsAlive(): void {
-		if (this.closing.promise != null)
+		if (this._closing.promise != null)
 			return;
 
-		this.timer = null;
-		if (libConfig.webSocketTimeout == 0)
+		this._alive.timer = null;
+		if (this._config.webSocketTimeout == 0)
 			return;
 
 		/* check if the connection is not alive anymore and should be killed */
-		if (!this.isAlive || libConfig.webSocketAliveTimeout == 0)
+		if (!this._alive.isAlive || this._config.webSocketAliveTimeout == 0)
 			return this.handleClosing('Closing dead websocket');
-		this.isAlive = false;
-		this.timer = setTimeout(() => this.checkIsAlive(), libConfig.webSocketAliveTimeout);
+		this._alive.isAlive = false;
+		this._alive.timer = setTimeout(() => this.checkIsAlive(), this._config.webSocketAliveTimeout);
 
 		/* try to ping the remote to check the liveliness */
 		try {
-			this.logging.root.trace(`Sending ping to determine if connection is alive`);
-			this.ws.ping();
+			this._logging.root.trace(`Sending ping to determine if connection is alive`);
+			this._ws.ping();
 		} catch (err: any) {
 			this.handleClosing(`WebSocket error while pinging: ${err.message}`);
 		}
 	}
 	private selfIsAlive(): void {
-		this.isAlive = true;
-		if (this.closing.promise != null)
+		this._alive.isAlive = true;
+		if (this._closing.promise != null)
 			return;
 
-		if (this.timer != null)
-			clearTimeout(this.timer);
-		this.timer = (libConfig.webSocketTimeout == 0 ? null : setTimeout(() => this.checkIsAlive(), libConfig.webSocketTimeout));
+		if (this._alive.timer != null)
+			clearTimeout(this._alive.timer);
+		this._alive.timer = (this._config.webSocketTimeout == 0 ? null : setTimeout(() => this.checkIsAlive(), this._config.webSocketTimeout));
 	}
 	private handleClosing(terminate?: string): void {
 		/* register the initial closing to mark a closing being imminent */
-		if (this.closing.promise == null) {
-			this.closing.promise = new Promise<void>((res) => this.closing.closed = res);
+		if (this._closing.promise == null) {
+			this._closing.promise = new Promise<void>((res) => this._closing.closed = res);
 
 			/* kill the last timer (alive timer) */
-			if (this.timer != null)
-				clearTimeout(this.timer);
-			this.timer = null;
+			if (this._alive.timer != null)
+				clearTimeout(this._alive.timer);
+			this._alive.timer = null;
 
 			/* check if a termination should be triggered and otherwise start the grace termination timer */
 			if (terminate != null) {
-				this.logging.root.error(terminate);
-				this.ws.terminate();
+				this._logging.root.error(terminate);
+				this._ws.terminate();
 			}
 			else {
-				this.timer = setTimeout(() => {
-					this.timer = null;
-					if (this.closing.closed != null) {
-						this.logging.root.error('Closing connection');
-						this.ws.terminate();
+				this._alive.timer = setTimeout(() => {
+					this._alive.timer = null;
+					if (this._closing.closed != null) {
+						this._logging.root.error('Closing connection');
+						this._ws.terminate();
 					}
-				}, libConfig.killGraceTimeout);
+				}, this._config.killGraceTimeout);
 			}
 		}
 
-		if (this.closing.closed == null || this.closing.defer > 0)
+		if (this._closing.closed == null || this._closing.defer > 0)
 			return;
-		const closed = this.closing.closed;
-		this.closing.closed = null;
+		const closed = this._closing.closed;
+		this._closing.closed = null;
 
 		if (this.onclose != null) {
 			try { this.onclose(); }
 			catch (err: any) {
-				this.logging.root.error(`Unhandled exception in WebSocket close handler: ${err.message}`);
+				this._logging.root.error(`Unhandled exception in WebSocket close handler: ${err.message}`);
 			}
 		}
-		this.logging.root.trace('Socket connection closed');
+		this._logging.root.trace('Socket connection closed');
 
 		closed();
 	}
 	private updateLogging(): void {
-		let identity = this.logging.root.logIdentity;
+		let identity = this._logging.root.logIdentity;
 
-		for (const tag of this.logging.tags) {
+		for (const tag of this._logging.tags) {
 			if (tag.value != '')
 				identity += `.${tag.value}`;
 		}
@@ -1804,7 +1812,7 @@ export class ClientSocket extends ClientBase {
 	public tagLog(identity: string): ((value?: string) => void) {
 		let tag: { value: string } | null = { value: identity };
 
-		this.logging.tags.push(tag);
+		this._logging.tags.push(tag);
 		if (tag.value != '')
 			this.updateLogging();
 
@@ -1814,7 +1822,7 @@ export class ClientSocket extends ClientBase {
 
 			/* check if the tag should be removed or if the value should just be updated */
 			if (value == null) {
-				this.logging.tags = this.logging.tags.filter((v) => v != tag);
+				this._logging.tags = this._logging.tags.filter((v) => v != tag);
 				tag = null;
 			}
 			else if (value != tag.value)
@@ -1825,20 +1833,83 @@ export class ClientSocket extends ClientBase {
 	}
 
 	public send(data: string | Buffer): void {
-		if (this.closing.promise != null)
+		if (this._closing.promise != null)
 			return;
 
 		try {
-			this.ws.send(data);
+			this._ws.send(data);
 		} catch (err: any) {
 			this.handleClosing(`WebSocket error while sending data: ${err.message}`);
 		}
 	}
 	public close(): Promise<void> {
-		if (this.closing.promise == null) {
-			this.ws.close();
+		if (this._closing.promise == null) {
+			this._ws.close();
 			this.handleClosing();
 		}
-		return this.closing.promise!;
+		return this._closing.promise!;
 	}
+}
+
+export interface ClientConfig {
+	/* default server name to be used in the http:server header [empty value prevents server header; Default: 'Modular Web Server'] */
+	serverName?: string;
+
+	/* default header values to be added to every http response [Default: { 'X-Content-Type-Options': 'nosniff' }] */
+	commonHeaders?: Record<string, string>;
+
+	/* default web-socket timeout before performing a ping to determine liveness [0 disables the timeout; in milliseconds; Default: 180_000] */
+	webSocketTimeout?: number;
+
+	/* default web-socket timeout to respond to a liveness ping before closing the connection [0 kills the connection without ping test; in milliseconds; Default: 2_000] */
+	webSocketAliveTimeout?: number;
+
+	/* time for a broken connection or socket to receive the response before force-closing it [0 results in immediate close; in milliseconds; Default: 1_000] */
+	killGraceTimeout?: number;
+
+	/* default cache-control value for normal cache reads [empty string does not set any cache-control; Default: 'public, max-age=600, must-revalidate' (10 minutes)] */
+	fileCacheControl?: string;
+
+	/* default cache-control value for immutable cache reads [empty string does not set any cache-control; Default: 'public, max-age=2592000, immutable' (30 days)] */
+	immutableCacheControl?: string;
+
+	/* default cache-control value for any basic responses [empty string does not set any cache-control; Default: 'private, no-cache'] */
+	responseCacheControl?: string;
+
+	/* grace period before the throughput is started to be measured or for busy connections [in milliseconds; Default: 10_000] */
+	throughputGrace?: number;
+
+	/* throughput required for combined sending and receiving bodies of requests [0 disables the throughput check, in bytes/second; Default: 1_000] */
+	throughputThreshold?: number;
+
+	/* length of sliding time window for which the throughput must be above the threshold [in milliseconds; Default: 30_000] */
+	throughputWindow?: number;
+}
+export interface BurntClientConfig {
+	readonly serverName: string;
+	readonly commonHeaders: Record<string, string>;
+	readonly webSocketTimeout: number;
+	readonly webSocketAliveTimeout: number;
+	readonly killGraceTimeout: number;
+	readonly fileCacheControl: string;
+	readonly immutableCacheControl: string;
+	readonly responseCacheControl: string;
+	readonly throughputGrace: number;
+	readonly throughputThreshold: number;
+	readonly throughputWindow: number;
+}
+export function BurnClientConfig(config: ClientConfig): BurntClientConfig {
+	return {
+		serverName: config.serverName ?? 'Modular Web Server',
+		commonHeaders: config.commonHeaders ?? { 'X-Content-Type-Options': 'nosniff' },
+		webSocketTimeout: config.webSocketTimeout ?? 180_000,
+		webSocketAliveTimeout: config.webSocketAliveTimeout ?? 2_000,
+		killGraceTimeout: config.killGraceTimeout ?? 1_000,
+		fileCacheControl: config.fileCacheControl ?? 'public, max-age=600, must-revalidate',
+		immutableCacheControl: config.immutableCacheControl ?? 'public, max-age=2592000, immutable',
+		responseCacheControl: config.responseCacheControl ?? 'private, no-cache',
+		throughputGrace: config.throughputGrace ?? 10_000,
+		throughputThreshold: config.throughputThreshold ?? 1_000,
+		throughputWindow: config.throughputWindow ?? 30_000
+	};
 }

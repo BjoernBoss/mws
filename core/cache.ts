@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 /* Copyright (c) 2026 Bjoern Boss Henrichsen */
-import { Config as libConfig } from "./config.js";
 import * as libLog from "./log.js";
 import * as libHelper from "./helper.js";
 import * as libBase from "./base.js";
@@ -40,21 +39,12 @@ class CacheManager {
 	private totalCapacity: number;
 	private largestSize: number;
 
-	public constructor(logger: libLog.LogIdentity) {
+	public constructor(logger: libLog.LogIdentity, cacheSize: number, fileSizeLimit: number) {
 		this.logger = logger;
-		this.totalCapacity = libConfig.cacheSize;
-		this.largestSize = libConfig.cacheFileSizeLimit;
-		libConfig.subscribe(() => this.applyConfig());
+		this.totalCapacity = cacheSize;
+		this.largestSize = fileSizeLimit;
 	}
 
-	private applyConfig(): void {
-		this.totalCapacity = Math.max(libConfig.cacheSize, 0);
-		this.largestSize = Math.max(libConfig.cacheFileSizeLimit, 0);
-
-		/* check if the cache needs to be reduced */
-		if (this.allocated > this.totalCapacity)
-			this.reduce(this.totalCapacity);
-	}
 	private reduce(maximum: number): void {
 		/* create the list of all cached objects sorted by the touched count */
 		const paths: string[] = Object.keys(this.map).sort((a, b) => this.map[a].touched - this.map[b].touched);
@@ -97,9 +87,11 @@ class CacheManager {
 		if (name in this.map[path].encodings)
 			return;
 
-		/* check if space needs to be reserved */
+		/* check if space needs to be reserved and check if the root entry is still available afterwards */
 		if (this.allocated + data.byteLength > this.totalCapacity)
 			this.reduce(this.totalCapacity - data.byteLength);
+		if (!(path in this.map))
+			return;
 
 		/* add the entry to the cache */
 		this.logger.log(`Added encoding [${name}] of [${path}] to the cache (Size: ${data.byteLength})`);
@@ -165,11 +157,15 @@ class ImmutableManager {
 	private map: Record<string, ImmutableEntry> = {};
 	private reverse: Record<string, string> = {};
 	private writeBack: { path: string, writing: Promise<void> | null, dirty: boolean } | null = null;
+	private alwaysValidate: boolean;
+	private immutableTagging: boolean;
 
-	constructor(writeBackPath: string | null, logger: libLog.LogIdentity) {
+	constructor(writeBackPath: string, logger: libLog.LogIdentity, alwaysValidate: boolean, immutableTagging: boolean) {
 		this.logger = logger;
+		this.alwaysValidate = alwaysValidate;
+		this.immutableTagging = immutableTagging;
 
-		if (writeBackPath != null)
+		if (writeBackPath != '')
 			this.configureWriteBack(writeBackPath);
 	}
 
@@ -270,7 +266,7 @@ class ImmutableManager {
 		return output;
 	}
 	private updateEntry(entry: ImmutableEntry, checkFreshness: boolean, firstAssign: boolean): boolean {
-		if (entry.fetched && !checkFreshness && !libConfig.cacheAlwaysValidate)
+		if (entry.fetched && !checkFreshness && !this.alwaysValidate)
 			return true;
 
 		/* fetch the file states of the actual filesystem entry */
@@ -329,7 +325,7 @@ class ImmutableManager {
 
 	public make(handler: string, path: string, checkFreshness: boolean): string {
 		const identifier = `${handler}:${path}`;
-		if (!libConfig.cacheImmutableTagging)
+		if (!this.immutableTagging)
 			return path;
 
 		while (true) {
@@ -355,7 +351,7 @@ class ImmutableManager {
 		}
 	}
 	public get(path: string, checkFreshness: boolean): [ImmutableEntry | null, boolean] {
-		if (!libConfig.cacheImmutableTagging)
+		if (!this.immutableTagging)
 			return [null, false];
 
 		/* check if it might be an immutable-tagged path */
@@ -681,23 +677,22 @@ export interface EncodedCache {
 }
 
 export class CacheHost extends libLog.LogIdentity {
-	private cacheManager: CacheManager;
-	private immutableManager: ImmutableManager;
+	private _cacheManager: CacheManager;
+	private _immutableManager: ImmutableManager;
+	private _alwaysValidate: boolean;
 
-	/* immutable state path is used to ensure the immutable state uses persistent ids across
-	*	restarts (will be read upon loading; if not set, ids will be lost after a server restart) */
-	public constructor(immutableStatePath: string | null) {
+	public constructor(config: BurntCacheConfig) {
 		super('cache');
 
 		this.info('Cache created');
-
-		this.cacheManager = new CacheManager(this);
-		this.immutableManager = new ImmutableManager(immutableStatePath, this);
+		this._alwaysValidate = config.alwaysValidate;
+		this._cacheManager = new CacheManager(this, config.cacheSize, config.fileSizeLimit);
+		this._immutableManager = new ImmutableManager(config.immutableStatePath, this, this._alwaysValidate, config.immutableTagging);
 	}
 	private resolveCache(path: string, checkFreshness: boolean, checkImmutable: boolean): Cached | string | null {
 		/* check if the entry is immutable and fetch its actual path or
 		*	if it has been moved (due to the id having been invalidated) */
-		const [immutable, immutableMoved] = (checkImmutable ? this.immutableManager.get(path, checkFreshness) : [null, false]);
+		const [immutable, immutableMoved] = (checkImmutable ? this._immutableManager.get(path, checkFreshness) : [null, false]);
 		if (immutable != null) {
 			path = immutable.fileSystem!;
 			if (immutableMoved)
@@ -706,9 +701,9 @@ export class CacheHost extends libLog.LogIdentity {
 		const isImmutable = (immutable != null);
 
 		/* check if does not need to be checked and the entry is already in the cache, in which case the file doesn't even need to be checked */
-		let entry = ((checkFreshness || libConfig.cacheAlwaysValidate) ? null : this.cacheManager.find(path, null));
+		let entry = ((checkFreshness || this._alwaysValidate) ? null : this._cacheManager.find(path, null));
 		if (entry != null && (immutable == null || (immutable.size == entry.data.byteLength && immutable.mtime == entry.mtime)))
-			return new AlreadyCached(this.cacheManager, path, entry, isImmutable);
+			return new AlreadyCached(this._cacheManager, path, entry, isImmutable);
 
 		/* check if the file exists and read its file-size and mtime (not necessary
 		*	for immutable entries, as their stats are already up-to-date) */
@@ -718,10 +713,10 @@ export class CacheHost extends libLog.LogIdentity {
 		const [fileSize, mtime] = stats;
 
 		/* check if the path exists in the validated cache and otherwise return the uncached entry */
-		entry = this.cacheManager.find(path, { mtime, size: fileSize });
+		entry = this._cacheManager.find(path, { mtime, size: fileSize });
 		if (entry != null)
-			return new AlreadyCached(this.cacheManager, path, entry, isImmutable);
-		return new NotCached(this.cacheManager, path, fileSize, mtime, Date.now(), isImmutable);
+			return new AlreadyCached(this._cacheManager, path, entry, isImmutable);
+		return new NotCached(this._cacheManager, path, fileSize, mtime, Date.now(), isImmutable);
 	}
 
 	/* [throws] if [checkFreshness] is true, re-validate the file stats on disk before serving from cache (defaults
@@ -742,13 +737,47 @@ export class CacheHost extends libLog.LogIdentity {
 	*	a path to a file, which looks similar to the source, except that the name includes a unique id, which will be used
 	*	to identity the given file state (will be removed from the final target path to be served, to identify the actual source) */
 	public makeImmutable(handler: string, path: string, options?: { checkFreshness?: boolean }): string {
-		return this.immutableManager.make(handler, path, options?.checkFreshness ?? false);
+		return this._immutableManager.make(handler, path, options?.checkFreshness ?? false);
 	}
 
 	/* flush all cached data and invalidate immutable stats so they are re-checked on next access */
 	public flushCache(): void {
 		this.info('Flushing cache and invalidating immutable entries');
-		this.cacheManager.flush();
-		this.immutableManager.invalidate();
+		this._cacheManager.flush();
+		this._immutableManager.invalidate();
 	}
+}
+
+export interface CacheConfig {
+	/* immutable state path is used to ensure the immutable state uses persistent ids across
+	*	restarts (will be read upon loading; if not set, ids will be lost after a server restart) [Default: ''] */
+	immutableStatePath?: string;
+
+	/* total cachable size [Default: 50_000_000] */
+	cacheSize?: number;
+
+	/* upper limit for files considered cachable, others will just be streamed through [Default: 10_000_000] */
+	fileSizeLimit?: number;
+
+	/* always validate file freshness before providing them [Default: false] */
+	alwaysValidate?: boolean;
+
+	/* tag served content with immutable ids to encode freshness into the path [Default: true] */
+	immutableTagging?: boolean;
+}
+export interface BurntCacheConfig {
+	readonly immutableStatePath: string;
+	readonly cacheSize: number;
+	readonly fileSizeLimit: number;
+	readonly alwaysValidate: boolean;
+	readonly immutableTagging: boolean;
+}
+export function BurnCacheConfig(config: CacheConfig): BurntCacheConfig {
+	return {
+		immutableStatePath: config.immutableStatePath ?? '',
+		cacheSize: config.cacheSize ?? 50_000_000,
+		fileSizeLimit: config.fileSizeLimit ?? 10_000_000,
+		alwaysValidate: config.alwaysValidate ?? false,
+		immutableTagging: config.immutableTagging ?? true
+	};
 }
