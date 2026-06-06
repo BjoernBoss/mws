@@ -214,15 +214,6 @@ class CoreConfig {
 		this._throughputWindow = value;
 		this.changed('Throughput window', value);
 	}
-
-	/* directly forwarded to cache [ConfigureWriteBack] but for consistency also here [cannot be subscribed to] */
-	public async cacheWriteBack(path: string | null): Promise<void> {
-		logger.info(`Configuring cache writeback to [${path ?? ''}]`);
-
-		/* defer, as the cache initialization imports this module again and interacts with it at initialization */
-		const config = await import("./cache.js");
-		return config.ConfigureWriteBack(path);
-	}
 }
 
 /*

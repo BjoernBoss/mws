@@ -5,6 +5,7 @@ import * as libLog from "./log.js";
 import * as libClient from "./client.js";
 import * as libBase from "./base.js";
 import * as libHandler from "./handler.js";
+import * as libCache from "./cache.js";
 import * as libHttps from "https";
 import * as libHttp from "http";
 import * as libFs from "fs";
@@ -28,12 +29,16 @@ export class Server {
 	private stopListener: (() => [Promise<void>, Promise<void>])[];
 	private wss: libWs.WebSocketServer;
 	private stopping: Promise<void> | null;
+	private cacheHost: libCache.CacheHost;
 
-	constructor() {
+	/* immutable state path will be passed to configure the cache host */
+	constructor(immutableStatePath: string | null) {
 		logger.info(`Server created`);
+
 		this.stopListener = [];
 		this.wss = new libWs.WebSocketServer({ noServer: true });
 		this.stopping = null;
+		this.cacheHost = new libCache.CacheHost(immutableStatePath);
 	}
 
 	private respondBadEndpoint(request: libHttp.IncomingMessage, client: libClient.ClientRequest): void {
@@ -88,7 +93,7 @@ export class Server {
 	}
 	private handleRequest(request: libHttp.IncomingMessage, response: libHttp.ServerResponse, check: CheckHost, handler: libHandler.AttachedModule, port: number, protocol: string): void {
 		this.handleWrapper(true, request, check, handler, port, (host: string): libClient.ClientRequest => {
-			return libClient.ClientRequest._fromRequest(request, host, protocol, response);
+			return libClient.ClientRequest._fromRequest(this.cacheHost, host, protocol, request, response);
 		}).catch((err: any) => {
 			logger.error(`Fatal error in request handler: ${err.message}`);
 			request.destroy(new Error('Unhandled exception'));
@@ -96,7 +101,7 @@ export class Server {
 	}
 	private handleUpgrade(request: libHttp.IncomingMessage, socket: libStream.Duplex, head: Buffer, check: CheckHost, handler: libHandler.AttachedModule, port: number, protocol: string): void {
 		this.handleWrapper(false, request, check, handler, port, (host: string): libClient.ClientRequest => {
-			return libClient.ClientRequest._fromUpgrade(request, host, protocol, socket, head, this.wss);
+			return libClient.ClientRequest._fromUpgrade(this.cacheHost, host, protocol, request, socket, head, this.wss);
 		}).catch((err: any) => {
 			logger.error(`Fatal error in upgrade handler: ${err.message}`);
 			request.destroy(new Error('Unhandled exception'));
@@ -246,5 +251,10 @@ export class Server {
 		})();
 
 		return this.stopping;
+	}
+
+	/* cache host used by this server */
+	public get cache(): libCache.CacheHost {
+		return this.cacheHost;
 	}
 }

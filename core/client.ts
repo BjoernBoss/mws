@@ -231,13 +231,14 @@ export class ClientRequest extends ClientBase {
 		busyCheck: (() => boolean)[];
 	};
 	private nativeInterface: {
+		cache: libCache.CacheHost;
 		request: libHttp.IncomingMessage;
 		response: HttpResponseInterface;
 		writer: libStream.Writable;
 		socket?: { socket: libStream.Duplex, head: Buffer, wss: libWs.WebSocketServer };
 	};
 
-	private constructor(request: libHttp.IncomingMessage, host: string, protocol: string, response: libHttp.ServerResponse | { socket: libStream.Duplex, head: Buffer, wss: libWs.WebSocketServer }) {
+	private constructor(cache: libCache.CacheHost, host: string, protocol: string, request: libHttp.IncomingMessage, response: libHttp.ServerResponse | { socket: libStream.Duplex, head: Buffer, wss: libWs.WebSocketServer }) {
 		super(new libUrl.URL(`${protocol}//${host == '' ? '_' : host}${request.url}`), 'request');
 		this.headerPatcher = [];
 		this.htmlPatcher = [];
@@ -312,7 +313,7 @@ export class ClientRequest extends ClientBase {
 		}
 		else
 			[responseWrapper, writerWrapper] = this.wrapSocketWriter(response.socket);
-		this.nativeInterface = { request, response: responseWrapper, writer: writerWrapper, socket: (response instanceof libHttp.ServerResponse ? undefined : response) };
+		this.nativeInterface = { cache, request, response: responseWrapper, writer: writerWrapper, socket: (response instanceof libHttp.ServerResponse ? undefined : response) };
 	}
 
 	private constructQuickResponse(status: libBase.StatusType, logReason: string | null, headers: Record<string, string> | undefined, content?: { media: libBase.MediaType, body?: Buffer } | null): void {
@@ -731,7 +732,7 @@ export class ClientRequest extends ClientBase {
 		else
 			resp.writer.end(() => cb(null));
 	}
-	private sendClientData(status: libBase.StatusType, media: libBase.MediaType, headers: Record<string, string>, options: { dynamicEncode?: boolean, contentSize?: number }): libStream.Writable {
+	private sendClientData(status: libBase.StatusType, media: libBase.MediaType, headers: Record<string, string>, dynamicEncode: boolean, contentSize: number | null): libStream.Writable {
 		const makeErrorStream = (msg: string) => new libStream.Writable({ write(_0, _1, cb) { cb(new Error(msg)) }, final(cb) { cb(new Error(msg)) } });
 
 		/* check if the object is already responded */
@@ -744,8 +745,7 @@ export class ClientRequest extends ClientBase {
 		this.baseState.response = ResponseState.acknowledged;
 
 		/* construct the actual response wrapper, which takes care of dynamic encoding and error handling */
-		const output = new HttpRequestResponse(this.nativeInterface.writer, status, headers,
-			options.contentSize ?? null, media, options?.dynamicEncode ?? false,
+		const output = new HttpRequestResponse(this.nativeInterface.writer, status, headers, contentSize, media, dynamicEncode,
 			(chunk: Buffer | null, cb: (err: any) => void) => {
 				if (output.destroyed)
 					return cb(new Error('Already failed'));
@@ -897,11 +897,11 @@ export class ClientRequest extends ClientBase {
 		return stream.pipe(output);
 	}
 
-	public static _fromRequest(request: libHttp.IncomingMessage, host: string, protocol: string, response: libHttp.ServerResponse): ClientRequest {
-		return new ClientRequest(request, host, protocol, response);
+	public static _fromRequest(cache: libCache.CacheHost, host: string, protocol: string, request: libHttp.IncomingMessage, response: libHttp.ServerResponse): ClientRequest {
+		return new ClientRequest(cache, host, protocol, request, response);
 	}
-	public static _fromUpgrade(request: libHttp.IncomingMessage, host: string, protocol: string, socket: libStream.Duplex, head: Buffer, wss: libWs.WebSocketServer): ClientRequest {
-		return new ClientRequest(request, host, protocol, { socket, head, wss });
+	public static _fromUpgrade(cache: libCache.CacheHost, host: string, protocol: string, request: libHttp.IncomingMessage, socket: libStream.Duplex, head: Buffer, wss: libWs.WebSocketServer): ClientRequest {
+		return new ClientRequest(cache, host, protocol, request, { socket, head, wss });
 	}
 	public async _finishConnection(): Promise<void> {
 		/* ensure the connection is default replied with not-found */
@@ -999,6 +999,11 @@ export class ClientRequest extends ClientBase {
 		this.throughput.busyCheck.splice(snapshot.busyCount);
 		this.headerPatcher.splice(snapshot.headerPatchCount);
 		this.htmlPatcher.splice(snapshot.htmlPatchCount);
+	}
+
+	/* cache host to be used with this client */
+	public get cache(): libCache.CacheHost {
+		return this.nativeInterface.cache;
 	}
 
 	/* request has not yet been acknowledged in any way */
@@ -1335,7 +1340,7 @@ export class ClientRequest extends ClientBase {
 		this.sendFullResponse(status, headers, { media: libBase.Media.Html, body: content });
 	}
 
-	/* [no-throw but errors] send data with [media type] and [status] and return a writable stream (default status is ok, media is unknown);
+	/* [no-throw but errors] send data with [media type] and [status] and return a writable stream (default: status is ok, media is unknown, dynamicEncode is true);
 	*	if a content size is provided, stream expects exactly this amount of bytes; if [dynamicEncode], the encoder will be dynamically negotiated
 	*	based on the content; for a HEAD request, no encoding will be negotiated, no lengths verified, and the written data will just be drained
 	*	(can immediately be ended using '.end()'); automatically adds Config.responseCacheControl, if no other cache control is specified */
@@ -1346,7 +1351,7 @@ export class ClientRequest extends ClientBase {
 			headers['Cache-Control'] = libConfig.responseCacheControl;
 
 		this.log(`Responding with data and status [${status.msg}]`);
-		return this.sendClientData(status, options?.media ?? libBase.Media.Unknown, headers, { contentSize: options?.contentSize, dynamicEncode: options?.dynamicEncode });
+		return this.sendClientData(status, options?.media ?? libBase.Media.Unknown, headers, options?.dynamicEncode ?? true, options?.contentSize ?? null);
 	}
 
 	/* try to respond with the given file, return false, if the file does not exist (range aware, HEAD aware); specify [checkFreshness] to
@@ -1365,7 +1370,7 @@ export class ClientRequest extends ClientBase {
 		/* read the entry from the cache and check if it has been permanently moved and apply the move */
 		let cached: libCache.Cached | string | null = null;
 		try {
-			cached = libCache.GetImmutable(filePath, { checkFreshness: options.checkFreshness });
+			cached = this.cache.getImmutable(filePath, { checkFreshness: options.checkFreshness });
 			if (cached == null)
 				return false;
 		}
@@ -1457,9 +1462,7 @@ export class ClientRequest extends ClientBase {
 
 		/* create the writer stream (doesn't throw, but errors; enforce the selected encoder) */
 		const status = (range.state == libHelper.RangeState.noRange ? libBase.Status.Ok : libBase.Status.PartialContent);
-		let stream = this.sendClientData(status, media, headers, {
-			dynamicEncode: false, contentSize: (reader == null ? range.last - range.first + 1 : reader.contentSize() ?? undefined)
-		});
+		let stream = this.sendClientData(status, media, headers, false, (reader == null ? range.last - range.first + 1 : reader.contentSize()));
 
 		let logMsg = `Responding with file-${this.isHead ? 'HEAD' : 'content'} [${range.first} - ${range.last}/${cached.fileSize()}] from [${filePath}]`;
 		if (reader != null) {
