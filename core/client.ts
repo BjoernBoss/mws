@@ -35,7 +35,7 @@ class ClientContext {
 	}
 }
 
-export class ClientBase extends libLog.LogIdentity {
+class ClientBase extends libLog.LogIdentity {
 	protected relativePath: string;
 	protected pathTranslation: Record<string, string | null>[];
 
@@ -117,12 +117,6 @@ export class ClientBase extends libLog.LogIdentity {
 	}
 }
 
-/* look at the state and modify the headers accordingly (only add or remove headers, must not try to alter the response) */
-export type HeaderPatch = (status: libRequest.StatusType, headers: Record<string, string>) => void;
-
-/* look at the page and modify it or the headers accordingly (can be interrupted by returning an alternate response) */
-export type HtmlPatch = (page: libBuilder.HtmlPage, status: libRequest.StatusType, headers: Record<string, string>) => Promise<void>;
-
 enum ReceiveState {
 	none,
 	receiving,
@@ -141,6 +135,46 @@ enum ResponseState {
 	broken
 }
 
+interface HttpResponseInterface {
+	setHeader(name: string, value: string): void;
+	setStatus(code: number, msg: string): void;
+}
+
+class HttpRequestResponse extends libStream.Writable {
+	public writer: libStream.Writable;
+	public totalSent: number;
+	public cache: Buffer | null;
+	public status: libRequest.StatusType;
+	public headers: Record<string, string>;
+	public contentSize: number | null;
+	public dynamicEncode: boolean;
+	public contentType: libRequest.MediaType;
+
+	constructor(writer: libStream.Writable, status: libRequest.StatusType, headers: Record<string, string>, contentSize: number | null, contentType: libRequest.MediaType,
+		dynamicEncode: boolean, handleData: (chunk: Buffer | null, cb: (err: any) => void) => void, destroy: (err: any, cb: (err: any) => void) => void
+	) {
+		super({
+			write: (chunk, _, cb) => handleData(chunk, cb),
+			final: (cb) => handleData(null, cb),
+			destroy: (err, cb) => destroy(err, cb)
+		});
+		this.writer = writer;
+		this.totalSent = 0;
+		this.cache = null;
+		this.status = status;
+		this.headers = headers;
+		this.contentSize = contentSize;
+		this.dynamicEncode = dynamicEncode;
+		this.contentType = contentType;
+	}
+}
+
+/* look at the state and modify the headers accordingly (only add or remove headers, must not try to alter the response) */
+export type HeaderPatch = (status: libRequest.StatusType, headers: Record<string, string>) => void;
+
+/* look at the page and modify it or the headers accordingly (can be interrupted by returning an alternate response) */
+export type HtmlPatch = (page: libBuilder.HtmlPage, status: libRequest.StatusType, headers: Record<string, string>) => Promise<void>;
+
 /*
 *	Does not throw any exceptions, unless explicitly stated.
 *	Http HEAD aware (will silently drain any data sent from a HEAD request).
@@ -155,16 +189,28 @@ enum ResponseState {
 *		=> Will terminate a connection, if the upload is not consumed or the client errors.
 *		=> Premature destroying of receive reader will result in the connection being gracefully terminated.
 *		=> All data must have been received before the response is completed.
+*	Responding data: Will automatically encode the stream and send the header accordingly
+*		=> Will automatically determine if encoding is to be used
+*		=> Checks if promised number of bytes is provided
+*		=> Will automatically error, if the broken state is detected, and will auto-respond or send the connection into the broken state (stream user does not need to respond).
 *	
 *	A response sent while another is being prepared (acknowledged) will override it and close the connection.
 *	A response sent while data is already being streamed (header sent) will break the connection.
-*	Responses automatically add Config.responseCacheControl, if no other cache control is specified.
+*	Normal responses automatically add Config.responseCacheControl, if no other cache control is specified.
+*	File responses will automatically add Config.fileCacheControl/Config.immutableCacheControl, if no other cache control is specified.
 *	Responses will either use the dedicated responder interface and its highWaterMark, or a responder interface, which caches up to socket.highWaterMark.
+*
+*	Upgrade requests, which were not accepted, will be closed after responding.
+*	An accept attempt must be fully awaited before completing the handling procedure.
+*
+*	Defaults [Accept-Ranges] normally to 'none' or to 'bytes' for files
+*	Defaults [Vary] to 'Accept-Encoding'.
+*	Defaults [Connection] to 'close' for upgrade requests.
 */
-export abstract class IncomingBase extends ClientBase {
-	protected headerPatcher: HeaderPatch[];
-	protected htmlPatcher: HtmlPatch[];
-	protected baseState: {
+export class ClientRequest extends ClientBase {
+	private headerPatcher: HeaderPatch[];
+	private htmlPatcher: HtmlPatch[];
+	private baseState: {
 		respondedPromise: Promise<void>;
 		respondedResolve: () => void;
 		completedPromise: Promise<void>;
@@ -184,16 +230,15 @@ export abstract class IncomingBase extends ClientBase {
 		window: number;
 		busyCheck: (() => boolean)[];
 	};
-	protected nativeInterface: {
+	private nativeInterface: {
 		request: libHttp.IncomingMessage;
 		response: HttpResponseInterface;
 		writer: libStream.Writable;
-		wss: libWs.WebSocketServer;
-		socket?: { socket: libStream.Duplex, head: Buffer };
+		socket?: { socket: libStream.Duplex, head: Buffer, wss: libWs.WebSocketServer };
 	};
 
-	protected constructor(request: libHttp.IncomingMessage, host: string, protocol: string, kind: string, response: libHttp.ServerResponse | { socket: libStream.Duplex, head: Buffer }, wss: libWs.WebSocketServer) {
-		super(new libUrl.URL(`${protocol}//${host == '' ? '_' : host}${request.url}`), kind);
+	private constructor(request: libHttp.IncomingMessage, host: string, protocol: string, response: libHttp.ServerResponse | { socket: libStream.Duplex, head: Buffer, wss: libWs.WebSocketServer }) {
+		super(new libUrl.URL(`${protocol}//${host == '' ? '_' : host}${request.url}`), 'request');
 		this.headerPatcher = [];
 		this.htmlPatcher = [];
 
@@ -267,7 +312,7 @@ export abstract class IncomingBase extends ClientBase {
 		}
 		else
 			[responseWrapper, writerWrapper] = this.wrapSocketWriter(response.socket);
-		this.nativeInterface = { request, response: responseWrapper, writer: writerWrapper, socket: (response instanceof libHttp.ServerResponse ? undefined : response), wss };
+		this.nativeInterface = { request, response: responseWrapper, writer: writerWrapper, socket: (response instanceof libHttp.ServerResponse ? undefined : response) };
 	}
 
 	private constructQuickResponse(status: libRequest.StatusType, logReason: string | null, headers: Record<string, string> | undefined, content?: { media: libRequest.MediaType, body?: Buffer } | null): void {
@@ -852,6 +897,12 @@ export abstract class IncomingBase extends ClientBase {
 		return stream.pipe(output);
 	}
 
+	public static _fromRequest(request: libHttp.IncomingMessage, host: string, protocol: string, response: libHttp.ServerResponse): ClientRequest {
+		return new ClientRequest(request, host, protocol, response);
+	}
+	public static _fromUpgrade(request: libHttp.IncomingMessage, host: string, protocol: string, socket: libStream.Duplex, head: Buffer, wss: libWs.WebSocketServer): ClientRequest {
+		return new ClientRequest(request, host, protocol, { socket, head, wss });
+	}
 	public async _finishConnection(): Promise<void> {
 		/* ensure the connection is default replied with not-found */
 		if (this.baseState.response == ResponseState.none)
@@ -965,7 +1016,7 @@ export abstract class IncomingBase extends ClientBase {
 		return this.baseState.respondedPromise;
 	}
 
-	/* resolves whenever the client has been fully processed */
+	/* resolves whenever the request has been fully processed */
 	public get completion(): Promise<void> {
 		return this.baseState.completedPromise;
 	}
@@ -1252,7 +1303,7 @@ export abstract class IncomingBase extends ClientBase {
 		});
 	}
 
-	/* respond with html, can be built on by parent modules, sent once the client has been fully processed
+	/* respond with html, can be built on by parent modules, sent once the request has been fully processed
 	*	(default status is ok; for HEAD builds, no actual content will be constructed or estimated in size)
 	*	automatically adds Config.responseCacheControl, if no other cache control is specified */
 	public async respondHtml(page: libBuilder.HtmlPage, options?: { status?: libRequest.StatusType, headers?: Record<string, string> }): Promise<void> {
@@ -1302,7 +1353,7 @@ export abstract class IncomingBase extends ClientBase {
 	*	re-validate the file stats on disk before serving from cache; the media type can be overwritten (defaults to extracting media-type
 	*	from the file-path); [encoding] describes the encoding of a pre-encoded file (warning: no checks against accepted encodings
 	*	performed!); status will be [Ok], [partial-content], [not-modified] or according errors cache aware and etag/last-modified aware;
-	*	automatically adds Config.fileCacheControl, if no other cache control is specified */
+	*	automatically adds Config.fileCacheControl/Config.immutableCacheControl, if no other cache control is specified */
 	public async tryRespondFile(filePath: string, options?: { encoded?: string, media?: libRequest.MediaType, headers?: Record<string, string>, checkFreshness?: boolean }): Promise<boolean> {
 		if (options == null)
 			options = {};
@@ -1353,7 +1404,7 @@ export abstract class IncomingBase extends ClientBase {
 		headers['Vary'] = 'Accept-Encoding';
 		if (dynamicEncoder != null || options.encoded != null)
 			headers['Content-Encoding'] = dynamicEncoder?.name ?? options.encoded!;
-		headers['Accept-Ranges'] = 'bytes';
+		headers['Accept-Ranges'] = (dynamicEncoder != null ? 'none' : 'bytes');
 		headers['Last-Modified'] = cached.lastModified();
 		headers['ETag'] = etag;
 		if (!('Cache-Control' in headers)) {
@@ -1545,7 +1596,7 @@ export abstract class IncomingBase extends ClientBase {
 			return null;
 		}
 		if (this.nativeInterface.socket == null) {
-			this.respondInternalError('Request was not constructed as upgradable');
+			this.respondInternalError('Request was not provided as upgradable');
 			return null;
 		}
 		const native = this.nativeInterface.socket;
@@ -1568,7 +1619,7 @@ export abstract class IncomingBase extends ClientBase {
 			});
 
 			/* start the upgrade process (web-socket upgrade handler will automatically send error messages) */
-			this.nativeInterface.wss.handleUpgrade(this.nativeInterface.request, native.socket, native.head, (ws, _) => {
+			native.wss.handleUpgrade(this.nativeInterface.request, native.socket, native.head, (ws, _) => {
 				if (!settled && this.baseState.response == ResponseState.headerSent) {
 					settled = true, this.baseState.response = ResponseState.completed;
 
@@ -1591,71 +1642,6 @@ export abstract class IncomingBase extends ClientBase {
 }
 
 /*
-*
-*	Responding data: Will automatically encode the stream and send the header accordingly
-*		=> Will automatically determine if encoding is to be used
-*		=> Checks if promised number of bytes is provided
-*		=> Will automatically error, if the broken state is detected, and will auto-respond or send the connection into the broken state (stream user does not need to respond)
-*	Responding with files, data, or html can and will modify cache properties
-*
-*	Defaults [Accept-Ranges] to none
-*	Defaults [Vary] to 'Accept-Encoding'
-*/
-export class HttpRequest extends IncomingBase {
-	constructor(request: libHttp.IncomingMessage, response: libHttp.ServerResponse, host: string, protocol: string, wss: libWs.WebSocketServer) {
-		super(request, host, protocol, 'client', response, wss);
-	}
-}
-
-interface HttpResponseInterface {
-	setHeader(name: string, value: string): void;
-	setStatus(code: number, msg: string): void;
-}
-
-class HttpRequestResponse extends libStream.Writable {
-	public writer: libStream.Writable;
-	public totalSent: number;
-	public cache: Buffer | null;
-	public status: libRequest.StatusType;
-	public headers: Record<string, string>;
-	public contentSize: number | null;
-	public dynamicEncode: boolean;
-	public contentType: libRequest.MediaType;
-
-	constructor(writer: libStream.Writable, status: libRequest.StatusType, headers: Record<string, string>, contentSize: number | null, contentType: libRequest.MediaType,
-		dynamicEncode: boolean, handleData: (chunk: Buffer | null, cb: (err: any) => void) => void, destroy: (err: any, cb: (err: any) => void) => void
-	) {
-		super({
-			write: (chunk, _, cb) => handleData(chunk, cb),
-			final: (cb) => handleData(null, cb),
-			destroy: (err, cb) => destroy(err, cb)
-		});
-		this.writer = writer;
-		this.totalSent = 0;
-		this.cache = null;
-		this.status = status;
-		this.headers = headers;
-		this.contentSize = contentSize;
-		this.dynamicEncode = dynamicEncode;
-		this.contentType = contentType;
-	}
-}
-
-/*
-*	WebSocket upgrade requests, which were not accepted, will be closed after responding
-*	Responses will not add or modify any cache configurations
-*	An accept attempt must be fully awaited before completing the upgrade procedure
-*/
-export class HttpUpgrade extends IncomingBase {
-	private wss: libWs.WebSocketServer;
-
-	constructor(request: libHttp.IncomingMessage, socket: libStream.Duplex, head: Buffer, host: string, protocol: string, wss: libWs.WebSocketServer) {
-		super(request, host, protocol, 'upgrade', { socket, head }, wss);
-		this.wss = wss;
-	}
-}
-
-/*
 *	WebSocket with integrated alive checks
 *	Structured WebSocket, which takes care of error handling.
 *	close() is guaranteed to be called exactly once and no data or others will follow.
@@ -1674,7 +1660,7 @@ export class ClientSocket extends ClientBase {
 	public ondata?: (data: libWs.RawData, isBinary: boolean) => void;
 	public onclose?: () => void;
 
-	constructor(ws: libWs.WebSocket, base: IncomingBase) {
+	constructor(ws: libWs.WebSocket, base: ClientRequest) {
 		super(base, 'socket');
 		this.ws = ws;
 		this.timer = null;
@@ -1853,5 +1839,3 @@ export class ClientSocket extends ClientBase {
 		return this.closing.promise!;
 	}
 }
-
-export type HttpClient = HttpRequest | HttpUpgrade;
