@@ -3,7 +3,7 @@
 import { Config as libConfig } from "./config.js";
 import * as libLog from "./log.js";
 import * as libClient from "./client.js";
-import * as libRequest from "./request.js";
+import * as libBase from "./base.js";
 import * as libHandler from "./handler.js";
 import * as libHttps from "https";
 import * as libHttp from "http";
@@ -38,8 +38,8 @@ export class Server {
 
 	private respondBadEndpoint(request: libHttp.IncomingMessage, client: libClient.ClientRequest): void {
 		client.respond(`No resource found at [${request.headers.host ?? ''}]:[${client.url.pathname}]`, {
-			status: libRequest.Status.NotFound,
-			media: libRequest.Media.Text,
+			status: libBase.Status.NotFound,
+			media: libBase.Media.Text,
 			headers: { 'Connection': 'close' }
 		});
 	}

@@ -1,24 +1,6 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 /* Copyright (c) 2026 Bjoern Boss Henrichsen */
-import * as libLog from "./log.js";
-
-const logger = libLog.Logger('builder');
-
-/* escape all html-special characters to prevent injection when embedding untrusted values */
-export function EscapeHtml(content: string): string {
-	let out = '';
-	for (let i = 0; i < content.length; ++i) {
-		switch (content[i]) {
-			case '&': out += '&amp;'; break;
-			case '<': out += '&lt;'; break;
-			case '>': out += '&gt;'; break;
-			case '"': out += '&quot;'; break;
-			case '\'': out += '&#39;'; break;
-			default: out += content[i]; break;
-		}
-	}
-	return out;
-}
+import * as libHelper from "./helper.js";
 
 /* wrapper around a string that has been verified as safe for direct html insertion;
 *	plain strings are treated as untrusted and will be html-escaped before wrapping */
@@ -31,69 +13,18 @@ export class HtmlGuard {
 
 	/* ensure the value is safe for html insertion; escapes plain strings, passes through HtmlGuard as-is */
 	public static get(str: HtmlString): HtmlGuard {
-		return (str instanceof HtmlGuard ? str : new HtmlGuard(EscapeHtml(str)));
+		return (str instanceof HtmlGuard ? str : new HtmlGuard(libHelper.EscapeHtml(str)));
 	}
 
 	/* wrap a string for html insertion; if safe is false, it will be html-escaped first */
 	public static make(str: string, safe: boolean): HtmlGuard {
-		return new HtmlGuard(safe ? str : EscapeHtml(str));
+		return new HtmlGuard(safe ? str : libHelper.EscapeHtml(str));
 	}
 }
 
 /* create a secure string [if safe is true, content is taken as-is; otherwise it is html escaped] */
 export function Safe(content: string, safe: boolean = true): HtmlGuard {
 	return HtmlGuard.make(content, safe);
-}
-
-/* expand the placeholders in the content (format: {#name}, with '{#' being escaped as '{##') */
-export function ExpandPlaceholders(content: string, args: Record<string, HtmlString>): string {
-	let out = '', name = '', placeholder = false;
-	for (let i = 0; i < content.length; ++i) {
-		/* check if this is not the start/end of a placeholder, in which case it can just be added to the current set */
-		if (!content.startsWith(placeholder ? '}' : '{#', i)) {
-			if (placeholder)
-				name += content[i];
-			else
-				out += content[i];
-			continue;
-		}
-
-		/* check if a name is being started and if its potentially just an escape sequence */
-		if (!placeholder) {
-			if (content.startsWith('{##', i))
-				out += '{#', i += 2;
-			else
-				name = '', placeholder = true, ++i;
-			continue;
-		}
-
-		/* validate the completed name */
-		else {
-			placeholder = false;
-			if (name in args)
-				out += HtmlGuard.get(args[name]).content;
-			else
-				logger.warning(`Undefined placeholder [${name}] encountered`);
-		}
-	}
-
-	if (placeholder)
-		logger.warning('Content ends with an incomplete placeholder');
-	return out;
-}
-
-/* escape all placeholders in the content */
-export function EscapePlaceholders(content: string): string {
-	let out = '';
-
-	/* construct the new escaped output content */
-	for (let i = 0; i < content.length; ++i) {
-		if (!content.startsWith('{#', i))
-			out += content[i];
-		else
-			out += '{##', ++i;
-	}
-	return out;
 }
 
 /* html component building interface (simple should return true for small one liners) */
@@ -106,7 +37,7 @@ export interface HtmlComponent {
 export class EmbeddedContent implements HtmlComponent {
 	private content: string;
 	public constructor(content: string, safe: boolean) {
-		this.content = (safe ? content : EscapeHtml(content));
+		this.content = (safe ? content : libHelper.EscapeHtml(content));
 	}
 	public simple(): boolean {
 		return (this.content.indexOf('\n') < 0);

@@ -3,7 +3,7 @@
 import { Config as libConfig } from "./config.js";
 import * as libLog from "./log.js";
 import * as libLocation from "./location.js";
-import * as libRequest from "./request.js";
+import * as libBase from "./base.js";
 import * as libFs from "fs";
 import * as libStream from "stream";
 import * as libCrypto from "crypto";
@@ -437,7 +437,7 @@ class AlreadyCached implements Cached {
 	public readSync(): Buffer {
 		return this.entry.data;
 	}
-	public encoded(encoding: libRequest.EncodingType): EncodedCache {
+	public encoded(encoding: libBase.EncodingType): EncodedCache {
 		return EncodedCache(this, this.entry, encoding, this.entry.age);
 	}
 }
@@ -532,7 +532,7 @@ class NotCached implements Cached {
 		cacheManager.add(this.path, data, this.mtime, this.age);
 		return data;
 	}
-	public encoded(encoding: libRequest.EncodingType): EncodedCache {
+	public encoded(encoding: libBase.EncodingType): EncodedCache {
 		return EncodedCache(this, null, encoding, this.age);
 	}
 }
@@ -561,7 +561,7 @@ function StreamToAsync(stream: libStream.Readable): Promise<Buffer> {
 		});
 	});
 }
-function EncodedCache(reader: Cached, entry: CacheEntry | null, encoding: libRequest.EncodingType, age: number): EncodedCache {
+function EncodedCache(reader: Cached, entry: CacheEntry | null, encoding: libBase.EncodingType, age: number): EncodedCache {
 	/* check if the given encoding has already been cached */
 	if (entry != null && encoding.name in entry.encodings) {
 		const encoded = entry.encodings[encoding.name];
@@ -729,7 +729,7 @@ export interface Cached {
 	readSync(): Buffer;
 
 	/* create an encoded version of this cached entry */
-	encoded(encoding: libRequest.EncodingType): EncodedCache;
+	encoded(encoding: libBase.EncodingType): EncodedCache;
 }
 
 export interface EncodedCache {
