@@ -211,32 +211,92 @@ export function AddLogger(cb: LogCallback): Detacher {
 	};
 }
 
-/* logger identity class to extend, supporting various log classes */
-export class LogIdentity {
-	public logIdentity: string;
+const LoggerIdMap: Record<string, number> = {};
+
+/* type to invoke to update the logging tag (empty string will hide the tag entry;
+*	null will completely remove the tag; other values will update the tag) */
+export type TagUpdate = (value?: string) => void;
+
+/* logger class to extend, supporting various logging classes */
+export class Logger {
+	private _rootIdentity: string;
+	private _logIdentity: string;
+	private _logTagList: { value: string }[];
 
 	constructor(identity: string) {
-		this.logIdentity = identity;
+		const id = (LoggerIdMap[identity] ?? 0) + 1;
+		LoggerIdMap[identity] = id;
+
+		this._rootIdentity = `${identity}!${id}`;
+		this._logIdentity = this._rootIdentity;
+		this._logTagList = [];
+	}
+	private _updateLogIdentity(): void {
+		this._logIdentity = this._rootIdentity;
+
+		for (const tag of this._logTagList) {
+			if (tag.value != '')
+				this._logIdentity += `.${tag.value}`;
+		}
+	}
+
+	/* root identity tagged with unique id */
+	public get logRoot(): string {
+		return this._rootIdentity;
+	}
+
+	/* tag extension appended to root identity to form full logging identity */
+	public get logExtension(): string {
+		return this._logIdentity.substring(this._rootIdentity.length + 1);
+	}
+
+	/* full logging identity as shown in logs */
+	public get logIdentity(): string {
+		return this._logIdentity;
+	}
+
+	/* tag the logging with the given identifier and return a callback to update the tag */
+	public tagLog(identifier: string): TagUpdate {
+		let tag: { value: string } | null = { value: identifier };
+
+		this._logTagList.push(tag);
+		if (tag.value != '')
+			this._updateLogIdentity();
+
+		/* setup the handler responsible to update the logging */
+		return (value?: string) => {
+			if (tag == null) return;
+
+			/* check if the tag should be removed or if the value should just be updated */
+			if (value == null) {
+				this._logTagList = this._logTagList.filter((v) => v != tag);
+				tag = null;
+			}
+			else if (value != tag.value)
+				tag.value = value;
+
+			this._updateLogIdentity();
+		};
 	}
 
 	public error(msg: string): void {
-		MakeActualLog('error', this.logIdentity, msg);
+		MakeActualLog('error', this._logIdentity, msg);
 	}
 	public info(msg: string): void {
-		MakeActualLog('info', this.logIdentity, msg);
+		MakeActualLog('info', this._logIdentity, msg);
 	}
 	public warning(msg: string): void {
-		MakeActualLog('warning', this.logIdentity, msg);
+		MakeActualLog('warning', this._logIdentity, msg);
 	}
 	public log(msg: string): void {
-		MakeActualLog('log', this.logIdentity, msg);
+		MakeActualLog('log', this._logIdentity, msg);
 	}
 	public trace(msg: string): void {
-		MakeActualLog('trace', this.logIdentity, msg);
+		MakeActualLog('trace', this._logIdentity, msg);
 	}
 }
 
-/* create a logger identity interface to create associated logs */
-export function Logger(identity: string): LogIdentity {
-	return new LogIdentity(identity);
+/* create a logger class to create associated logs */
+export function MakeLogger(identity: string): Logger {
+	return new Logger(identity);
 }

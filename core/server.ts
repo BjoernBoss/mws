@@ -20,7 +20,7 @@ import * as libWs from "ws";
 */
 export type CheckHost = (host: string) => boolean;
 
-export class Server extends libLog.LogIdentity {
+export class Server extends libLog.Logger {
 	private _stop: {
 		listener: (() => [Promise<void>, Promise<void>])[];
 		promise: Promise<void> | null;
@@ -136,7 +136,7 @@ export class Server extends libLog.LogIdentity {
 
 						const address = server.address() as libNet.AddressInfo | null;
 						if (address != null)
-							this.info(`Server stopping to listen ${protocol}[${address.address}]:${address.port} [family: ${address.family}] with handler [${handler.moduleName}]`);
+							this.info(`Server stopping to listen ${protocol}[${address.address}]:${address.port} [family: ${address.family}] with handler [${handler.logIdentity}]`);
 
 						server.close(() => {
 							resolver();
@@ -167,7 +167,7 @@ export class Server extends libLog.LogIdentity {
 				server.on('listening', () => {
 					if (serverStopPromise != null) return;
 					const address = server.address() as libNet.AddressInfo;
-					this.info(`Server started successfully on ${protocol}[${address.address}]:${address.port} [family: ${address.family}] with handler [${handler.moduleName}]`);
+					this.info(`Server started successfully on ${protocol}[${address.address}]:${address.port} [family: ${address.family}] with handler [${handler.logIdentity}]`);
 				});
 
 				/* start the actual serer */

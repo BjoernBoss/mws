@@ -14,18 +14,16 @@ import * as libHttp from "http";
 const BAD_HTTP_STRING_REGEX: RegExp = /[\x00-\x1f\x7f]/;
 const BAD_HTTP_HEADER_NAME_REGEX: RegExp = /[\x00-\x1f\x7f\(\)<>@,;:\\"/\[\]\?=\{\} \t]/;
 
-let NextClientId: number = 0;
-
 class ClientContext {
-	public logIdentity: string;
+	public dropLogTag: () => void;
 	public path: string;
 	public translationCount: number;
 	public busyCount: number;
 	public headerPatchCount: number;
 	public htmlPatchCount: number;
 
-	constructor(logIdentity: string, path: string, translationCount: number, busyCount: number, headerPatchCount: number, htmlPatchCount: number) {
-		this.logIdentity = logIdentity;
+	constructor(path: string, translationCount: number, busyCount: number, headerPatchCount: number, htmlPatchCount: number) {
+		this.dropLogTag = () => { };
 		this.path = path;
 		this.translationCount = translationCount;
 		this.busyCount = busyCount;
@@ -34,7 +32,7 @@ class ClientContext {
 	}
 }
 
-class ClientBase extends libLog.LogIdentity {
+class ClientBase extends libLog.Logger {
 	private _config: BurntClientConfig;
 	protected _path: string;
 	protected _translation: Record<string, string | null>[];
@@ -42,9 +40,7 @@ class ClientBase extends libLog.LogIdentity {
 	protected constructor(url: libUrl.URL, kind: string, config: BurntClientConfig);
 	protected constructor(client: ClientBase, kind: string, config: BurntClientConfig);
 	protected constructor(arg: libUrl.URL | ClientBase, kind: string, config: BurntClientConfig) {
-		const thisClientId = ++NextClientId;
-		super(`${kind}!${thisClientId}`);
-		this.id = thisClientId;
+		super(kind);
 
 		if (arg instanceof libUrl.URL) {
 			this._translation = [];
@@ -59,9 +55,6 @@ class ClientBase extends libLog.LogIdentity {
 
 		this._config = config;
 	}
-
-	/* unique id to identify client in logs */
-	readonly id: number;
 
 	/* raw request origin (no host will result in '_') */
 	readonly url: libUrl.URL;
@@ -932,24 +925,26 @@ export class ClientRequest extends ClientBase {
 				return null;
 		}
 
-		const current = new ClientContext(this.logIdentity, this._path, this._translation.length,
+		const current = new ClientContext(this._path, this._translation.length,
 			this._throughput.busyCheck.length, this._headerPatcher.length, this._htmlPatcher.length);
 
 		/* setup the new path, all path translations, and the tagged logging identity */
 		this._path = libHelper.Rebase(match[0], match[1]!, this._path);
 		if (sanitized != null)
 			this._translation.push(sanitized);
-		if (identity != '')
-			this.logIdentity = `${this.logIdentity}.${identity}`;
+		if (identity != '') {
+			const update = this.tagLog(identity);
+			current.dropLogTag = () => update();
+		}
 		return current;
 	}
 	public _restoreSnapshot(snapshot: ClientContext): void {
-		this.logIdentity = snapshot.logIdentity;
 		this._path = snapshot.path;
 		this._translation.splice(snapshot.translationCount);
 		this._throughput.busyCheck.splice(snapshot.busyCount);
 		this._headerPatcher.splice(snapshot.headerPatchCount);
 		this._htmlPatcher.splice(snapshot.htmlPatchCount);
+		snapshot.dropLogTag();
 	}
 
 	/* instantiate a request client from a web request structure (must be followed by one finalizeConnection call) */
@@ -1674,7 +1669,6 @@ export class ClientRequest extends ClientBase {
 *	WebSocket with integrated alive checks.
 *	Structured WebSocket, which takes care of error handling.
 *	close() is guaranteed to be called exactly once and no data or others will follow.
-*	Closing promise resolves once the close callback has been fully invoked.
 */
 export class ClientSocket extends ClientBase {
 	private _ws: libWs.WebSocket;
@@ -1686,20 +1680,17 @@ export class ClientSocket extends ClientBase {
 		promise: Promise<void> | null;
 		closed: (() => void) | null, defer: number;
 	};
-	private _logging: {
-		root: libLog.LogIdentity;
-		tags: { value: string }[];
-	};
+	private _logger: libLog.Logger;
 
 	private constructor(ws: libWs.WebSocket, source: ClientRequest) {
 		super(source, 'socket', source.config);
 		this._ws = ws;
 		this._alive = { timer: null, isAlive: true };
 		this._closing = { promise: null, closed: null, defer: 0 };
-		this._logging = { root: libLog.Logger(this.logIdentity), tags: [] };
+		this._logger = libLog.MakeLogger(this.logIdentity);
 
 		this._ws.on('pong', () => {
-			this._logging.root.trace(`Alive check pong received`);
+			this._logger.trace(`Alive check pong received`);
 			this.selfIsAlive();
 		});
 		this._ws.on('message', (data, isBinary) => {
@@ -1736,11 +1727,7 @@ export class ClientSocket extends ClientBase {
 
 		/* perserve the log tags of the base */
 		source.log(`WebSocket accepted: [${this.logIdentity}]`);
-		const logTagList = source.logIdentity.indexOf('.');
-		if (logTagList >= 0) {
-			this._logging.tags.push({ value: source.logIdentity.substring(logTagList + 1) });
-			this.updateLogging();
-		}
+		this.tagLog(source.logExtension);
 	}
 	private checkIsAlive(): void {
 		if (this._closing.promise != null)
@@ -1758,7 +1745,7 @@ export class ClientSocket extends ClientBase {
 
 		/* try to ping the remote to check the liveliness */
 		try {
-			this._logging.root.trace(`Sending ping to determine if connection is alive`);
+			this._logger.trace(`Sending ping to determine if connection is alive`);
 			this._ws.ping();
 		} catch (err: any) {
 			this.handleClosing(`WebSocket error while pinging: ${err.message}`);
@@ -1785,14 +1772,14 @@ export class ClientSocket extends ClientBase {
 
 			/* check if a termination should be triggered and otherwise start the grace termination timer */
 			if (terminate != null) {
-				this._logging.root.error(terminate);
+				this._logger.error(terminate);
 				this._ws.terminate();
 			}
 			else {
 				this._alive.timer = setTimeout(() => {
 					this._alive.timer = null;
 					if (this._closing.closed != null) {
-						this._logging.root.error('Closing connection');
+						this._logger.error('Closing connection');
 						this._ws.terminate();
 					}
 				}, this.config.killGraceTimeout);
@@ -1807,22 +1794,12 @@ export class ClientSocket extends ClientBase {
 		if (this.onclose != null) {
 			try { this.onclose(); }
 			catch (err: any) {
-				this._logging.root.error(`Unhandled exception in WebSocket close handler: ${err.message}`);
+				this._logger.error(`Unhandled exception in WebSocket close handler: ${err.message}`);
 			}
 		}
-		this._logging.root.trace('Socket connection closed');
+		this._logger.trace('Socket connection closed');
 
 		closed();
-	}
-	private updateLogging(): void {
-		let identity = this._logging.root.logIdentity;
-
-		for (const tag of this._logging.tags) {
-			if (tag.value != '')
-				identity += `.${tag.value}`;
-		}
-
-		this.logIdentity = identity;
 	}
 
 	public static _fromRequest(ws: libWs.WebSocket, source: ClientRequest) {
@@ -1835,31 +1812,7 @@ export class ClientSocket extends ClientBase {
 	/* invoked once when the connection has been closed or failed (no more data will be received afterwards) */
 	public onclose?: () => void;
 
-	/* tag the logging with the given identity and return a callback to update the tag (empty string will
-	*	hide the tag entry; null will completely remove the tag; other values will update the tag) */
-	public tagLog(identity: string): ((value?: string) => void) {
-		let tag: { value: string } | null = { value: identity };
-
-		this._logging.tags.push(tag);
-		if (tag.value != '')
-			this.updateLogging();
-
-		/* setup the handler responsible to update the logging */
-		return (value?: string) => {
-			if (tag == null) return;
-
-			/* check if the tag should be removed or if the value should just be updated */
-			if (value == null) {
-				this._logging.tags = this._logging.tags.filter((v) => v != tag);
-				tag = null;
-			}
-			else if (value != tag.value)
-				tag.value = value;
-
-			this.updateLogging();
-		};
-	}
-
+	/* send data to the remote (ignored if connection is being closed) */
 	public send(data: string | Buffer): void {
 		if (this._closing.promise != null)
 			return;
@@ -1870,6 +1823,8 @@ export class ClientSocket extends ClientBase {
 			this.handleClosing(`WebSocket error while sending data: ${err.message}`);
 		}
 	}
+
+	/* close the web socket (promise resolved once the close callback has been fully invoked) */
 	public close(): Promise<void> {
 		if (this._closing.promise == null) {
 			this._ws.close();

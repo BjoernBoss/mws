@@ -6,7 +6,7 @@ import * as libUrl from "url";
 import * as libPath from "path";
 import * as libFs from "fs/promises";
 
-const logger = libLog.Logger('helper');
+const logger = libLog.MakeLogger('helper');
 
 /* setup the reverse list of file-endings to media types and encoding-names to encoding types */
 const FileEndingToMediaTypeMapping: Record<string, libBase.MediaType> = {};
@@ -405,7 +405,7 @@ export function SplitFilePath(path: string): [string, string, string] {
 }
 
 /* perform an atomic write by first writing the file to [path.temp] and then replacing it (logs on failures and returns false, encoded as utf-8) */
-export async function AtomicWrite(path: string, content: string, what: string, _logger: libLog.LogIdentity): Promise<boolean> {
+export async function AtomicWrite(path: string, content: string, what: string, _logger: libLog.Logger): Promise<boolean> {
 	const tempPath = `${path}.temp`;
 
 	let written = false;

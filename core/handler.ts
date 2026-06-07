@@ -29,16 +29,14 @@ interface LinkedModules {
 	cleanup: () => Promise<void>;
 	setup: ((realized: Promise<void> | null) => void) | null;
 }
-let NextModuleId: number = 0;
 
-export abstract class ModuleHandler extends libLog.LogIdentity {
+export abstract class ModuleHandler extends libLog.Logger {
 	private _stopped: Promise<void> | null;
 	private _config: {
 		name: string;
-		tagLogs: boolean;
+		tagClients: boolean;
 		tagString: string;
 		stopOnDetach: boolean;
-		id: number;
 	};
 	private _handling: {
 		active: Set<libClient.ClientRequest>;
@@ -57,10 +55,9 @@ export abstract class ModuleHandler extends libLog.LogIdentity {
 	};
 
 	protected constructor(name: string) {
-		const thisModuleId = ++NextModuleId;
-		super(`${name}!${thisModuleId}`);
+		super(name);
 
-		this._config = { name, tagLogs: true, tagString: '', stopOnDetach: true, id: thisModuleId };
+		this._config = { name, tagClients: true, tagString: '', stopOnDetach: true };
 		this._handling = { active: new Set<libClient.ClientRequest>(), promise: null, resolver: () => { } };
 		this._stopped = null;
 		this._attachment = { links: new Set<LinkedModules>(), attached: false, task: { promise: null, order: [], count: 0, resolver: () => { } } };
@@ -120,7 +117,7 @@ export abstract class ModuleHandler extends libLog.LogIdentity {
 		if (!this._attachment.attached)
 			return client.claimed;
 		const mapping = translate ?? { '/': '/' };
-		const logTag = (this._config.tagLogs ? (this._config.tagString == '' ? this._config.name : this._config.tagString) : '');
+		const logTag = (this._config.tagClients ? (this._config.tagString == '' ? this._config.name : this._config.tagString) : '');
 		const snapshot = client._pushTranslation(mapping, logTag);
 		if (snapshot == null)
 			return client.claimed;
@@ -359,13 +356,13 @@ export abstract class ModuleHandler extends libLog.LogIdentity {
 		return this._config.name;
 	}
 
-	/* enable or disable the module tagging the logging output [default: true] */
-	public tagLogs(tag: boolean): this {
-		this._config.tagLogs = tag;
+	/* enable or disable the module tagging the logging of clients [default: true] */
+	public tagClients(tag: boolean): this {
+		this._config.tagClients = tag;
 		return this;
 	}
 
-	/* set the tagging string the module should use in the logging with empty string being module name [default: ''] */
+	/* set the tagging string the module should use in the logging of clients with empty string being module name [default: ''] */
 	public tagString(tag: string): this {
 		this._config.tagString = tag;
 		return this;

@@ -32,14 +32,14 @@ interface CacheEntry {
 	touched: number;
 }
 class CacheManager {
-	private logger: libLog.LogIdentity;
+	private logger: libLog.Logger;
 	private map: Record<string, CacheEntry> = {};
 	private nextStamp: number = 0;
 	private allocated: number = 0;
 	private totalCapacity: number;
 	private largestSize: number;
 
-	public constructor(logger: libLog.LogIdentity, cacheSize: number, fileSizeLimit: number) {
+	public constructor(logger: libLog.Logger, cacheSize: number, fileSizeLimit: number) {
 		this.logger = logger;
 		this.totalCapacity = cacheSize;
 		this.largestSize = fileSizeLimit;
@@ -153,14 +153,14 @@ interface ImmutableSerialized {
 	mtime: number;
 }
 class ImmutableManager {
-	private logger: libLog.LogIdentity;
+	private logger: libLog.Logger;
 	private map: Record<string, ImmutableEntry> = {};
 	private reverse: Record<string, string> = {};
 	private writeBack: { path: string, writing: Promise<void> | null, dirty: boolean } | null = null;
 	private alwaysValidate: boolean;
 	private immutableTagging: boolean;
 
-	constructor(writeBackPath: string, logger: libLog.LogIdentity, alwaysValidate: boolean, immutableTagging: boolean) {
+	constructor(writeBackPath: string, logger: libLog.Logger, alwaysValidate: boolean, immutableTagging: boolean) {
 		this.logger = logger;
 		this.alwaysValidate = alwaysValidate;
 		this.immutableTagging = immutableTagging;
@@ -676,7 +676,7 @@ export interface EncodedCache {
 	readSync(): Buffer;
 }
 
-export class CacheHost extends libLog.LogIdentity {
+export class CacheHost extends libLog.Logger {
 	private _cacheManager: CacheManager;
 	private _immutableManager: ImmutableManager;
 	private _alwaysValidate: boolean;
