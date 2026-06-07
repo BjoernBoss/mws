@@ -199,9 +199,9 @@ export abstract class ModuleHandler extends libLog.LogIdentity {
 		if (this._config.stopOnDetach)
 			this.stop();
 
-		/* kill any current connections and wait for any current tasks and connections to complete */
+		/* kill any connections and wait for any current tasks and connections to complete */
 		for (const client of this._handling.active)
-			client._killConnection();
+			client.killConnection('Module detached');
 		await this._drainTaskQueue(true, taskPromise);
 
 		/* convert the task back to the unordered next step */

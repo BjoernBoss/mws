@@ -35,26 +35,29 @@ class ClientContext {
 }
 
 class ClientBase extends libLog.LogIdentity {
-	protected relativePath: string;
-	protected pathTranslation: Record<string, string | null>[];
+	private _config: BurntClientConfig;
+	protected _path: string;
+	protected _translation: Record<string, string | null>[];
 
-	protected constructor(url: libUrl.URL, kind: string);
-	protected constructor(client: ClientBase, kind: string);
-	protected constructor(arg: libUrl.URL | ClientBase, kind: string) {
+	protected constructor(url: libUrl.URL, kind: string, config: BurntClientConfig);
+	protected constructor(client: ClientBase, kind: string, config: BurntClientConfig);
+	protected constructor(arg: libUrl.URL | ClientBase, kind: string, config: BurntClientConfig) {
 		const thisClientId = ++NextClientId;
 		super(`${kind}!${thisClientId}`);
 		this.id = thisClientId;
 
 		if (arg instanceof libUrl.URL) {
-			this.pathTranslation = [];
-			this.relativePath = libHelper.Sanitize(arg.pathname, false);
+			this._translation = [];
+			this._path = libHelper.Sanitize(arg.pathname, false);
 			this.url = arg;
 		}
 		else {
-			this.pathTranslation = arg.pathTranslation;
-			this.relativePath = arg.relativePath;
+			this._translation = arg._translation;
+			this._path = arg._path;
 			this.url = arg.url;
 		}
+
+		this._config = config;
 	}
 
 	/* unique id to identify client in logs */
@@ -65,17 +68,22 @@ class ClientBase extends libLog.LogIdentity {
 
 	/* path relative to current module */
 	public get path(): string {
-		return this.relativePath;
+		return this._path;
+	}
+
+	/* configuration used by this client */
+	public get config(): BurntClientConfig {
+		return this._config
 	}
 
 	/* check if the path relative to the current module is a sub path of the given test base path */
 	public isSubPathOf(base: string): boolean {
-		return libHelper.IsSubPath(base, this.relativePath);
+		return libHelper.IsSubPath(base, this._path);
 	}
 
 	/* check if the path relative to the current module is inside of the given test base path */
 	public isInsideOf(base: string): boolean {
-		return libHelper.IsInside(base, this.relativePath);
+		return libHelper.IsInside(base, this._path);
 	}
 
 	/* create a path relative from the current module into the clients traversed server space */
@@ -83,11 +91,11 @@ class ClientBase extends libLog.LogIdentity {
 		path = libHelper.Sanitize(path, false);
 		let output = path;
 
-		for (let i = this.pathTranslation.length - 1; i >= 0; --i) {
+		for (let i = this._translation.length - 1; i >= 0; --i) {
 			let nullCheck = false, match: [string, string | null] | null = null;
 
 			/* find the best reverse mapping and apply it */
-			for (const [from, to] of Object.entries(this.pathTranslation[i])) {
+			for (const [from, to] of Object.entries(this._translation[i])) {
 				if (to == null)
 					nullCheck = true;
 				else if (libHelper.IsSubPath(to, output) && (match == null || match[1]!.length < to.length))
@@ -100,7 +108,7 @@ class ClientBase extends libLog.LogIdentity {
 			*	the final unpacked path re-maps into the null-mapping */
 			if (nullCheck) {
 				match = null;
-				for (const [from, to] of Object.entries(this.pathTranslation[i])) {
+				for (const [from, to] of Object.entries(this._translation[i])) {
 					if (libHelper.IsSubPath(from, output) && (match == null || match[0].length < from.length))
 						match = [from, to];
 				}
@@ -148,6 +156,8 @@ class HttpRequestResponse extends libStream.Writable {
 	public contentSize: number | null;
 	public dynamicEncode: boolean;
 	public contentType: libBase.MediaType;
+	public encodingFailed: boolean;
+	public responseCompleted: boolean;
 
 	constructor(writer: libStream.Writable, status: libBase.StatusType, headers: Record<string, string>, contentSize: number | null, contentType: libBase.MediaType,
 		dynamicEncode: boolean, handleData: (chunk: Buffer | null, cb: (err: any) => void) => void, destroy: (err: any, cb: (err: any) => void) => void
@@ -165,6 +175,8 @@ class HttpRequestResponse extends libStream.Writable {
 		this.contentSize = contentSize;
 		this.dynamicEncode = dynamicEncode;
 		this.contentType = contentType;
+		this.encodingFailed = false;
+		this.responseCompleted = false;
 	}
 }
 
@@ -234,11 +246,10 @@ export class ClientRequest extends ClientBase {
 		socket?: { socket: libStream.Duplex, head: Buffer, wss: libWs.WebSocketServer };
 	};
 	private _request: libHttp.IncomingMessage;
-	private _config: BurntClientConfig;
 	private _cache: libCache.CacheHost;
 
 	private constructor(cache: libCache.CacheHost, config: BurntClientConfig, host: string, protocol: string, request: libHttp.IncomingMessage, response: libHttp.ServerResponse | { socket: libStream.Duplex, head: Buffer, wss: libWs.WebSocketServer }) {
-		super(new libUrl.URL(`${protocol}//${host == '' ? '_' : host}${request.url}`), 'request');
+		super(new libUrl.URL(`${protocol}//${host == '' ? '_' : host}${request.url}`), 'request', config);
 		this._headerPatcher = [];
 		this._htmlPatcher = [];
 
@@ -261,12 +272,11 @@ export class ClientRequest extends ClientBase {
 
 		this._request = request;
 		this._cache = cache;
-		this._config = config;
 
 		/* setup the throughput measurement to detect any stalling connections */
 		this._throughput = { timer: null, deadline: 0, start: 0, active: true, busyCheck: [] };
-		if (this._config.throughputThreshold > 0) {
-			this._throughput.start = Date.now() + this._config.throughputGrace;
+		if (this.config.throughputThreshold > 0) {
+			this._throughput.start = Date.now() + this.config.throughputGrace;
 			this.updateThroughput(0);
 		}
 
@@ -317,8 +327,8 @@ export class ClientRequest extends ClientBase {
 			headers = {};
 		const description = `${this.isHead ? 'HEAD:' : ''}[${status.msg}]${logReason == null ? '' : `: ${logReason}`}`;
 
-		if (!('Cache-Control' in headers) && this._config.responseCacheControl != '')
-			headers['Cache-Control'] = this._config.responseCacheControl;
+		if (!('Cache-Control' in headers) && this.config.responseCacheControl != '')
+			headers['Cache-Control'] = this.config.responseCacheControl;
 
 		/* check if the response can still be sent (acknowledged state can be overridden; the connection
 		*	will be closed afterwards to prevent the client from seeing inconsistent responses) */
@@ -347,7 +357,7 @@ export class ClientRequest extends ClientBase {
 			this.trace(`Request broken, discarding response ${description}`);
 	}
 	private failThroughput(): void {
-		if (this._config.throughputThreshold <= 0 || !this._throughput.active || this._state.response == ResponseState.broken)
+		if (this.config.throughputThreshold <= 0 || !this._throughput.active || this._state.response == ResponseState.broken)
 			return;
 
 		/* check if the connection is still considered busy and should receive a grace delay */
@@ -358,29 +368,31 @@ export class ClientRequest extends ClientBase {
 			if (!result) continue;
 
 			this.trace(`Deferring throughput closing as connection is busy`);
-			this._throughput.start = Date.now() + this._config.throughputGrace;
+			this._throughput.start = Date.now() + this.config.throughputGrace;
 			this.updateThroughput(0);
 			this._request.socket.setTimeout(this._request.socket.timeout ?? 0);
 			return;
 		}
 
+		const description = `Throughput below [${this.config.throughputThreshold}] bytes/sec`;
 		const closing = (this._state.response == ResponseState.none || this._state.response == ResponseState.acknowledged);
+
 		if (closing)
-			this.respondRequestTimeout(`Throughput below [${this._config.throughputThreshold}] bytes/sec`, { headers: { 'Connection': 'close' } });
-		this.markAsBroken(`Throughput below [${this._config.throughputThreshold}] bytes/sec`, closing);
+			this.respondRequestTimeout(description, { headers: { 'Connection': 'close' } });
+		this.markAsBroken((closing ? '' : description), closing);
 	}
 	private updateThroughput(delta: number): void {
 		if (this._throughput.timer != null)
 			clearTimeout(this._throughput.timer);
 		this._throughput.timer = null;
-		if (this._config.throughputThreshold <= 0 || !this._throughput.active)
+		if (this.config.throughputThreshold <= 0 || !this._throughput.active)
 			return;
 		const _now = Date.now();
 		const now = Math.max(_now, this._throughput.start);
 
 		/* shift the deadline according to the bought time by the throughput */
-		const bought = (delta / this._config.throughputThreshold) * 1000;
-		this._throughput.deadline = now + Math.min(this._config.throughputWindow, Math.max(0, this._throughput.deadline - now) + bought);
+		const bought = (delta / this.config.throughputThreshold) * 1000;
+		this._throughput.deadline = now + Math.min(this.config.throughputWindow, Math.max(0, this._throughput.deadline - now) + bought);
 		this._throughput.timer = setTimeout(() => this.failThroughput(), this._throughput.deadline - _now);
 	}
 	private wrapSocketWriter(socket: libStream.Duplex): [HttpResponseInterface, libStream.Writable] {
@@ -526,7 +538,7 @@ export class ClientRequest extends ClientBase {
 				if (settled) return; settled = true;
 				this.killNativeConnection(false);
 				resolver();
-			}, this._config.killGraceTimeout);
+			}, this.config.killGraceTimeout);
 
 			await this.killNativeConnection(graceful);
 			clearTimeout(forceDestroy);
@@ -563,12 +575,12 @@ export class ClientRequest extends ClientBase {
 			headers['Vary'] = 'Accept-Encoding';
 		if (!('Date' in headers))
 			headers['Date'] = new Date().toUTCString();
-		for (const [key, value] of Object.entries(this._config.commonHeaders)) {
+		for (const [key, value] of Object.entries(this.config.commonHeaders)) {
 			if (!(key in headers))
 				headers[key] = value;
 		}
-		if (this._config.serverName != '' && !('Server' in headers))
-			headers['Server'] = this._config.serverName;
+		if (this.config.serverName != '' && !('Server' in headers))
+			headers['Server'] = this.config.serverName;
 		if (content != null) {
 			headers['Content-Type'] = libHelper.BuildMediaTypeIdentifier(content.media);
 			if (content.size != null)
@@ -679,9 +691,9 @@ export class ClientRequest extends ClientBase {
 			encoder.pipe(resp.writer);
 			resp.writer = encoder;
 
-			resp.writer.once('error', (err: any) => {
-				if (!resp.destroyed)
-					resp.destroy(err);
+			encoder.once('error', (err: any) => {
+				resp.encodingFailed = true;
+				resp.destroy(err);
 			});
 		}
 
@@ -695,6 +707,7 @@ export class ClientRequest extends ClientBase {
 			if (this._state.response != ResponseState.headerSent)
 				return cb(null);
 			this._state.response = ResponseState.completed;
+			resp.responseCompleted = true;
 			resp.writer.end(() => cb(null));
 			return;
 		}
@@ -723,6 +736,7 @@ export class ClientRequest extends ClientBase {
 
 		/* mark the state as completed and sent the last package */
 		this._state.response = ResponseState.completed;
+		resp.responseCompleted = true;
 		if (chunk != null)
 			resp.writer.end(chunk, () => cb(null));
 		else
@@ -764,32 +778,36 @@ export class ClientRequest extends ClientBase {
 				}
 			},
 			(err: any, cb: (err: any) => void) => {
-				if (this._state.response == ResponseState.completed)
+				/* check if the response was already completed, in which case the error must
+				*	be ignored, as the encoder might still contain buffered data to be sent */
+				if (output.responseCompleted)
 					return cb(err);
+				output.responseCompleted = true;
 
-				/* check if the output stream was an encoder, in which case it still needs to be destroyed
-				*	(only if an error occurred and the response was not completed, as the decoder might otherwise
-				*	still queue data waiting to be sent out, which the response writer already passed on) */
+				/* check if the output stream was an encoder, in which case it can be destroyed */
 				if (output.writer !== this._native.writer)
 					output.writer.destroy();
 
 				/* check if the error originated from the data sender and ensure the connection is closed
 				*	(cannot be acknowledged for failed encodings, as they can first trigger on already header-sent) */
 				if (this._state.response != ResponseState.broken) {
+					const description = `${output.encodingFailed ? 'Encoding failure' : 'Response closed prematurely'}: ${err.message}`;
 					const closing = (this._state.response == ResponseState.acknowledged);
-					if (closing)
-						this.badClientUsage('Response closed prematurely', true);
-					this.markAsBroken(`Data transfer failed: ${err.message}`, closing);
+
+					if (closing) {
+						if (output.encodingFailed)
+							this.respondInternalError(description, { headers: { 'Connection': 'close' } });
+						else
+							this.badClientUsage(description, true);
+					}
+					this.markAsBroken((closing ? '' : description), closing);
 				}
 				return cb(err);
 			}
 		);
 
 		/* register the broken handler to detect closed or failed connections */
-		this._state.breakPromise.then(() => {
-			if (!output.destroyed)
-				output.destroy(new Error('Connection broken'));
-		});
+		this._state.breakPromise.then(() => output.destroy(new Error('Connection broken')));
 
 		return output;
 	}
@@ -861,8 +879,8 @@ export class ClientRequest extends ClientBase {
 				const decoder = encoding.makeDecode();
 				stream = stream.pipe(decoder);
 				decoder.once('error', (err: any) => {
-					if (output.destroyed) return;
-					this.respondBadRequest('Invalid data encoding');
+					if (!output.destroyed)
+						this.respondBadRequest('Invalid data encoding');
 					output.destroy(err);
 				});
 
@@ -884,22 +902,74 @@ export class ClientRequest extends ClientBase {
 		}
 
 		/* register the broken handler to detect closed or failed connections */
-		this._state.breakPromise.then(() => {
-			if (!output.destroyed)
-				output.destroy(new Error('Connection broken'));
-		});
+		this._state.breakPromise.then(() => output.destroy(new Error('Connection broken')));
 
 		/* create the plumbing between stream and output (errors are already handled) */
 		return stream.pipe(output);
 	}
 
-	public static _fromRequest(cache: libCache.CacheHost, config: BurntClientConfig, host: string, protocol: string, request: libHttp.IncomingMessage, response: libHttp.ServerResponse): ClientRequest {
+	public _pushTranslation(map: Record<string, string | null>, identity: string): ClientContext | null {
+		let sanitized: Record<string, string | null> | null = null;
+		let match: [string, string | null] | null = null;
+
+		/* check if this is only an identity map, in which case nothing complex needs to be evaluated */
+		if (Object.keys(map).length == 1 && map['/'] == '/')
+			match = ['/', '/'];
+
+		/* create the merged reverse map and check if the map applies to the current translation */
+		else {
+			sanitized = {};
+			for (const [_from, _to] of Object.entries(map)) {
+				const from = libHelper.Sanitize(_from, false);
+				const to = (_to == null ? null : libHelper.Sanitize(_to, false));
+				sanitized[from] = to;
+
+				/* check if the mapping can be applied to the current path */
+				if (this.isSubPathOf(from) && (match == null || match[0].length < from.length))
+					match = [from, to];
+			}
+			if (match == null || match[1] == null)
+				return null;
+		}
+
+		const current = new ClientContext(this.logIdentity, this._path, this._translation.length,
+			this._throughput.busyCheck.length, this._headerPatcher.length, this._htmlPatcher.length);
+
+		/* setup the new path, all path translations, and the tagged logging identity */
+		this._path = libHelper.Rebase(match[0], match[1]!, this._path);
+		if (sanitized != null)
+			this._translation.push(sanitized);
+		if (identity != '')
+			this.logIdentity = `${this.logIdentity}.${identity}`;
+		return current;
+	}
+	public _restoreSnapshot(snapshot: ClientContext): void {
+		this.logIdentity = snapshot.logIdentity;
+		this._path = snapshot.path;
+		this._translation.splice(snapshot.translationCount);
+		this._throughput.busyCheck.splice(snapshot.busyCount);
+		this._headerPatcher.splice(snapshot.headerPatchCount);
+		this._htmlPatcher.splice(snapshot.htmlPatchCount);
+	}
+
+	/* instantiate a request client from a web request structure (must be followed by one finalizeConnection call) */
+	public static fromRequest(cache: libCache.CacheHost, protocol: string, request: libHttp.IncomingMessage, response: libHttp.ServerResponse, options?: { host?: string, burntConfig?: BurntClientConfig, config?: ClientConfig }): ClientRequest {
+		const config = (options?.burntConfig ?? BurnClientConfig(options?.config ?? {}));
+		const host = (options?.host ?? '');
 		return new ClientRequest(cache, config, host, protocol, request, response);
 	}
-	public static _fromUpgrade(cache: libCache.CacheHost, config: BurntClientConfig, host: string, protocol: string, request: libHttp.IncomingMessage, socket: libStream.Duplex, head: Buffer, wss: libWs.WebSocketServer): ClientRequest {
+
+	/* instantiate a request client from a web socket upgrade structure (instantiates a new no-server wss if none is provided; must be followed by one finalizeConnection call) */
+	public static fromUpgrade(cache: libCache.CacheHost, protocol: string, request: libHttp.IncomingMessage, socket: libStream.Duplex, head: Buffer, options?: { host?: string, burntConfig?: BurntClientConfig, config?: ClientConfig, wss?: libWs.WebSocketServer }): ClientRequest {
+		const config = (options?.burntConfig ?? BurnClientConfig(options?.config ?? {}));
+		const host = (options?.host ?? '');
+		const wss = options?.wss ?? new libWs.WebSocketServer({ noServer: true });
 		return new ClientRequest(cache, config, host, protocol, request, { socket, head, wss });
 	}
-	public async _finishConnection(): Promise<void> {
+
+	/* finalize the connection (must be called once at the end; must have been fully
+	*	processed and responded to; default responds with not-found for unhandled requests) */
+	public async finalizeConnection(): Promise<void> {
 		/* ensure the connection is default replied with not-found */
 		if (this._state.response == ResponseState.none)
 			this.respondNotFound();
@@ -949,51 +1019,15 @@ export class ClientRequest extends ClientBase {
 		this.log('Request processing completed');
 		this._state.completedResolve();
 	}
-	public _killConnection(): void {
-		this.markAsBroken('Closing connection', false);
-	}
-	public _pushTranslation(map: Record<string, string | null>, identity: string): ClientContext | null {
-		let sanitized: Record<string, string | null> | null = null;
-		let match: [string, string | null] | null = null;
 
-		/* check if this is only an identity map, in which case nothing complex needs to be evaluated */
-		if (Object.keys(map).length == 1 && map['/'] == '/')
-			match = ['/', '/'];
+	/* respond with an internal error and kill the connection */
+	public killConnection(reason: string): void {
+		const description = `Connection killed: ${reason}`;
+		const closing = (this._state.response == ResponseState.none || this._state.response == ResponseState.acknowledged);
 
-		/* create the merged reverse map and check if the map applies to the current translation */
-		else {
-			sanitized = {};
-			for (const [_from, _to] of Object.entries(map)) {
-				const from = libHelper.Sanitize(_from, false);
-				const to = (_to == null ? null : libHelper.Sanitize(_to, false));
-				sanitized[from] = to;
-
-				/* check if the mapping can be applied to the current path */
-				if (this.isSubPathOf(from) && (match == null || match[0].length < from.length))
-					match = [from, to];
-			}
-			if (match == null || match[1] == null)
-				return null;
-		}
-
-		const current = new ClientContext(this.logIdentity, this.relativePath, this.pathTranslation.length,
-			this._throughput.busyCheck.length, this._headerPatcher.length, this._htmlPatcher.length);
-
-		/* setup the new path, all path translations, and the tagged logging identity */
-		this.relativePath = libHelper.Rebase(match[0], match[1]!, this.relativePath);
-		if (sanitized != null)
-			this.pathTranslation.push(sanitized);
-		if (identity != '')
-			this.logIdentity = `${this.logIdentity}.${identity}`;
-		return current;
-	}
-	public _restoreSnapshot(snapshot: ClientContext): void {
-		this.logIdentity = snapshot.logIdentity;
-		this.relativePath = snapshot.path;
-		this.pathTranslation.splice(snapshot.translationCount);
-		this._throughput.busyCheck.splice(snapshot.busyCount);
-		this._headerPatcher.splice(snapshot.headerPatchCount);
-		this._htmlPatcher.splice(snapshot.htmlPatchCount);
+		if (closing)
+			this.respondInternalError(description, { headers: { 'Connection': 'close' } });
+		this.markAsBroken((closing ? '' : description), closing);
 	}
 
 	/* cache host to be used with this client */
@@ -1313,8 +1347,8 @@ export class ClientRequest extends ClientBase {
 		this._state.response = ResponseState.acknowledged;
 		const status = (options?.status ?? libBase.Status.Ok);
 		const headers = (options?.headers ?? {});
-		if (!('Cache-Control' in headers) && this._config.responseCacheControl != '')
-			headers['Cache-Control'] = this._config.responseCacheControl;
+		if (!('Cache-Control' in headers) && this.config.responseCacheControl != '')
+			headers['Cache-Control'] = this.config.responseCacheControl;
 
 		/* invoke all registered html patcher to let them modify the content (in reverse order to ensure
 		*	first added is last executed, and check if one of them produced an alternate response) */
@@ -1342,8 +1376,8 @@ export class ClientRequest extends ClientBase {
 	public respondData(options?: { status?: libBase.StatusType, media?: libBase.MediaType, contentSize?: number, dynamicEncode?: boolean, headers?: Record<string, string> }): libStream.Writable {
 		const status: libBase.StatusType = options?.status ?? libBase.Status.Ok;
 		const headers = (options?.headers ?? {});
-		if (!('Cache-Control' in headers) && this._config.responseCacheControl != '')
-			headers['Cache-Control'] = this._config.responseCacheControl;
+		if (!('Cache-Control' in headers) && this.config.responseCacheControl != '')
+			headers['Cache-Control'] = this.config.responseCacheControl;
 
 		this.log(`Responding with data and status [${status.msg}]`);
 		return this.sendClientData(status, options?.media ?? libBase.Media.Unknown, headers, options?.dynamicEncode ?? true, options?.contentSize ?? null);
@@ -1408,10 +1442,10 @@ export class ClientRequest extends ClientBase {
 		headers['Last-Modified'] = cached.lastModified();
 		headers['ETag'] = etag;
 		if (!('Cache-Control' in headers)) {
-			if (cached.isImmutable() && this._config.immutableCacheControl != '')
-				headers['Cache-Control'] = this._config.immutableCacheControl;
-			else if (this._config.fileCacheControl != '')
-				headers['Cache-Control'] = this._config.fileCacheControl;
+			if (cached.isImmutable() && this.config.immutableCacheControl != '')
+				headers['Cache-Control'] = this.config.immutableCacheControl;
+			else if (this.config.fileCacheControl != '')
+				headers['Cache-Control'] = this.config.fileCacheControl;
 		}
 
 		/* validate the conditions (e-tag more relevant than last-modified; invalid times are not
@@ -1526,8 +1560,7 @@ export class ClientRequest extends ClientBase {
 
 				/* destroy the source to clean up the receiving pipeline (will
 				*	not close the underlying request, just the pass-through reader) */
-				if (!source.destroyed)
-					source.destroy();
+				source.destroy();
 
 				/* check if the file was opened and remove it */
 				if (!opened)
@@ -1625,13 +1658,11 @@ export class ClientRequest extends ClientBase {
 					*	need to log errors, as this will trigger the broken state, which will be logged) */
 					if (native.socket.destroyed)
 						return resolve(null);
-					return resolve(ClientSocket._fromRequest(ws, this, this._config));
+					return resolve(ClientSocket._fromRequest(ws, this));
 				}
-				const settler = !settled;
 				settled = true;
 				this.markAsBroken('Broken connection upgraded', false);
-				if (settler)
-					resolve(null);
+				resolve(null);
 			});
 		});
 		this._state.upgrade = UpgradeState.upgraded;
@@ -1659,21 +1690,13 @@ export class ClientSocket extends ClientBase {
 		root: libLog.LogIdentity;
 		tags: { value: string }[];
 	};
-	private _config: BurntClientConfig;
 
-	/* invoked whenever data is available */
-	public ondata?: (data: libWs.RawData, isBinary: boolean) => void;
-
-	/* invoked once when the connection has been closed or failed (no more data will be received afterwards) */
-	public onclose?: () => void;
-
-	private constructor(ws: libWs.WebSocket, source: ClientRequest, config: BurntClientConfig) {
-		super(source, 'socket');
+	private constructor(ws: libWs.WebSocket, source: ClientRequest) {
+		super(source, 'socket', source.config);
 		this._ws = ws;
 		this._alive = { timer: null, isAlive: true };
 		this._closing = { promise: null, closed: null, defer: 0 };
 		this._logging = { root: libLog.Logger(this.logIdentity), tags: [] };
-		this._config = config;
 
 		this._ws.on('pong', () => {
 			this._logging.root.trace(`Alive check pong received`);
@@ -1719,24 +1742,19 @@ export class ClientSocket extends ClientBase {
 			this.updateLogging();
 		}
 	}
-
-	public static _fromRequest(ws: libWs.WebSocket, source: ClientRequest, config: BurntClientConfig) {
-		return new ClientSocket(ws, source, config);
-	}
-
 	private checkIsAlive(): void {
 		if (this._closing.promise != null)
 			return;
 
 		this._alive.timer = null;
-		if (this._config.webSocketTimeout == 0)
+		if (this.config.webSocketTimeout == 0)
 			return;
 
 		/* check if the connection is not alive anymore and should be killed */
-		if (!this._alive.isAlive || this._config.webSocketAliveTimeout == 0)
+		if (!this._alive.isAlive || this.config.webSocketAliveTimeout == 0)
 			return this.handleClosing('Closing dead websocket');
 		this._alive.isAlive = false;
-		this._alive.timer = setTimeout(() => this.checkIsAlive(), this._config.webSocketAliveTimeout);
+		this._alive.timer = setTimeout(() => this.checkIsAlive(), this.config.webSocketAliveTimeout);
 
 		/* try to ping the remote to check the liveliness */
 		try {
@@ -1753,7 +1771,7 @@ export class ClientSocket extends ClientBase {
 
 		if (this._alive.timer != null)
 			clearTimeout(this._alive.timer);
-		this._alive.timer = (this._config.webSocketTimeout == 0 ? null : setTimeout(() => this.checkIsAlive(), this._config.webSocketTimeout));
+		this._alive.timer = (this.config.webSocketTimeout == 0 ? null : setTimeout(() => this.checkIsAlive(), this.config.webSocketTimeout));
 	}
 	private handleClosing(terminate?: string): void {
 		/* register the initial closing to mark a closing being imminent */
@@ -1777,7 +1795,7 @@ export class ClientSocket extends ClientBase {
 						this._logging.root.error('Closing connection');
 						this._ws.terminate();
 					}
-				}, this._config.killGraceTimeout);
+				}, this.config.killGraceTimeout);
 			}
 		}
 
@@ -1806,6 +1824,16 @@ export class ClientSocket extends ClientBase {
 
 		this.logIdentity = identity;
 	}
+
+	public static _fromRequest(ws: libWs.WebSocket, source: ClientRequest) {
+		return new ClientSocket(ws, source);
+	}
+
+	/* invoked whenever data is available */
+	public ondata?: (data: libWs.RawData, isBinary: boolean) => void;
+
+	/* invoked once when the connection has been closed or failed (no more data will be received afterwards) */
+	public onclose?: () => void;
 
 	/* tag the logging with the given identity and return a callback to update the tag (empty string will
 	*	hide the tag entry; null will completely remove the tag; other values will update the tag) */

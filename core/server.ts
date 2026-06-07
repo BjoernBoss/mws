@@ -35,10 +35,10 @@ export class Server extends libLog.LogIdentity {
 
 		this.info(`Server created`);
 		this._config = BurnServerConfig(config);
+		this._clientConfig = libClient.BurnClientConfig(config);
 		this._stop = { listener: [], promise: null };
 		this._wss = new libWs.WebSocketServer({ noServer: true });
-		this._cacheHost = new libCache.CacheHost(libCache.BurnCacheConfig(config));
-		this._clientConfig = libClient.BurnClientConfig(config);
+		this._cacheHost = (config.cache ?? new libCache.CacheHost(libCache.BurnCacheConfig(config)));
 	}
 
 	private respondBadEndpoint(request: libHttp.IncomingMessage, client: libClient.ClientRequest): void {
@@ -86,14 +86,14 @@ export class Server extends libLog.LogIdentity {
 		if (client == null)
 			request.destroy();
 		else try {
-			await client._finishConnection();
+			await client.finalizeConnection();
 		} catch (err: any) {
-			client.respondInternalError(`Failed to complete connection: ${err.message}`);
+			client.killConnection(`Failed to complete connection: ${err.message}`);
 		}
 	}
 	private handleRequest(request: libHttp.IncomingMessage, response: libHttp.ServerResponse, check: CheckHost, handler: libHandler.AttachedModule, port: number, protocol: string): void {
 		this.handleWrapper(true, request, check, handler, port, (host: string): libClient.ClientRequest => {
-			return libClient.ClientRequest._fromRequest(this._cacheHost, this._clientConfig, host, protocol, request, response);
+			return libClient.ClientRequest.fromRequest(this._cacheHost, protocol, request, response, { host, burntConfig: this._clientConfig });
 		}).catch((err: any) => {
 			this.error(`Fatal error in request handler: ${err.message}`);
 			request.destroy(new Error('Unhandled exception'));
@@ -101,7 +101,7 @@ export class Server extends libLog.LogIdentity {
 	}
 	private handleUpgrade(request: libHttp.IncomingMessage, socket: libStream.Duplex, head: Buffer, check: CheckHost, handler: libHandler.AttachedModule, port: number, protocol: string): void {
 		this.handleWrapper(false, request, check, handler, port, (host: string): libClient.ClientRequest => {
-			return libClient.ClientRequest._fromUpgrade(this._cacheHost, this._clientConfig, host, protocol, request, socket, head, this._wss);
+			return libClient.ClientRequest.fromUpgrade(this._cacheHost, protocol, request, socket, head, { host, burntConfig: this._clientConfig, wss: this._wss });
 		}).catch((err: any) => {
 			this.error(`Fatal error in upgrade handler: ${err.message}`);
 			request.destroy(new Error('Unhandled exception'));
@@ -282,4 +282,7 @@ export function BurnServerConfig(config: ServerConfig): BurntServerConfig {
 	};
 }
 
-export type SystemConfig = ServerConfig & libClient.ClientConfig & libCache.CacheConfig;
+export type SystemConfig = ServerConfig & libClient.ClientConfig & libCache.CacheConfig & {
+	/* set the cache host to be used by the server and created clients [Default: new cache is created] */
+	cache?: libCache.CacheHost;
+};
