@@ -244,8 +244,8 @@ export interface ListenOrigin {
 }
 
 /* wrapper to create a simple server */
-export function createServer(): Server {
-	return new Server();
+export function createServer(config?: ServerConfig): Server {
+	return new Server(config);
 }
 
 /* create a listen-origin for a plain HTTP server */
