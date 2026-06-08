@@ -209,7 +209,7 @@ export type HtmlPatch = (page: libBuilder.HtmlPage, status: libBase.StatusType, 
 *
 *	Defaults [Accept-Ranges] normally to 'none' or to 'bytes' for files
 *	Defaults [Vary] to 'Accept-Encoding'.
-*	Defaults [Connection] to 'close' for upgrade requests.
+*	Defaults [Connection] to 'close' for upgrade requests and for some error responses.
 */
 export class ClientRequest extends ClientBase {
 	private _headerPatcher: HeaderPatch[];
@@ -236,12 +236,13 @@ export class ClientRequest extends ClientBase {
 	private _native: {
 		response: HttpResponseInterface;
 		writer: libStream.Writable;
-		socket?: { socket: libStream.Duplex, head: Buffer, wss: libWs.WebSocketServer };
+		socket?: { socket: libStream.Duplex, head: Buffer, wss?: libWs.WebSocketServer };
+		timeout?: number;
 	};
 	private _request: libHttp.IncomingMessage;
 	private _cache: libCache.CacheHost;
 
-	private constructor(cache: libCache.CacheHost, config: BurntClientConfig, protocol: string, request: libHttp.IncomingMessage, response: libHttp.ServerResponse | { socket: libStream.Duplex, head: Buffer, wss: libWs.WebSocketServer }) {
+	private constructor(cache: libCache.CacheHost, config: BurntClientConfig, protocol: string, request: libHttp.IncomingMessage, response: libHttp.ServerResponse | { socket: libStream.Duplex, head: Buffer, wss?: libWs.WebSocketServer }) {
 		super(new libUrl.URL(`${protocol}://${request.headers.host?.toLowerCase() ?? '_'}${request.url}`), 'request', config);
 		this._headerPatcher = [];
 		this._htmlPatcher = [];
@@ -313,6 +314,10 @@ export class ClientRequest extends ClientBase {
 		else
 			[responseWrapper, writerWrapper] = this.wrapSocketWriter(response.socket);
 		this._native = { response: responseWrapper, writer: writerWrapper, socket: (response instanceof libHttp.ServerResponse ? undefined : response) };
+
+		/* overwrite the original socket timeout as the client handler will take care of it (set it to twice the conceivable upper bound) */
+		this._native.timeout = this._request.socket.timeout;
+		this._request.socket.setTimeout((this.config.throughputWindow + this.config.throughputGrace) * 2);
 	}
 
 	private constructQuickResponse(status: libBase.StatusType, logReason: string | null, headers: Record<string, string> | undefined, content?: { media: libBase.MediaType, body?: Buffer } | null): void {
@@ -363,7 +368,7 @@ export class ClientRequest extends ClientBase {
 			this.trace(`Deferring throughput closing as connection is busy`);
 			this._throughput.start = Date.now() + this.config.throughputGrace;
 			this.updateThroughput(0);
-			this._request.socket.setTimeout(this._request.socket.timeout ?? 0);
+			this._request.socket.setTimeout((this.config.throughputWindow + this.config.throughputGrace) * 2);
 			return;
 		}
 
@@ -947,17 +952,16 @@ export class ClientRequest extends ClientBase {
 		snapshot.dropLogTag();
 	}
 
-	/* instantiate a request client from a web request structure (must be followed by one finalizeConnection call) */
+	/* instantiate a request client from a web request structure (must be followed by one finalizeConnection call under all circumstances) */
 	public static fromRequest(cache: libCache.CacheHost, protocol: string, request: libHttp.IncomingMessage, response: libHttp.ServerResponse, options?: { burntConfig?: BurntClientConfig, config?: ClientConfig }): ClientRequest {
 		const config = (options?.burntConfig ?? BurnClientConfig(options?.config ?? {}));
 		return new ClientRequest(cache, config, protocol, request, response);
 	}
 
-	/* instantiate a request client from a web socket upgrade structure (instantiates a new no-server wss if none is provided; must be followed by one finalizeConnection call) */
+	/* instantiate a request client from a web socket upgrade structure (instantiates a new no-server wss if none is provided; must be followed by one finalizeConnection call under all circumstances) */
 	public static fromUpgrade(cache: libCache.CacheHost, protocol: string, request: libHttp.IncomingMessage, socket: libStream.Duplex, head: Buffer, options?: { burntConfig?: BurntClientConfig, config?: ClientConfig, wss?: libWs.WebSocketServer }): ClientRequest {
 		const config = (options?.burntConfig ?? BurnClientConfig(options?.config ?? {}));
-		const wss = options?.wss ?? new libWs.WebSocketServer({ noServer: true });
-		return new ClientRequest(cache, config, protocol, request, { socket, head, wss });
+		return new ClientRequest(cache, config, protocol, request, { socket, head, wss: options?.wss });
 	}
 
 	/* finalize the connection (must be called once at the end; must have been fully
@@ -1008,6 +1012,10 @@ export class ClientRequest extends ClientBase {
 		/* check if the connection is broken and await its grace cleanup completion */
 		if (this._state.response == ResponseState.broken)
 			await this._state.breaking!;
+
+		/* recover the original socket timeout (not for sockets, as they take care of the timeout themselves) */
+		if (this._state.upgrade != UpgradeState.upgraded || this._state.response != ResponseState.completed)
+			this._request.socket.setTimeout(this._native.timeout ?? 0);
 
 		this.log('Request processing completed');
 		this._state.completedResolve();
@@ -1643,7 +1651,8 @@ export class ClientRequest extends ClientBase {
 			});
 
 			/* start the upgrade process (web-socket upgrade handler will automatically send error messages) */
-			native.wss.handleUpgrade(this._request, native.socket, native.head, (ws, _) => {
+			const wss = (native.wss ?? new libWs.WebSocketServer({ noServer: true, clientTracking: false }));
+			wss.handleUpgrade(this._request, native.socket, native.head, (ws, _) => {
 				if (!settled && this._state.response == ResponseState.headerSent) {
 					settled = true, this._state.response = ResponseState.completed;
 
@@ -1651,6 +1660,9 @@ export class ClientRequest extends ClientBase {
 					*	need to log errors, as this will trigger the broken state, which will be logged) */
 					if (native.socket.destroyed)
 						return resolve(null);
+
+					/* clear the socket timeout (should already have been done in the first place by the web-socket-server) */
+					this._request.socket.setTimeout(0);
 					return resolve(ClientSocket._fromRequest(ws, this));
 				}
 				settled = true;
@@ -1667,6 +1679,7 @@ export class ClientRequest extends ClientBase {
 *	WebSocket with integrated alive checks.
 *	Structured WebSocket, which takes care of error handling.
 *	close() is guaranteed to be called exactly once and no data or others will follow.
+*	Takes ownership of the socket.
 */
 export class ClientSocket extends ClientBase {
 	private _ws: libWs.WebSocket;
@@ -1720,7 +1733,7 @@ export class ClientSocket extends ClientBase {
 			this.handleClosing(`WebSocket error: ${err.message}`);
 		});
 
-		/* start the first alive check */
+		/* start the first alive check (no need to consider the socket timeout, as it will have been cleared already) */
 		this.selfIsAlive();
 
 		/* perserve the log tags of the base */

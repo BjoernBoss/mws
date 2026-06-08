@@ -679,15 +679,15 @@ export interface EncodedCache {
 export class CacheHost extends libLog.Logger {
 	private _cacheManager: CacheManager;
 	private _immutableManager: ImmutableManager;
-	private _alwaysValidate: boolean;
+	private _config: BurntCacheConfig;
 
-	public constructor(config: BurntCacheConfig) {
+	public constructor(config: CacheConfig) {
 		super('cache');
 
 		this.info('Cache created');
-		this._alwaysValidate = config.alwaysValidate;
-		this._cacheManager = new CacheManager(this, config.cacheSize, config.fileSizeLimit);
-		this._immutableManager = new ImmutableManager(config.immutableStatePath, this, this._alwaysValidate, config.immutableTagging);
+		this._config = BurnCacheConfig(config);
+		this._cacheManager = new CacheManager(this, this._config.cacheSize, this._config.fileSizeLimit);
+		this._immutableManager = new ImmutableManager(this._config.immutableStatePath, this, this._config.alwaysValidate, this._config.immutableTagging);
 	}
 	private resolveCache(path: string, checkFreshness: boolean, checkImmutable: boolean): Cached | string | null {
 		/* check if the entry is immutable and fetch its actual path or
@@ -701,7 +701,7 @@ export class CacheHost extends libLog.Logger {
 		const isImmutable = (immutable != null);
 
 		/* check if does not need to be checked and the entry is already in the cache, in which case the file doesn't even need to be checked */
-		let entry = ((checkFreshness || this._alwaysValidate) ? null : this._cacheManager.find(path, null));
+		let entry = ((checkFreshness || this._config.alwaysValidate) ? null : this._cacheManager.find(path, null));
 		if (entry != null && (immutable == null || (immutable.size == entry.data.byteLength && immutable.mtime == entry.mtime)))
 			return new AlreadyCached(this._cacheManager, path, entry, isImmutable);
 
@@ -717,6 +717,10 @@ export class CacheHost extends libLog.Logger {
 		if (entry != null)
 			return new AlreadyCached(this._cacheManager, path, entry, isImmutable);
 		return new NotCached(this._cacheManager, path, fileSize, mtime, Date.now(), isImmutable);
+	}
+
+	public get config(): BurntCacheConfig {
+		return this._config;
 	}
 
 	/* [throws] if [checkFreshness] is true, re-validate the file stats on disk before serving from cache (defaults
