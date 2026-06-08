@@ -2,6 +2,7 @@
 /* Copyright (c) 2025-2026 Bjoern Boss Henrichsen */
 import * as libClient from "./client.js";
 import * as libLog from "./log.js";
+import * as libBase from "./base.js";
 
 /*
 *	Translation to be applied for nested children and reversed for any paths produced by the children.
@@ -420,7 +421,7 @@ export type HandleWrap = (this: ModuleHandler, client: libClient.ClientRequest, 
 
 /*
 *	Simple module handler implementation, which dispatches requests to different children based on the request path (longest match).
-*	Stops itself once all children have been stopped.
+*	Stops itself once all children have been unlinked.
 *	Forwards parameter to dispatched child.
 */
 export function Dispatch(map: Record<string, ModuleHandler>, options?: { name?: string }): DispatchModule {
@@ -472,7 +473,7 @@ export class DispatchModule extends ModuleHandler {
 
 /*
 *	Simple module handler implementation, which dispatches requests to different children based on the request hostname (longest match).
-*	Stops itself once all children have been stopped.
+*	Stops itself once all children have been unlinked.
 *	Forwards parameter to dispatched child.
 */
 export function Host(map: Record<string, ModuleHandler>, options?: { name?: string }): HostModule {
@@ -573,7 +574,7 @@ export class LambdaModule extends ModuleHandler {
 
 /*
 *	Simple module interface implementation, which forwards unhandled requests to a lambda.
-*	Stops itself once all children have been stopped. Forwards parameter to wrapper and handler.
+*	Stops itself once thie child has been unlinked. Forwards parameter to wrapper and handler.
 */
 export function Unhandled(handler: ModuleHandler, options?: { handle?: HandleLambda, name?: string }): UnhandledModule {
 	return new UnhandledModule(handler, options);
@@ -598,7 +599,7 @@ export class UnhandledModule extends ModuleHandler {
 
 /*
 *	Simple module interface implementation, which forwards any requests to a lambda.
-*	Stops itself once all children have been stopped. Forwards parameter to wrapper or handler.
+*	Stops itself once thie child has been unlinked. Forwards parameter to wrapper or handler.
 */
 export function Wrap(handler: ModuleHandler, options?: { handle?: HandleWrap, name?: string }): WrapModule {
 	return new WrapModule(handler, options);
@@ -624,7 +625,7 @@ export class WrapModule extends ModuleHandler {
 
 /*
 *	Simple module interface implementation, which forwards any requests to a lambda.
-*	Stops itself once all children have been stopped. Forwards parameter to wrapper or handler.
+*	Stops itself once thie child has been unlinked. Forwards parameter to handler.
 */
 export function Bind(handler: ModuleHandler, options?: { params?: object, translation?: PathTranslation, name?: string }): BindModule {
 	return new BindModule(handler, options);
@@ -645,5 +646,60 @@ export class BindModule extends ModuleHandler {
 
 	protected override async handleRequest(client: libClient.ClientRequest, params?: object): Promise<void> {
 		await this.handler.handle(client, this.params ?? params, this.translation);
+	}
+}
+
+/*
+*	Simple module interface implementation, which validates the connected host and port before forwarding the client.
+*	Stops itself once thie child has been unlinked. Forwards parameter to handler.
+*/
+export function Check(handler: ModuleHandler, host: string | string[], options?: { name?: string, port?: number }): CheckModule {
+	return new CheckModule(handler, host, options);
+}
+export class CheckModule extends ModuleHandler {
+	private handler: AttachedModule;
+	private port?: number;
+	private hosts: string[];
+
+	constructor(handler: ModuleHandler, host: string | string[], options?: { name?: string, port?: number }) {
+		super(options?.name ?? 'check');
+
+		this.handler = this.linkChild(handler, () => this.stop());
+		this.hosts = (typeof host == 'string' ? [host] : host);
+		this.port = options?.port;
+	}
+	private respondBadEndpoint(client: libClient.ClientRequest): void {
+		client.respond(`No resource found at [${client.url.host}]:[${client.url.pathname}]`, {
+			status: libBase.Status.NotFound,
+			media: libBase.Media.Text,
+			headers: { 'Connection': 'close' }
+		});
+		client.killConnection('Invalid endpoint description');
+	}
+
+	protected override async handleRequest(client: libClient.ClientRequest, params?: object): Promise<void> {
+		let matches = false;
+
+		/* validate that the host matches */
+		for (const host of this.hosts) {
+			if (host == client.url.hostname) {
+				matches = true;
+				break;
+			}
+		}
+		if (!matches) {
+			client.warning(`Hostname [${client.url.hostname}] not allowed for this endpoint`);
+			return this.respondBadEndpoint(client);
+		}
+
+		/* validate that the port matches */
+		if (this.port != null && client.url.port) {
+			if (parseInt(client.url.port, 10) != this.port) {
+				client.warning(`Host [${client.url.port}] port does not match [${this.port}]`);
+				return this.respondBadEndpoint(client);
+			}
+		}
+
+		await this.handler.handle(client, params);
 	}
 }

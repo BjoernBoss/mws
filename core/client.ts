@@ -56,7 +56,7 @@ class ClientBase extends libLog.Logger {
 		this._config = config;
 	}
 
-	/* raw request origin (no host will result in '_') */
+	/* raw request origin (no host will result in '_'; host will be lower-case) */
 	readonly url: libUrl.URL;
 
 	/* path relative to current module */
@@ -241,8 +241,8 @@ export class ClientRequest extends ClientBase {
 	private _request: libHttp.IncomingMessage;
 	private _cache: libCache.CacheHost;
 
-	private constructor(cache: libCache.CacheHost, config: BurntClientConfig, host: string, protocol: string, request: libHttp.IncomingMessage, response: libHttp.ServerResponse | { socket: libStream.Duplex, head: Buffer, wss: libWs.WebSocketServer }) {
-		super(new libUrl.URL(`${protocol}//${host == '' ? '_' : host}${request.url}`), 'request', config);
+	private constructor(cache: libCache.CacheHost, config: BurntClientConfig, protocol: string, request: libHttp.IncomingMessage, response: libHttp.ServerResponse | { socket: libStream.Duplex, head: Buffer, wss: libWs.WebSocketServer }) {
+		super(new libUrl.URL(`${protocol}://${request.headers.host?.toLowerCase() ?? '_'}${request.url}`), 'request', config);
 		this._headerPatcher = [];
 		this._htmlPatcher = [];
 
@@ -948,18 +948,16 @@ export class ClientRequest extends ClientBase {
 	}
 
 	/* instantiate a request client from a web request structure (must be followed by one finalizeConnection call) */
-	public static fromRequest(cache: libCache.CacheHost, protocol: string, request: libHttp.IncomingMessage, response: libHttp.ServerResponse, options?: { host?: string, burntConfig?: BurntClientConfig, config?: ClientConfig }): ClientRequest {
+	public static fromRequest(cache: libCache.CacheHost, protocol: string, request: libHttp.IncomingMessage, response: libHttp.ServerResponse, options?: { burntConfig?: BurntClientConfig, config?: ClientConfig }): ClientRequest {
 		const config = (options?.burntConfig ?? BurnClientConfig(options?.config ?? {}));
-		const host = (options?.host ?? '');
-		return new ClientRequest(cache, config, host, protocol, request, response);
+		return new ClientRequest(cache, config, protocol, request, response);
 	}
 
 	/* instantiate a request client from a web socket upgrade structure (instantiates a new no-server wss if none is provided; must be followed by one finalizeConnection call) */
-	public static fromUpgrade(cache: libCache.CacheHost, protocol: string, request: libHttp.IncomingMessage, socket: libStream.Duplex, head: Buffer, options?: { host?: string, burntConfig?: BurntClientConfig, config?: ClientConfig, wss?: libWs.WebSocketServer }): ClientRequest {
+	public static fromUpgrade(cache: libCache.CacheHost, protocol: string, request: libHttp.IncomingMessage, socket: libStream.Duplex, head: Buffer, options?: { burntConfig?: BurntClientConfig, config?: ClientConfig, wss?: libWs.WebSocketServer }): ClientRequest {
 		const config = (options?.burntConfig ?? BurnClientConfig(options?.config ?? {}));
-		const host = (options?.host ?? '');
 		const wss = options?.wss ?? new libWs.WebSocketServer({ noServer: true });
-		return new ClientRequest(cache, config, host, protocol, request, { socket, head, wss });
+		return new ClientRequest(cache, config, protocol, request, { socket, head, wss });
 	}
 
 	/* finalize the connection (must be called once at the end; must have been fully
