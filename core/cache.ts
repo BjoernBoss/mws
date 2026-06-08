@@ -681,11 +681,11 @@ export class CacheHost extends libLog.Logger {
 	private _immutableManager: ImmutableManager;
 	private _config: BurntCacheConfig;
 
-	public constructor(config: CacheConfig) {
+	public constructor(config?: CacheConfig | BurntCacheConfig) {
 		super('cache');
 
 		this.info('Cache created');
-		this._config = BurnCacheConfig(config);
+		this._config = BurntCacheConfig.from(config);
 		this._cacheManager = new CacheManager(this, this._config.cacheSize, this._config.fileSizeLimit);
 		this._immutableManager = new ImmutableManager(this._config.immutableStatePath, this, this._config.alwaysValidate, this._config.immutableTagging);
 	}
@@ -719,6 +719,7 @@ export class CacheHost extends libLog.Logger {
 		return new NotCached(this._cacheManager, path, fileSize, mtime, Date.now(), isImmutable);
 	}
 
+	/* configuration used by this cache host */
 	public get config(): BurntCacheConfig {
 		return this._config;
 	}
@@ -752,6 +753,11 @@ export class CacheHost extends libLog.Logger {
 	}
 }
 
+/* simple wrapper function to create a cache */
+export function makeCache(config?: CacheConfig | BurntCacheConfig): CacheHost {
+	return new CacheHost(config);
+}
+
 export interface CacheConfig {
 	/* immutable state path is used to ensure the immutable state uses persistent ids across
 	*	restarts (will be read upon loading; if not set, ids will be lost after a server restart) [Default: ''] */
@@ -769,19 +775,23 @@ export interface CacheConfig {
 	/* tag served content with immutable ids to encode freshness into the path [Default: true] */
 	immutableTagging?: boolean;
 }
-export interface BurntCacheConfig {
-	readonly immutableStatePath: string;
-	readonly cacheSize: number;
-	readonly fileSizeLimit: number;
-	readonly alwaysValidate: boolean;
-	readonly immutableTagging: boolean;
-}
-export function BurnCacheConfig(config: CacheConfig): BurntCacheConfig {
-	return {
-		immutableStatePath: config.immutableStatePath ?? '',
-		cacheSize: config.cacheSize ?? 50_000_000,
-		fileSizeLimit: config.fileSizeLimit ?? 10_000_000,
-		alwaysValidate: config.alwaysValidate ?? false,
-		immutableTagging: config.immutableTagging ?? true
-	};
+
+export class BurntCacheConfig {
+	public readonly immutableStatePath: string;
+	public readonly cacheSize: number;
+	public readonly fileSizeLimit: number;
+	public readonly alwaysValidate: boolean;
+	public readonly immutableTagging: boolean;
+
+	public constructor(config?: CacheConfig) {
+		this.immutableStatePath = config?.immutableStatePath ?? '';
+		this.cacheSize = config?.cacheSize ?? 50_000_000;
+		this.fileSizeLimit = config?.fileSizeLimit ?? 10_000_000;
+		this.alwaysValidate = config?.alwaysValidate ?? false;
+		this.immutableTagging = config?.immutableTagging ?? true;
+	}
+
+	public static from(config?: CacheConfig | BurntCacheConfig): BurntCacheConfig {
+		return (config instanceof BurntCacheConfig ? config : new BurntCacheConfig(config));
+	}
 }

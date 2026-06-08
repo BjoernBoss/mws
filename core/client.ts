@@ -953,15 +953,13 @@ export class ClientRequest extends ClientBase {
 	}
 
 	/* instantiate a request client from a web request structure (must be followed by one finalizeConnection call under all circumstances) */
-	public static fromRequest(cache: libCache.CacheHost, protocol: string, request: libHttp.IncomingMessage, response: libHttp.ServerResponse, options?: { burntConfig?: BurntClientConfig, config?: ClientConfig }): ClientRequest {
-		const config = (options?.burntConfig ?? BurnClientConfig(options?.config ?? {}));
-		return new ClientRequest(cache, config, protocol, request, response);
+	public static fromRequest(cache: libCache.CacheHost, protocol: string, request: libHttp.IncomingMessage, response: libHttp.ServerResponse, options?: { config?: BurntClientConfig | ClientConfig }): ClientRequest {
+		return new ClientRequest(cache, BurntClientConfig.from(options?.config), protocol, request, response);
 	}
 
 	/* instantiate a request client from a web socket upgrade structure (instantiates a new no-server wss if none is provided; must be followed by one finalizeConnection call under all circumstances) */
-	public static fromUpgrade(cache: libCache.CacheHost, protocol: string, request: libHttp.IncomingMessage, socket: libStream.Duplex, head: Buffer, options?: { burntConfig?: BurntClientConfig, config?: ClientConfig, wss?: libWs.WebSocketServer }): ClientRequest {
-		const config = (options?.burntConfig ?? BurnClientConfig(options?.config ?? {}));
-		return new ClientRequest(cache, config, protocol, request, { socket, head, wss: options?.wss });
+	public static fromUpgrade(cache: libCache.CacheHost, protocol: string, request: libHttp.IncomingMessage, socket: libStream.Duplex, head: Buffer, options?: { config?: BurntClientConfig | ClientConfig, wss?: libWs.WebSocketServer }): ClientRequest {
+		return new ClientRequest(cache, BurntClientConfig.from(options?.config), protocol, request, { socket, head, wss: options?.wss });
 	}
 
 	/* finalize the connection (must be called once at the end; must have been fully
@@ -1879,31 +1877,35 @@ export interface ClientConfig {
 	/* length of sliding time window for which the throughput must be above the threshold [in milliseconds; Default: 30_000] */
 	throughputWindow?: number;
 }
-export interface BurntClientConfig {
-	readonly serverName: string;
-	readonly commonHeaders: Record<string, string>;
-	readonly webSocketTimeout: number;
-	readonly webSocketAliveTimeout: number;
-	readonly killGraceTimeout: number;
-	readonly fileCacheControl: string;
-	readonly immutableCacheControl: string;
-	readonly responseCacheControl: string;
-	readonly throughputGrace: number;
-	readonly throughputThreshold: number;
-	readonly throughputWindow: number;
-}
-export function BurnClientConfig(config: ClientConfig): BurntClientConfig {
-	return {
-		serverName: config.serverName ?? 'Modular Web Server',
-		commonHeaders: config.commonHeaders ?? { 'X-Content-Type-Options': 'nosniff' },
-		webSocketTimeout: config.webSocketTimeout ?? 180_000,
-		webSocketAliveTimeout: config.webSocketAliveTimeout ?? 2_000,
-		killGraceTimeout: config.killGraceTimeout ?? 1_000,
-		fileCacheControl: config.fileCacheControl ?? 'public, max-age=600, must-revalidate',
-		immutableCacheControl: config.immutableCacheControl ?? 'public, max-age=2592000, immutable',
-		responseCacheControl: config.responseCacheControl ?? 'private, no-cache',
-		throughputGrace: config.throughputGrace ?? 10_000,
-		throughputThreshold: config.throughputThreshold ?? 1_000,
-		throughputWindow: config.throughputWindow ?? 30_000
-	};
+
+export class BurntClientConfig {
+	public readonly serverName: string;
+	public readonly commonHeaders: Record<string, string>;
+	public readonly webSocketTimeout: number;
+	public readonly webSocketAliveTimeout: number;
+	public readonly killGraceTimeout: number;
+	public readonly fileCacheControl: string;
+	public readonly immutableCacheControl: string;
+	public readonly responseCacheControl: string;
+	public readonly throughputGrace: number;
+	public readonly throughputThreshold: number;
+	public readonly throughputWindow: number;
+
+	public constructor(config?: ClientConfig) {
+		this.serverName = config?.serverName ?? 'Modular Web Server';
+		this.commonHeaders = config?.commonHeaders ?? { 'X-Content-Type-Options': 'nosniff' };
+		this.webSocketTimeout = config?.webSocketTimeout ?? 180_000;
+		this.webSocketAliveTimeout = config?.webSocketAliveTimeout ?? 2_000;
+		this.killGraceTimeout = config?.killGraceTimeout ?? 1_000;
+		this.fileCacheControl = config?.fileCacheControl ?? 'public, max-age=600, must-revalidate';
+		this.immutableCacheControl = config?.immutableCacheControl ?? 'public, max-age=2592000, immutable';
+		this.responseCacheControl = config?.responseCacheControl ?? 'private, no-cache';
+		this.throughputGrace = config?.throughputGrace ?? 10_000;
+		this.throughputThreshold = config?.throughputThreshold ?? 1_000;
+		this.throughputWindow = config?.throughputWindow ?? 30_000;
+	}
+
+	public static from(config?: ClientConfig | BurntClientConfig): BurntClientConfig {
+		return (config instanceof BurntClientConfig ? config : new BurntClientConfig(config));
+	}
 }
