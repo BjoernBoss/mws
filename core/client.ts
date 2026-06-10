@@ -5,6 +5,7 @@ import * as libBuilder from "./builder.js";
 import * as libCache from "./cache.js";
 import * as libHelper from "./helper.js";
 import * as libBase from "./base.js";
+import * as libEvents from "events";
 import * as libFs from "fs";
 import * as libStream from "stream";
 import * as libUrl from "url";
@@ -295,11 +296,11 @@ export class ClientRequest extends ClientBase {
 
 		/* ensure to remove the events again once the processing has completed */
 		this._state.completedPromise.then(() => {
-			request.removeListener('error', lostHandler);
-			request.removeListener('aborted', closedHandler);
-			request.socket.removeListener('timeout', timeoutHandler);
-			request.socket.removeListener('error', lostHandler);
-			request.socket.removeListener('close', closedHandler);
+			request.off('error', lostHandler);
+			request.off('aborted', closedHandler);
+			request.socket.off('timeout', timeoutHandler);
+			request.socket.off('error', lostHandler);
+			request.socket.off('close', closedHandler);
 		});
 
 		/* configure the native interface writer, depending on the actual source parameters */
@@ -1015,7 +1016,6 @@ export class ClientRequest extends ClientBase {
 		if (this._state.upgrade != UpgradeState.upgraded || this._state.response != ResponseState.completed)
 			this._request.socket.setTimeout(this._native.timeout ?? 0);
 
-		this.log('Request processing completed');
 		this._state.completedResolve();
 	}
 
@@ -1050,7 +1050,7 @@ export class ClientRequest extends ClientBase {
 	}
 
 	/* resolves whenever the request has been fully processed */
-	public get completion(): Promise<void> {
+	public get completed(): Promise<void> {
 		return this._state.completedPromise;
 	}
 
@@ -1690,28 +1690,27 @@ export class ClientSocket extends ClientBase {
 		closed: (() => void) | null, defer: number;
 	};
 	private _logger: libLog.Logger;
+	private _emitter: libEvents.EventEmitter;
 
 	private constructor(ws: libWs.WebSocket, source: ClientRequest) {
 		super(source, 'socket', source.config);
 		this._ws = ws;
 		this._alive = { timer: null, isAlive: true };
 		this._closing = { promise: null, closed: null, defer: 0 };
-		this._logger = libLog.MakeLogger(this.logIdentity);
+		this._emitter = new libEvents.EventEmitter();
 
 		this._ws.on('pong', () => {
 			this._logger.trace(`Alive check pong received`);
 			this.selfIsAlive();
 		});
-		this._ws.on('message', (data, isBinary) => {
+		this._ws.on('message', (data) => {
 			this.selfIsAlive();
-			if (this._closing.promise != null || this.ondata == null)
+			if (this._closing.promise != null || this._emitter.listenerCount('data') == 0)
 				return;
 
 			++this._closing.defer;
-			try { this.ondata(data, isBinary); }
-			catch (err: any) {
-				this.handleClosing(`Unhandled exception in message handler: ${err.message}`);
-			}
+			const buffer: Buffer = (Buffer.isBuffer(data) ? data : (Array.isArray(data) ? Buffer.concat(data) : Buffer.from(data)));
+			this.emitEventSync('data', buffer);
 			--this._closing.defer;
 
 			if (this._closing.promise != null)
@@ -1737,6 +1736,9 @@ export class ClientSocket extends ClientBase {
 		/* perserve the log tags of the base */
 		source.log(`WebSocket accepted: [${this.logIdentity}]`);
 		this.tagLog(source.logExtension);
+
+		/* preserve the root logger to be used for internal socket logs */
+		this._logger = libLog.MakeLogger(this.logIdentity);
 	}
 	private checkIsAlive(): void {
 		if (this._closing.promise != null)
@@ -1800,12 +1802,7 @@ export class ClientSocket extends ClientBase {
 		const closed = this._closing.closed;
 		this._closing.closed = null;
 
-		if (this.onclose != null) {
-			try { this.onclose(); }
-			catch (err: any) {
-				this._logger.error(`Unhandled exception in WebSocket close handler: ${err.message}`);
-			}
-		}
+		this.emitEventSync('close');
 		this._logger.trace('Socket connection closed');
 
 		closed();
@@ -1814,12 +1811,6 @@ export class ClientSocket extends ClientBase {
 	public static _fromRequest(ws: libWs.WebSocket, source: ClientRequest) {
 		return new ClientSocket(ws, source);
 	}
-
-	/* invoked whenever data is available */
-	public ondata?: (data: libWs.RawData, isBinary: boolean) => void;
-
-	/* invoked once when the connection has been closed or failed (no more data will be received afterwards) */
-	public onclose?: () => void;
 
 	/* send data to the remote (ignored if connection is being closed) */
 	public send(data: string | Buffer): void {
@@ -1841,7 +1832,27 @@ export class ClientSocket extends ClientBase {
 		}
 		return this._closing.promise!;
 	}
+
+	/* -------- event handler interfaces -------- */
+	public on<K extends keyof ClientSocketEvents>(event: K, listener: ClientSocketEvents[K]): ClientSocket {
+		this._emitter.on(event, listener); return this;
+	}
+	public off<K extends keyof ClientSocketEvents>(event: K, listener: ClientSocketEvents[K]): ClientSocket {
+		this._emitter.off(event, listener); return this;
+	}
+	public once<K extends keyof ClientSocketEvents>(event: K, listener: ClientSocketEvents[K]): ClientSocket {
+		this._emitter.once(event, listener); return this;
+	}
+	private emitEventSync<K extends keyof ClientSocketEvents>(event: K, ...args: Parameters<ClientSocketEvents[K]>): void {
+		try {
+			this._emitter.emit(event, ...args);
+		}
+		catch (err: any) {
+			this._logger.error(`Unhandled exception in ${event} listener: ${err.message}`);
+		}
+	}
 }
+type ClientSocketEvents = { 'data': (data: Buffer) => void, 'close': () => void };
 
 export interface ClientConfig {
 	/* default server name to be used in the http:server header [empty value prevents server header; Default: 'Modular Web Server'] */

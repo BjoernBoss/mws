@@ -413,11 +413,11 @@ export abstract class ModuleHandler extends libLog.Logger {
 	}
 }
 
-export type AttachLambda = (this: ModuleHandler) => Promise<void>;
-export type DetachLambda = (this: ModuleHandler) => Promise<void>;
-export type HandleLambda = (this: ModuleHandler, client: libClient.ClientRequest, params?: object) => Promise<void>;
-export type StopLambda = (this: ModuleHandler) => Promise<void>;
-export type HandleWrap = (this: ModuleHandler, client: libClient.ClientRequest, handle: (params?: object, translate?: PathTranslation) => Promise<boolean>, params?: object) => Promise<void>;
+export type CallbackAttach = (this: ModuleHandler) => Promise<void>;
+export type CallbackDetach = (this: ModuleHandler) => Promise<void>;
+export type CallbackHandle = (this: ModuleHandler, client: libClient.ClientRequest, params?: object) => Promise<void>;
+export type CallbackStop = (this: ModuleHandler) => Promise<void>;
+export type WrapHandle = (this: ModuleHandler, client: libClient.ClientRequest, handle: (params?: object, translate?: PathTranslation) => Promise<boolean>, params?: object) => Promise<void>;
 
 /*
 *	Simple module handler implementation, which dispatches requests to different children based on the request path (longest match).
@@ -537,16 +537,16 @@ export class HostModule extends ModuleHandler {
 *	Simple module handler implementation, which allows requests to be handled by lambdas.
 *	Forwards parameter to lambda functions.
 */
-export function Lambda(options?: { attach?: AttachLambda, detach?: DetachLambda, handle?: HandleLambda, stop?: StopLambda, name?: string }): LambdaModule {
+export function Lambda(options?: { attach?: CallbackAttach, detach?: CallbackDetach, handle?: CallbackHandle, stop?: CallbackStop, name?: string }): LambdaModule {
 	return new LambdaModule(options);
 }
 export class LambdaModule extends ModuleHandler {
-	private attachLambda?: AttachLambda;
-	private detachLambda?: DetachLambda;
-	private handleLambda?: HandleLambda;
-	private stopLambda?: StopLambda;
+	private attachLambda?: CallbackAttach;
+	private detachLambda?: CallbackDetach;
+	private handleLambda?: CallbackHandle;
+	private stopLambda?: CallbackStop;
 
-	constructor(options?: { attach?: AttachLambda, detach?: DetachLambda, handle?: HandleLambda, stop?: StopLambda, name?: string }) {
+	constructor(options?: { attach?: CallbackAttach, detach?: CallbackDetach, handle?: CallbackHandle, stop?: CallbackStop, name?: string }) {
 		super(options?.name ?? 'lambda');
 		this.attachLambda = options?.attach;
 		this.detachLambda = options?.detach;
@@ -576,14 +576,14 @@ export class LambdaModule extends ModuleHandler {
 *	Simple module interface implementation, which forwards unhandled requests to a lambda.
 *	Stops itself once thie child has been unlinked. Forwards parameter to wrapper and handler.
 */
-export function Unhandled(handler: ModuleHandler, options?: { handle?: HandleLambda, name?: string }): UnhandledModule {
+export function Unhandled(handler: ModuleHandler, options?: { handle?: CallbackHandle, name?: string }): UnhandledModule {
 	return new UnhandledModule(handler, options);
 }
 export class UnhandledModule extends ModuleHandler {
 	private handler: AttachedModule;
-	private handleLambda?: HandleLambda;
+	private handleLambda?: CallbackHandle;
 
-	constructor(handler: ModuleHandler, options?: { handle?: HandleLambda, name?: string }) {
+	constructor(handler: ModuleHandler, options?: { handle?: CallbackHandle, name?: string }) {
 		super(options?.name ?? 'unhandler');
 
 		this.handler = this.linkChild(handler, () => this.stop());
@@ -601,14 +601,14 @@ export class UnhandledModule extends ModuleHandler {
 *	Simple module interface implementation, which forwards any requests to a lambda.
 *	Stops itself once thie child has been unlinked. Forwards parameter to wrapper or handler.
 */
-export function Wrap(handler: ModuleHandler, options?: { handle?: HandleWrap, name?: string }): WrapModule {
+export function Wrap(handler: ModuleHandler, options?: { handle?: WrapHandle, name?: string }): WrapModule {
 	return new WrapModule(handler, options);
 }
 export class WrapModule extends ModuleHandler {
 	private handler: AttachedModule;
-	private handleWrap?: HandleWrap;
+	private handleWrap?: WrapHandle;
 
-	constructor(handler: ModuleHandler, options?: { handle?: HandleWrap, name?: string }) {
+	constructor(handler: ModuleHandler, options?: { handle?: WrapHandle, name?: string }) {
 		super(options?.name ?? 'wrap');
 
 		this.handler = this.linkChild(handler, () => this.stop());
