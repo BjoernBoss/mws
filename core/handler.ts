@@ -424,7 +424,7 @@ export type WrapHandle = (this: ModuleHandler, client: libClient.ClientRequest, 
 *	Stops itself once all children have been unlinked.
 *	Forwards parameter to dispatched child.
 */
-export function Dispatch(map: Record<string, ModuleHandler>, options?: { name?: string }): DispatchModule {
+export function dispatch(map: Record<string, ModuleHandler>, options?: { name?: string }): DispatchModule {
 	return new DispatchModule(map, options);
 }
 export class DispatchModule extends ModuleHandler {
@@ -476,7 +476,7 @@ export class DispatchModule extends ModuleHandler {
 *	Stops itself once all children have been unlinked.
 *	Forwards parameter to dispatched child.
 */
-export function Host(map: Record<string, ModuleHandler>, options?: { name?: string }): HostModule {
+export function host(map: Record<string, ModuleHandler>, options?: { name?: string }): HostModule {
 	return new HostModule(map, options);
 }
 export class HostModule extends ModuleHandler {
@@ -537,7 +537,7 @@ export class HostModule extends ModuleHandler {
 *	Simple module handler implementation, which allows requests to be handled by lambdas.
 *	Forwards parameter to lambda functions.
 */
-export function Lambda(options?: { attach?: CallbackAttach, detach?: CallbackDetach, handle?: CallbackHandle, stop?: CallbackStop, name?: string }): LambdaModule {
+export function lambda(options?: { attach?: CallbackAttach, detach?: CallbackDetach, handle?: CallbackHandle, stop?: CallbackStop, name?: string }): LambdaModule {
 	return new LambdaModule(options);
 }
 export class LambdaModule extends ModuleHandler {
@@ -576,7 +576,7 @@ export class LambdaModule extends ModuleHandler {
 *	Simple module interface implementation, which forwards unhandled requests to a lambda.
 *	Stops itself once thie child has been unlinked. Forwards parameter to wrapper and handler.
 */
-export function Unhandled(handler: ModuleHandler, options?: { handle?: CallbackHandle, name?: string }): UnhandledModule {
+export function unhandled(handler: ModuleHandler, options?: { handle?: CallbackHandle, name?: string }): UnhandledModule {
 	return new UnhandledModule(handler, options);
 }
 export class UnhandledModule extends ModuleHandler {
@@ -601,7 +601,7 @@ export class UnhandledModule extends ModuleHandler {
 *	Simple module interface implementation, which forwards any requests to a lambda.
 *	Stops itself once thie child has been unlinked. Forwards parameter to wrapper or handler.
 */
-export function Wrap(handler: ModuleHandler, options?: { handle?: WrapHandle, name?: string }): WrapModule {
+export function wrap(handler: ModuleHandler, options?: { handle?: WrapHandle, name?: string }): WrapModule {
 	return new WrapModule(handler, options);
 }
 export class WrapModule extends ModuleHandler {
@@ -627,7 +627,7 @@ export class WrapModule extends ModuleHandler {
 *	Simple module interface implementation, which forwards any requests to a lambda.
 *	Stops itself once thie child has been unlinked. Forwards parameter to handler.
 */
-export function Bind(handler: ModuleHandler, options?: { params?: object, translation?: PathTranslation, name?: string }): BindModule {
+export function bind(handler: ModuleHandler, options?: { params?: object, translation?: PathTranslation, name?: string }): BindModule {
 	return new BindModule(handler, options);
 }
 export class BindModule extends ModuleHandler {
@@ -653,7 +653,7 @@ export class BindModule extends ModuleHandler {
 *	Simple module interface implementation, which validates the connected host and port before forwarding the client.
 *	Stops itself once thie child has been unlinked. Forwards parameter to handler.
 */
-export function Check(handler: ModuleHandler, host: string | string[], options?: { name?: string, port?: number }): CheckModule {
+export function check(handler: ModuleHandler, host: string | string[], options?: { name?: string, port?: number }): CheckModule {
 	return new CheckModule(handler, host, options);
 }
 export class CheckModule extends ModuleHandler {

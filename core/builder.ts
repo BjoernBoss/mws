@@ -13,12 +13,12 @@ export class HtmlGuard {
 
 	/* ensure the value is safe for html insertion; escapes plain strings, passes through HtmlGuard as-is */
 	public static get(str: HtmlString): HtmlGuard {
-		return (str instanceof HtmlGuard ? str : new HtmlGuard(libHelper.EscapeHtml(str)));
+		return (str instanceof HtmlGuard ? str : new HtmlGuard(libHelper.escapeHtml(str)));
 	}
 
 	/* wrap a string for html insertion; if safe is false, it will be html-escaped first */
 	public static make(str: string, safe: boolean): HtmlGuard {
-		return new HtmlGuard(safe ? str : libHelper.EscapeHtml(str));
+		return new HtmlGuard(safe ? str : libHelper.escapeHtml(str));
 	}
 }
 
@@ -37,7 +37,7 @@ export interface HtmlComponent {
 export class EmbeddedContent implements HtmlComponent {
 	private content: string;
 	public constructor(content: string, safe: boolean) {
-		this.content = (safe ? content : libHelper.EscapeHtml(content));
+		this.content = (safe ? content : libHelper.escapeHtml(content));
 	}
 	public simple(): boolean {
 		return (this.content.indexOf('\n') < 0);

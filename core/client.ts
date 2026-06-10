@@ -45,7 +45,7 @@ class ClientBase extends libLog.Logger {
 
 		if (arg instanceof libUrl.URL) {
 			this._translation = [];
-			this._path = libHelper.Sanitize(arg.pathname, false);
+			this._path = libHelper.sanitize(arg.pathname, false);
 			this.url = arg;
 		}
 		else {
@@ -72,17 +72,17 @@ class ClientBase extends libLog.Logger {
 
 	/* check if the path relative to the current module is a sub path of the given test base path */
 	public isSubPathOf(base: string): boolean {
-		return libHelper.IsSubPath(base, this._path);
+		return libHelper.isSubPath(base, this._path);
 	}
 
 	/* check if the path relative to the current module is inside of the given test base path */
 	public isInsideOf(base: string): boolean {
-		return libHelper.IsInside(base, this._path);
+		return libHelper.isInside(base, this._path);
 	}
 
 	/* create a path relative from the current module into the clients traversed server space */
 	public makePath(path: string): string {
-		path = libHelper.Sanitize(path, false);
+		path = libHelper.sanitize(path, false);
 		let output = path;
 
 		for (let i = this._translation.length - 1; i >= 0; --i) {
@@ -92,18 +92,18 @@ class ClientBase extends libLog.Logger {
 			for (const [from, to] of Object.entries(this._translation[i])) {
 				if (to == null)
 					nullCheck = true;
-				else if (libHelper.IsSubPath(to, output) && (match == null || match[1]!.length < to.length))
+				else if (libHelper.isSubPath(to, output) && (match == null || match[1]!.length < to.length))
 					match = [from, to];
 			}
 			if (match != null)
-				output = libHelper.Rebase(match[1]!, match[0], output);
+				output = libHelper.rebasePath(match[1]!, match[0], output);
 
 			/* check if the translation contained null-mappings and check if
 			*	the final unpacked path re-maps into the null-mapping */
 			if (nullCheck) {
 				match = null;
 				for (const [from, to] of Object.entries(this._translation[i])) {
-					if (libHelper.IsSubPath(from, output) && (match == null || match[0].length < from.length))
+					if (libHelper.isSubPath(from, output) && (match == null || match[0].length < from.length))
 						match = [from, to];
 				}
 			}
@@ -581,7 +581,7 @@ export class ClientRequest extends ClientBase {
 		if (this.config.serverName != '' && !('Server' in headers))
 			headers['Server'] = this.config.serverName;
 		if (content != null) {
-			headers['Content-Type'] = libHelper.BuildMediaTypeIdentifier(content.media);
+			headers['Content-Type'] = libHelper.buildMediaTypeIdentifier(content.media);
 			if (content.size != null)
 				headers['Content-Length'] = content.size.toString();
 		}
@@ -613,7 +613,7 @@ export class ClientRequest extends ClientBase {
 			headers['Vary'] = 'Accept-Encoding';
 
 			/* check if the data should be encoded (if the size is not known, pretend the buffer to be large enough) */
-			encoding = libHelper.NegotiateEncoding(this.headers['accept-encoding'] ?? null, content.body?.byteLength ?? null, content.media);
+			encoding = libHelper.negotiateEncoding(this.headers['accept-encoding'] ?? null, content.body?.byteLength ?? null, content.media);
 			if (encoding != null) {
 				if (content.body != null)
 					content.body = encoding.encodeBuffer(content.body);
@@ -667,7 +667,7 @@ export class ClientRequest extends ClientBase {
 
 		/* lookup the dynamic encoder (for [head] and no explicit content, default to size being valid to just
 		*	assume an encoding - can always be disabled in the real run, should the data be too short) */
-		let encoding = libHelper.NegotiateEncoding(this.headers['accept-encoding'] ?? null, fullContentSize ?? chunk?.byteLength ?? null, resp.contentType);
+		let encoding = libHelper.negotiateEncoding(this.headers['accept-encoding'] ?? null, fullContentSize ?? chunk?.byteLength ?? null, resp.contentType);
 		if (encoding == null) {
 			this.closeHeader(resp.status, resp.headers, { media: resp.contentType, size: fullContentSize ?? undefined });
 			return this.sendClientWrite(resp, chunk, last, cb);
@@ -863,14 +863,14 @@ export class ClientRequest extends ClientBase {
 		/* check if the content is encoded and create the chain of decoders (in reverse to ensure the nesting is correct) */
 		let stream: libStream.Readable = this._request;
 		if (this.headers['content-encoding'] != null) {
-			const encodings = libHelper.SplitAndTrimList(this.headers['content-encoding'], ',', false);
+			const encodings = libHelper.splitAndTrimList(this.headers['content-encoding'], ',', false);
 
 			for (let i = encodings.length - 1; i >= 0; --i) {
-				const encoding = libHelper.LookupEncoding(encodings[i]);
+				const encoding = libHelper.lookupEncoding(encodings[i]);
 
 				if (encoding == null) {
 					output.destroy();
-					this.respondUnsupported(encodings[i], libHelper.SupportedEncodingNames().join(','));
+					this.respondUnsupported(encodings[i], libHelper.supportedEncodingNames().join(','));
 					return makeErrorStream('Unsupported content encoding');
 				}
 
@@ -919,8 +919,8 @@ export class ClientRequest extends ClientBase {
 		else {
 			sanitized = {};
 			for (const [_from, _to] of Object.entries(map)) {
-				const from = libHelper.Sanitize(_from, false);
-				const to = (_to == null ? null : libHelper.Sanitize(_to, false));
+				const from = libHelper.sanitize(_from, false);
+				const to = (_to == null ? null : libHelper.sanitize(_to, false));
 				sanitized[from] = to;
 
 				/* check if the mapping can be applied to the current path */
@@ -935,7 +935,7 @@ export class ClientRequest extends ClientBase {
 			this._throughput.busyCheck.length, this._headerPatcher.length, this._htmlPatcher.length);
 
 		/* setup the new path, all path translations, and the tagged logging identity */
-		this._path = libHelper.Rebase(match[0], match[1]!, this._path);
+		this._path = libHelper.rebasePath(match[0], match[1]!, this._path);
 		if (sanitized != null)
 			this._translation.push(sanitized);
 		if (identity != '') {
@@ -1071,7 +1071,7 @@ export class ClientRequest extends ClientBase {
 
 	/* return the string formatted media-type (or empty string for no media type) */
 	public getMediaType(): string {
-		const type = libHelper.SplitAndTrimList(this.headers['content-type'] ?? null, ';', true)[0] ?? '';
+		const type = libHelper.splitAndTrimList(this.headers['content-type'] ?? null, ';', true)[0] ?? '';
 		return type.toLowerCase();
 	}
 
@@ -1082,7 +1082,7 @@ export class ClientRequest extends ClientBase {
 			return defEncoding;
 
 		/* look for the first charset entry in the content-type list */
-		for (const part of libHelper.SplitAndTrimList(type, ';', true)) {
+		for (const part of libHelper.splitAndTrimList(type, ';', true)) {
 			if (part.substring(0, 8).toLowerCase() != 'charset=')
 				continue;
 			let value = part.substring(8).trim();
@@ -1412,7 +1412,7 @@ export class ClientRequest extends ClientBase {
 		}
 
 		/* parse the range and ensure that its well formed */
-		const range = libHelper.ParseRangeHeader(this.headers.range ?? null, cached.fileSize());
+		const range = libHelper.parseRangeHeader(this.headers.range ?? null, cached.fileSize());
 		if (range.state == libHelper.RangeState.malformed) {
 			this.respondBadRequest(`Issues while parsing http-header range: [${this.headers.range}]`);
 			return true;
@@ -1425,8 +1425,8 @@ export class ClientRequest extends ClientBase {
 		/* update the cached reader to read the encoded content (no encoding if already encoded or a range request has occurred,
 		*	as the encoded byte representation might not be stable; this is also the reason why the e-tag must be forced to weak,
 		*	as the content cannot be guaranteed to be stabled across cache flushes or reloads) */
-		const media = (options.media ?? libHelper.LookupMediaTypeFromFile(filePath) ?? libBase.Media.Unknown);
-		let dynamicEncoder = ((options.encoded != null || range.state != libHelper.RangeState.noRange) ? null : libHelper.NegotiateEncoding(this.headers['accept-encoding'] ?? null, cached.fileSize(), media));
+		const media = (options.media ?? libHelper.lookupMediaTypeFromFile(filePath) ?? libBase.Media.Unknown);
+		let dynamicEncoder = ((options.encoded != null || range.state != libHelper.RangeState.noRange) ? null : libHelper.negotiateEncoding(this.headers['accept-encoding'] ?? null, cached.fileSize(), media));
 		let reader: null | libCache.EncodedCache = null;
 		if (dynamicEncoder != null)
 			reader = cached.encoded(dynamicEncoder);
@@ -1450,13 +1450,13 @@ export class ClientRequest extends ClientBase {
 		/* validate the conditions (e-tag more relevant than last-modified; invalid times are not
 		*	considered errors; no need to set etag/last-modified, as they are already set) */
 		if (this.headers['if-match'] != null) {
-			if (!libHelper.ETagMatchesList(etag, this.headers['if-match'], true)) {
+			if (!libHelper.etagMatchesList(etag, this.headers['if-match'], true)) {
 				this.respondPreconditionFailed(`New etag [${etag}]`, { headers });
 				return true;
 			}
 		}
 		else if (this.headers['if-unmodified-since'] != null) {
-			const result = libHelper.TimeStampCompare(cached.lastModified(), this.headers['if-unmodified-since']);
+			const result = libHelper.timestampCompare(cached.lastModified(), this.headers['if-unmodified-since']);
 			if (result != null && result > 0) {
 				this.respondPreconditionFailed(`Modified at [${cached.lastModified()}]`, { headers });
 				return true;
@@ -1466,13 +1466,13 @@ export class ClientRequest extends ClientBase {
 		/* check if the response can be skipped due to the resource not having been modified since
 		*	the last fetch (etag outweighs last-modified; invalid times are not considered errors) */
 		if (this.headers['if-none-match'] != null) {
-			if (libHelper.ETagMatchesList(etag, this.headers['if-none-match'], false)) {
+			if (libHelper.etagMatchesList(etag, this.headers['if-none-match'], false)) {
 				this.respondNotModified({ headers });
 				return true;
 			}
 		}
 		else if (this.headers['if-modified-since'] != null) {
-			const result = libHelper.TimeStampCompare(cached.lastModified(), this.headers['if-modified-since']);
+			const result = libHelper.timestampCompare(cached.lastModified(), this.headers['if-modified-since']);
 			if (result != null && result <= 0) {
 				this.respondNotModified({ headers });
 				return true;
@@ -1620,7 +1620,7 @@ export class ClientRequest extends ClientBase {
 		}
 
 		/* check if the connection is a valid upgrade request (and ensure that the underlying web-server, also detected it) */
-		let connection = libHelper.SplitAndTrimList(this.headers.connection?.toLowerCase() ?? null, ',', false);
+		let connection = libHelper.splitAndTrimList(this.headers.connection?.toLowerCase() ?? null, ',', false);
 		if (connection.indexOf('upgrade') == -1 || this.headers?.upgrade?.toLowerCase() != 'websocket' || this.method != 'GET') {
 			this.respondUpdateRequired('websocket');
 			return null;
@@ -1689,8 +1689,8 @@ export class ClientSocket extends ClientBase {
 		promise: Promise<void> | null;
 		closed: (() => void) | null, defer: number;
 	};
-	private _logger: libLog.Logger;
 	private _emitter: libEvents.EventEmitter;
+	private _extension: string;
 
 	private constructor(ws: libWs.WebSocket, source: ClientRequest) {
 		super(source, 'socket', source.config);
@@ -1700,7 +1700,7 @@ export class ClientSocket extends ClientBase {
 		this._emitter = new libEvents.EventEmitter();
 
 		this._ws.on('pong', () => {
-			this._logger.trace(`Alive check pong received`);
+			this.trace(`Alive check pong received`, { extension: this._extension });
 			this.selfIsAlive();
 		});
 		this._ws.on('message', (data) => {
@@ -1733,12 +1733,10 @@ export class ClientSocket extends ClientBase {
 		/* start the first alive check (no need to consider the socket timeout, as it will have been cleared already) */
 		this.selfIsAlive();
 
-		/* perserve the log tags of the base */
+		/* perserve the log extension of the base and preserve it to be re-used for internal logs */
 		source.log(`WebSocket accepted: [${this.logIdentity}]`);
 		this.tagLog(source.logExtension);
-
-		/* preserve the root logger to be used for internal socket logs */
-		this._logger = libLog.MakeLogger(this.logIdentity);
+		this._extension = source.logExtension;
 	}
 	private checkIsAlive(): void {
 		if (this._closing.promise != null)
@@ -1756,7 +1754,7 @@ export class ClientSocket extends ClientBase {
 
 		/* try to ping the remote to check the liveliness */
 		try {
-			this._logger.trace(`Sending ping to determine if connection is alive`);
+			this.trace(`Sending ping to determine if connection is alive`, { extension: this._extension });
 			this._ws.ping();
 		} catch (err: any) {
 			this.handleClosing(`WebSocket error while pinging: ${err.message}`);
@@ -1783,14 +1781,14 @@ export class ClientSocket extends ClientBase {
 
 			/* check if a termination should be triggered and otherwise start the grace termination timer */
 			if (terminate != null) {
-				this._logger.error(terminate);
+				this.error(terminate, { extension: this._extension });
 				this._ws.terminate();
 			}
 			else {
 				this._alive.timer = setTimeout(() => {
 					this._alive.timer = null;
 					if (this._closing.closed != null) {
-						this._logger.error('Closing connection');
+						this.error('Closing connection', { extension: this._extension });
 						this._ws.terminate();
 					}
 				}, this.config.killGraceTimeout);
@@ -1803,7 +1801,7 @@ export class ClientSocket extends ClientBase {
 		this._closing.closed = null;
 
 		this.emitEventSync('close');
-		this._logger.trace('Socket connection closed');
+		this.trace('Socket connection closed', { extension: this._extension });
 
 		closed();
 	}
@@ -1848,7 +1846,7 @@ export class ClientSocket extends ClientBase {
 			this._emitter.emit(event, ...args);
 		}
 		catch (err: any) {
-			this._logger.error(`Unhandled exception in ${event} listener: ${err.message}`);
+			this.error(`Unhandled exception in ${event} listener: ${err.message}`, { extension: this._extension });
 		}
 	}
 }

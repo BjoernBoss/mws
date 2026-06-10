@@ -33,7 +33,7 @@ export class Server extends libLog.Logger {
 		if (config?.cache instanceof libCache.CacheHost)
 			this._cache = config.cache;
 		else
-			this._cache = libCache.makeCache(config?.cache);
+			this._cache = libCache.createCache(config?.cache);
 		this._nextId = 0;
 
 		let stoppedResolver = () => { };

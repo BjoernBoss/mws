@@ -180,7 +180,7 @@ class ImmutableManager {
 			entry.unique += UNIQUE_ID_CHARS[libCrypto.randomInt(UNIQUE_ID_CHARS.length)];
 
 		/* patch the state up to contain the new id */
-		const [base, name, extension] = libHelper.SplitFilePath(entry.path);
+		const [base, name, extension] = libHelper.splitFilePath(entry.path);
 		entry.immutable = `${base}${name}.${entry.unique}${extension}`;
 		this.reverse[entry.unique] = entry.identifier;
 
@@ -216,7 +216,7 @@ class ImmutableManager {
 			const content: string = JSON.stringify(output);
 
 			/* ignore any read/write failures */
-			await libHelper.AtomicWrite(this.writeBack.path, content, 'immutable state', this.logger);
+			await libHelper.atomicWrite(this.writeBack.path, content, { what: 'immutable state', logger: this.logger });
 		}
 
 		this.writeBack.writing = null;
@@ -303,7 +303,7 @@ class ImmutableManager {
 				continue;
 			this.logger.trace(`Recovering immutable unique id [${state.unique}] for [${state.identifier}]`);
 
-			const [base, name, extension] = libHelper.SplitFilePath(state.path);
+			const [base, name, extension] = libHelper.splitFilePath(state.path);
 			this.map[state.identifier] = {
 				immutable: `${base}${name}.${state.unique}${extension}`,
 				identifier: state.identifier,
@@ -355,8 +355,8 @@ class ImmutableManager {
 			return [null, false];
 
 		/* check if it might be an immutable-tagged path */
-		const [base, temp, extension] = libHelper.SplitFilePath(path);
-		const [_, name, tempId] = libHelper.SplitFilePath(temp);
+		const [base, temp, extension] = libHelper.splitFilePath(path);
+		const [_, name, tempId] = libHelper.splitFilePath(temp);
 		if (!tempId.match(ID_EXTENSION_REGEX))
 			return [null, false];
 		const unique = tempId.substring(1);
@@ -754,7 +754,7 @@ export class CacheHost extends libLog.Logger {
 }
 
 /* simple wrapper function to create a cache */
-export function makeCache(config?: CacheConfig | BurntCacheConfig): CacheHost {
+export function createCache(config?: CacheConfig | BurntCacheConfig): CacheHost {
 	return new CacheHost(config);
 }
 

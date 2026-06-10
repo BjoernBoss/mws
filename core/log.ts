@@ -2,23 +2,16 @@
 /* Copyright (c) 2024-2026 Bjoern Boss Henrichsen */
 import * as libFs from "fs";
 
+const DEFAULT_FILE_FLUSHING_DELAY: number = 2_000;
+const DEFAULT_FILE_BUF_MAXIMUM_LINES = 1_000;
+const DEFAULT_FILE_SIZE_SWAP_FILE = 10_000_000;
+
 /* setup the initial default console-logger */
-let LogListener: Set<LogCallback> = new Set<LogCallback>();
-AddLogger(ConsoleLogger());
+const LoggerIdMap: Record<string, number> = {};
+const GlobalLogConsumers: Set<LogConsumer> = new Set<LogConsumer>();
+addLogger(createConsoleLogger());
 
-function MakeActualLog(level: LogLevel, identity: string, msg: string): void {
-	const date: string = new Date().toUTCString();
-	for (const log of LogListener)
-		log(level, date, identity, msg);
-}
-
-export type LogLevel = 'error' | 'info' | 'warning' | 'log' | 'trace';
-
-/* if [level] is null: is not a log, but the callback is being unregistered */
-export type LogCallback = (level: LogLevel | null, date: string, identity: string, msg: string) => void;
-
-/* format the parameter into a well known style */
-export function FormatLevel(level: LogLevel): string {
+function formatLevel(level: LogLevel): string {
 	switch (level) {
 		case 'log':
 			return 'Log  ';
@@ -32,21 +25,34 @@ export function FormatLevel(level: LogLevel): string {
 			return 'Warn ';
 	}
 }
-export function FormatLine(level: LogLevel, date: string, identity: string, msg: string, lineBreak: boolean): string {
-	let printLevel: string = FormatLevel(level);
+function formatLine(level: LogLevel, date: string, identity: string, msg: string, lineBreak: boolean): string {
+	let printLevel: string = formatLevel(level);
 	if (lineBreak)
 		return `[${date}] ${printLevel}: [${identity}] ${msg}\n`;
 	return `[${date}] ${printLevel}: [${identity}] ${msg}`;
 }
 
+/* supported log level */
+export type LogLevel = 'error' | 'info' | 'warning' | 'log' | 'trace';
+
+/* if [level] is null: is not a log, but the callback is being unregistered */
+export type LogConsumer = (level: LogLevel | null, date: string, identity: string, msg: string) => void;
+
+/* type to invoke to detach the given logger */
+export type Detacher = () => void;
+
+/* type to invoke to update the logging tag (empty string will hide the tag entry;
+*	null will completely remove the tag; other values will update the tag) */
+export type TagUpdate = (value?: string) => void;
+
 /* implementation of a console logger */
-export function ConsoleLogger(): LogCallback {
+export function createConsoleLogger(): LogConsumer {
 	return (level: LogLevel | null, date: string, identity: string, msg: string) => {
 		if (level == null)
 			return;
-		let levelPrint: string = FormatLevel(level);
+		let levelPrint: string = formatLevel(level);
 		if (process.stdout?.hasColors == null || !process.stdout.hasColors())
-			return console.log(FormatLine(level, date, identity, msg, false));
+			return console.log(formatLine(level, date, identity, msg, false));
 
 		let levelColor = '';
 		switch (level) {
@@ -72,17 +78,14 @@ export function ConsoleLogger(): LogCallback {
 }
 
 /* implementation of a logger which receives a well formatted line */
-export function LineLogger(cb: (line: string) => void): LogCallback {
+export function createLineLogger(cb: (line: string) => void): LogConsumer {
 	return (level: LogLevel | null, date: string, identity: string, msg: string) => {
 		if (level != null)
-			cb(FormatLine(level, date, identity, msg, false));
+			cb(formatLine(level, date, identity, msg, false));
 	};
 }
 
-const DEFAULT_FILE_FLUSHING_DELAY: number = 2_000;
-const DEFAULT_FILE_BUF_MAXIMUM_LINES = 1_000;
-const DEFAULT_FILE_SIZE_SWAP_FILE = 10_000_000;
-
+/* file overwriting preservation mode */
 export enum PreserveMode {
 	/* simply clear the log file once full */
 	none,
@@ -96,7 +99,7 @@ export enum PreserveMode {
 
 /* implementation of a file logger, which logs into the file-path and optionally preserves old logs
 *	(Note: contains a timer, server shutdown should clear all loggers to ensure fast shutdown) */
-export function FileLogger(filePath: string, options?: { flushingDelayMs?: number, bufMaxLineCount?: number, sizeSwapFile?: number, preserve?: PreserveMode }): LogCallback {
+export function createFileLogger(filePath: string, options?: { flushingDelayMs?: number, bufMaxLineCount?: number, sizeSwapFile?: number, preserve?: PreserveMode }): LogConsumer {
 	/* setup the logging state (ignore any errors, as they cannot be logged) */
 	let fileHandle: number | null = null;
 	let logFileSize: number = 0;
@@ -140,7 +143,7 @@ export function FileLogger(filePath: string, options?: { flushingDelayMs?: numbe
 		}
 
 		/* write the log to the buffer and check if the data need to be flushed inplace, or if the flushing can be delayed */
-		logBuffer.push(FormatLine(level, date, identity, msg, true));
+		logBuffer.push(formatLine(level, date, identity, msg, true));
 		if (logBuffer.length >= bufMaxLineCount)
 			flushToFile();
 		else {
@@ -173,57 +176,13 @@ export function FileLogger(filePath: string, options?: { flushingDelayMs?: numbe
 	};
 }
 
-/* remove all registered loggers (default logger is a single console logger) */
-export function ClearLoggers(): void {
-	for (const log of LogListener)
-		log(null, '', '', '');
-}
-
-/* type to invoke to detach the given logger */
-export type Detacher = () => void;
-
-/* register another logger to receive the logs (returned detacher can be invoked to remove the log) */
-export function AddLogger(cb: LogCallback): Detacher {
-	let detached = false;
-	const wrapped = (level: LogLevel | null, date: string, identity: string, msg: string): void => {
-		if (detached) return;
-
-		if (level == null) {
-			LogListener.delete(wrapped);
-			detached = true;
-		}
-
-		try {
-			if (detached)
-				cb(null, '', '', '');
-			else
-				cb(level, date, identity, msg);
-		}
-		catch (err: any) {
-			console.error(`Logger failed: ${err.message}`);
-			wrapped(null, '', '', '');
-		}
-	};
-	LogListener.add(wrapped);
-
-	return () => {
-		wrapped(null, '', '', '');
-	};
-}
-
-const LoggerIdMap: Record<string, number> = {};
-
-/* type to invoke to update the logging tag (empty string will hide the tag entry;
-*	null will completely remove the tag; other values will update the tag) */
-export type TagUpdate = (value?: string) => void;
-
-/* logger class to extend, supporting various logging classes */
+/* logger class to extend, supporting various logging classes, and writing to the registered log consumer */
 export class Logger {
 	private _rootIdentity: string;
 	private _logIdentity: string;
 	private _logTagList: { value: string }[];
 
-	constructor(identity: string) {
+	public constructor(identity: string) {
 		const id = (LoggerIdMap[identity] ?? 0) + 1;
 		LoggerIdMap[identity] = id;
 
@@ -238,6 +197,10 @@ export class Logger {
 			if (tag.value != '')
 				this._logIdentity += `.${tag.value}`;
 		}
+	}
+	private _performActualLog(level: LogLevel, msg: string, options?: { extension?: string }): void {
+		const identity = (options?.extension == null ? this._logIdentity : this._rootIdentity + (options.extension == '' ? '' : `.${options.extension}`));
+		logGlobal(level, identity, msg);
 	}
 
 	/* root identity tagged with unique id */
@@ -279,24 +242,66 @@ export class Logger {
 		};
 	}
 
-	public error(msg: string): void {
-		MakeActualLog('error', this._logIdentity, msg);
+	public error(msg: string, options?: { extension?: string }): void {
+		this._performActualLog('error', msg, options);
 	}
-	public info(msg: string): void {
-		MakeActualLog('info', this._logIdentity, msg);
+	public info(msg: string, options?: { extension?: string }): void {
+		this._performActualLog('info', msg, options);
 	}
-	public warning(msg: string): void {
-		MakeActualLog('warning', this._logIdentity, msg);
+	public warning(msg: string, options?: { extension?: string }): void {
+		this._performActualLog('warning', msg, options);
 	}
-	public log(msg: string): void {
-		MakeActualLog('log', this._logIdentity, msg);
+	public log(msg: string, options?: { extension?: string }): void {
+		this._performActualLog('log', msg, options);
 	}
-	public trace(msg: string): void {
-		MakeActualLog('trace', this._logIdentity, msg);
+	public trace(msg: string, options?: { extension?: string }): void {
+		this._performActualLog('trace', msg, options);
 	}
 }
 
 /* create a logger class to create associated logs */
-export function MakeLogger(identity: string): Logger {
+export function createLogger(identity: string): Logger {
 	return new Logger(identity);
+}
+
+/* register another global logger to receive the logs (returned detacher can be invoked to remove the log) */
+export function addLogger(cb: LogConsumer): Detacher {
+	let detached = false;
+	const wrapped = (level: LogLevel | null, date: string, identity: string, msg: string): void => {
+		if (detached) return;
+
+		if (level == null) {
+			GlobalLogConsumers.delete(wrapped);
+			detached = true;
+		}
+
+		try {
+			if (detached)
+				cb(null, '', '', '');
+			else
+				cb(level, date, identity, msg);
+		}
+		catch (err: any) {
+			console.error(`Logger failed: ${err.message}`);
+			wrapped(null, '', '', '');
+		}
+	};
+	GlobalLogConsumers.add(wrapped);
+
+	return () => {
+		wrapped(null, '', '', '');
+	};
+}
+
+/* remove all registered global loggers (default logger is a single console logger) */
+export function clearLoggers(): void {
+	for (const log of GlobalLogConsumers)
+		log(null, '', '', '');
+}
+
+/* perform a global log to all registered loggers */
+export function logGlobal(level: LogLevel, identity: string, msg: string): void {
+	const date = new Date().toUTCString();
+	for (const cb of GlobalLogConsumers)
+		cb(level, date, identity, msg);
 }
