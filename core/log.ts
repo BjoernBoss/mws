@@ -176,6 +176,24 @@ export function createFileLogger(filePath: string, options?: { flushingDelayMs?:
 	};
 }
 
+/* implementation of a log filter, which can filter by matching level and identity including a given sub-string, and then forwards these logs to the target logger */
+export function createLogFilter(target: LogConsumer, options?: { level?: LogLevel | LogLevel[], identity?: string | string[] }): LogConsumer {
+	const filterLevel = (options?.level == null ? null : new Set<string>(Array.isArray(options.level) ? options.level : [options.level]));
+	const filterIdentity = (options?.identity == null ? null : (Array.isArray(options.identity) ? options.identity : [options.identity]));
+
+	return (level: LogLevel | null, date: string, identity: string, msg: string) => {
+		if (level == null)
+			return target(null, '', '', '');
+
+		/* check if the level is supported */
+		if (filterLevel != null && !filterLevel.has(level))
+			return;
+		if (filterIdentity != null && !filterIdentity.some((value) => identity.includes(value)))
+			return;
+		target(level, date, identity, msg);
+	};
+}
+
 /* logger class to extend, supporting various logging classes, and writing to the registered log consumer */
 export class Logger {
 	private _rootIdentity: string;

@@ -954,17 +954,19 @@ export class ClientRequest extends ClientBase {
 	}
 
 	/* instantiate a request client from a web request structure (must be followed by one finalizeConnection call under all circumstances) */
-	public static fromRequest(cache: libCache.CacheHost, protocol: string, request: libHttp.IncomingMessage, response: libHttp.ServerResponse, options?: { config?: BurntClientConfig | ClientConfig }): ClientRequest {
+	public static fromRequest(protocol: string, request: libHttp.IncomingMessage, response: libHttp.ServerResponse, options?: { config?: BurntClientConfig | ClientConfig, cache?: libCache.CacheHost | libCache.CacheConfig | libCache.BurntCacheConfig }): ClientRequest {
+		const cache = (options?.cache instanceof libCache.CacheHost ? options.cache : libCache.createCache(options?.cache));
 		return new ClientRequest(cache, BurntClientConfig.from(options?.config), protocol, request, response);
 	}
 
 	/* instantiate a request client from a web socket upgrade structure (instantiates a new no-server wss if none is provided; must be followed by one finalizeConnection call under all circumstances) */
-	public static fromUpgrade(cache: libCache.CacheHost, protocol: string, request: libHttp.IncomingMessage, socket: libStream.Duplex, head: Buffer, options?: { config?: BurntClientConfig | ClientConfig, wss?: libWs.WebSocketServer }): ClientRequest {
+	public static fromUpgrade(protocol: string, request: libHttp.IncomingMessage, socket: libStream.Duplex, head: Buffer, options?: { config?: BurntClientConfig | ClientConfig, cache?: libCache.CacheHost | libCache.CacheConfig | libCache.BurntCacheConfig, wss?: libWs.WebSocketServer }): ClientRequest {
+		const cache = (options?.cache instanceof libCache.CacheHost ? options.cache : libCache.createCache(options?.cache));
 		return new ClientRequest(cache, BurntClientConfig.from(options?.config), protocol, request, { socket, head, wss: options?.wss });
 	}
 
-	/* finalize the connection (must be called once at the end; must have been fully
-	*	processed and responded to; default responds with not-found for unhandled requests) */
+	/* finalize the connection by ensuring the response is completed and pontentially also closed (must be called once at
+	*	the end; must have been fully processed and responded to; default responds with not-found for unhandled requests) */
 	public async finalizeConnection(): Promise<void> {
 		/* ensure the connection is default replied with not-found */
 		if (this._state.response == ResponseState.none)

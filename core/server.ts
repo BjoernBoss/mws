@@ -6,7 +6,6 @@ import * as libHandler from "./handler.js";
 import * as libCache from "./cache.js";
 import * as libHttps from "https";
 import * as libHttp from "http";
-import * as libStream from "stream";
 import * as libNet from "net";
 import * as libWs from "ws";
 import * as libFs from "fs";
@@ -41,7 +40,7 @@ export class Server extends libLog.Logger {
 		this._stop.stoppedResolver = stoppedResolver;
 	}
 
-	private async handleWrapper(request: libHttp.IncomingMessage, client: libClient.ClientRequest, handler: libHandler.AttachedModule, id: number): Promise<void> {
+	private async handleClient(request: libHttp.IncomingMessage, client: libClient.ClientRequest, handler: libHandler.AttachedModule, id: number): Promise<void> {
 		this.log(`Listener[${id}]: Client [${client.logIdentity}] connected using [method: ${request.method ?? '_'}] from [${request.socket.remoteAddress}]:${request.socket.remotePort} to [${client.url.hostname}]:[${request.url}] (user-agent: [${request.headers['user-agent'] ?? ''}])`);
 
 		try {
@@ -50,27 +49,15 @@ export class Server extends libLog.Logger {
 			client.respondInternalError(`Uncaught exception: ${err.message}`);
 		}
 
-		/* let finalize errors propagate out */
-		await client.finalizeConnection();
+		/* kill the connection on any errors, as the finalizing normally ensures that the response is completed */
+		try {
+			await client.finalizeConnection();
+		} catch (err: any) {
+			this.error(`Fatal error while finalizing client: ${err.message}`);
+			request.destroy(new Error('Unhandled exception'));
+		}
+
 		this.log(`Listener[${id}]: Client [${client.logIdentity}] completed`);
-	}
-	private async handleRequest(request: libHttp.IncomingMessage, handler: libHandler.AttachedModule, config: libClient.BurntClientConfig, id: number, protocol: string, response: libHttp.ServerResponse): Promise<void> {
-		try {
-			const client = libClient.ClientRequest.fromRequest(this._cache, protocol, request, response, { config });
-			await this.handleWrapper(request, client, handler, id);
-		} catch (err: any) {
-			this.error(`Fatal error in request handler: ${err.message}`);
-			request.destroy(new Error('Unhandled exception'));
-		}
-	}
-	private async handleUpgrade(request: libHttp.IncomingMessage, handler: libHandler.AttachedModule, config: libClient.BurntClientConfig, id: number, protocol: string, socket: libStream.Duplex, head: Buffer, wss: libWs.WebSocketServer): Promise<void> {
-		try {
-			const client = libClient.ClientRequest.fromUpgrade(this._cache, protocol, request, socket, head, { config, wss });
-			await this.handleWrapper(request, client, handler, id);
-		} catch (err: any) {
-			this.error(`Fatal error in request handler: ${err.message}`);
-			request.destroy(new Error('Unhandled exception'));
-		}
 	}
 	private fetchAddress(server: libHttp.Server): libNet.AddressInfo | null {
 		const raw = server.address();
@@ -189,14 +176,21 @@ export class Server extends libLog.Logger {
 		}
 
 		/* register the handler properly and register the cleanup callback */
-		const attached = handler._attachToRoot(() => listener.stop());
+		const attached = handler._rootAttach(() => listener.stop());
 		const wss = new libWs.WebSocketServer({ noServer: true });
 		this._stop.listener.push(listener.stop);
 
 		/* register the corresponding connection handlers and error handlers */
 		const clientConfig = (options?.client != null ? libClient.BurntClientConfig.from(options.client) : this._config.client);
-		server.on('request', (req, resp) => this.handleRequest(req, attached, clientConfig, idListener, protocol, resp));
-		server.on('upgrade', (req, sock, head) => this.handleUpgrade(req, attached, clientConfig, idListener, protocol, sock, head, wss));
+		const clientCache = (options?.cache instanceof libCache.CacheHost ? options.cache : (options?.cache == null ? this._cache : libCache.createCache(options?.cache)));
+		server.on('request', (req, resp) => {
+			const client = libClient.ClientRequest.fromRequest(protocol, req, resp, { cache: clientCache, config: clientConfig });
+			this.handleClient(req, client, attached, idListener);
+		});
+		server.on('upgrade', (req, sock, head) => {
+			const client = libClient.ClientRequest.fromUpgrade(protocol, req, sock, head, { cache: clientCache, config: clientConfig, wss });
+			this.handleClient(req, client, attached, idListener);
+		});
 		server.once('error', (err) => {
 			if (stopping != null) return;
 			this.error(`Error while listening to ${who}: ${err.message}`);
@@ -239,11 +233,9 @@ export class Server extends libLog.Logger {
 		const promises: Promise<void>[] = [];
 		for (const cb of this._stop.listener)
 			promises.push(cb());
-
-		/* await the stopping of all listened connections */
 		await Promise.all(promises);
-		this.info('Server stopped');
 
+		this.info('Server stopped');
 		this._stop.stoppedResolver();
 		return this._stop.stoppedPromise;
 	}
@@ -261,6 +253,26 @@ export class Server extends libLog.Logger {
 	/* resolves once the server has stopped */
 	public get stopped(): Promise<void> {
 		return this._stop.stoppedPromise;
+	}
+
+	/* check if the server is still running */
+	public get running(): boolean {
+		return !this._stop.stopping;
+	}
+
+	/* link the given module to the server (automatically unlinked upon server stop) */
+	public linkModule(module: libHandler.ModuleHandler, unlinked?: () => void): libHandler.AttachedModule {
+		const cleanup = (): Promise<void> => attached.unlink();
+		this._stop.listener.push(cleanup);
+
+		const attached = module._rootAttach(() => {
+			if (unlinked != null)
+				unlinked();
+			if (!this._stop.stopping)
+				this._stop.listener.filter((v) => v != cleanup);
+		});
+
+		return attached;
 	}
 }
 
@@ -283,8 +295,12 @@ export interface ListenOptions {
 	/* hostname/interface to bind to (omit to listen on all interfaces) */
 	hostname?: string;
 
-	/* client configuration to use for this listener */
+	/* client configuration to use for this listener, otherwise the server's is used */
 	client?: libClient.ClientConfig | libClient.BurntClientConfig;
+
+	/* default cache configuration to be used, otherwise the server's is used
+	*	Important: cache host should be shared where possible as otherwise multiple unshared caches could exist and immutable ids might overwrite each other */
+	cache?: libCache.CacheHost | libCache.CacheConfig | libCache.BurntCacheConfig;
 
 	/* tls configuration to be used */
 	tls?: { key: string, cert: string };
