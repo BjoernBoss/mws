@@ -80,10 +80,7 @@ export class Server extends libLog.Logger {
 			return { address: raw, port: 0, family: 'unix' };
 		return raw;
 	}
-	private async performServerCleanup(server: libHttp.Server | null, id: number | null, who: string, attached: libHandler.AttachedModule, wss: libWs.WebSocketServer): Promise<void> {
-		if (server == null)
-			return;
-
+	private async performServerCleanup(server: libHttp.Server, id: number | null, who: string, attached: libHandler.AttachedModule, wss: libWs.WebSocketServer): Promise<void> {
 		/* close the server and any existing connections within it */
 		const address = this.fetchAddress(server);
 		if (address != null && id != null)
@@ -152,14 +149,17 @@ export class Server extends libLog.Logger {
 				let resolver = () => { };
 				stopping = new Promise<void>((res) => resolver = res);
 
-				this.performServerCleanup(server, (listenLogged ? idListener : null), who, attached, wss).then(() => {
+				(async () => {
+					if (server != null)
+						await this.performServerCleanup(server, (listenLogged ? idListener : null), who, attached, wss);
+
 					/* check if the cleanup can be removed from the stop list (only if stopping is not already in progress) */
 					if (!this._stop.stopping)
 						this._stop.listener = this._stop.listener.filter((v) => v != listener.stop);
 
 					this.emitEventSync(emitter, 'stopped');
 					resolver();
-				});
+				})();
 				return stopping;
 			}
 		};

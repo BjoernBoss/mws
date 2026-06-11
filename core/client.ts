@@ -1301,7 +1301,7 @@ export class ClientRequest extends ClientBase {
 			header['Connection'] = 'upgrade';
 		header['Upgrade'] = upgrade;
 
-		this.constructQuickResponse(libBase.Status.UpgradeRequired, `Required: ${upgrade}`, options?.headers, {
+		this.constructQuickResponse(libBase.Status.UpgradeRequired, `Required: ${upgrade}`, header, {
 			media: libBase.Media.Text, body: Buffer.from(`Endpoint [${this.url.pathname}] requires an upgrade.\nRequired: ${upgrade}`, 'utf-8')
 		});
 	}
