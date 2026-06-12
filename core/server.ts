@@ -268,7 +268,7 @@ export class Server extends libLog.Logger {
 			if (unlinked != null)
 				unlinked();
 			if (!this._stop.stopping)
-				this._stop.listener.filter((v) => v != cleanup);
+				this._stop.listener = this._stop.listener.filter((v) => v != cleanup);
 		});
 
 		return attached;

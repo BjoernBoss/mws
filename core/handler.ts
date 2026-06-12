@@ -302,7 +302,7 @@ export abstract class ModuleHandler extends libLog.Logger {
 			},
 			cleanup: async (): Promise<void> => {
 				if (stopping) return unlinkPromise;
-				link.setup = null;
+				stopping = true, link.setup = null;
 				if (logged)
 					this.info(`Detached from [${parent.logIdentity}]${detail}`);
 
@@ -628,52 +628,52 @@ export class CheckModule extends ModuleHandler {
 }
 
 /*
-*	Simple module handler implementation, which allows requests to be handled by lambdas, and child modules to be bound.
+*	Simple module handler implementation, which allows requests to be handled by lambdas, and child modules to be attached.
 *	Stops itself once all children have been unlinked. Forwards parameter to lambda functions.
 */
-export function lambda(options?: { bind?: Record<string, ModuleHandler>, setup?: CallbackSetup, handle?: CallbackHandle, stop?: CallbackStop, name?: string }): LambdaModule {
+export function lambda(options?: { attach?: Record<string, ModuleHandler>, setup?: CallbackSetup, handle?: CallbackHandle, stop?: CallbackStop, name?: string }): LambdaModule {
 	return new LambdaModule(options);
 }
 export class LambdaModule extends ModuleHandler {
 	private setupLambda?: CallbackSetup;
 	private handleLambda?: CallbackHandle;
 	private stopLambda?: CallbackStop;
-	private bound: Record<string, AttachedModule>;
+	private links: Record<string, AttachedModule>;
 	private active: number;
 
-	constructor(options?: { bind?: Record<string, ModuleHandler>, setup?: CallbackSetup, handle?: CallbackHandle, stop?: CallbackStop, name?: string }) {
+	constructor(options?: { attach?: Record<string, ModuleHandler>, setup?: CallbackSetup, handle?: CallbackHandle, stop?: CallbackStop, name?: string }) {
 		super(options?.name ?? 'lambda');
 		this.setupLambda = options?.setup;
 		this.handleLambda = options?.handle;
 		this.stopLambda = options?.stop;
 
-		this.bound = {};
+		this.links = {};
 		this.active = 0;
-		if (options?.bind != null) for (const name in options.bind) {
+		if (options?.attach != null) for (const name in options.attach) {
 			++this.active;
-			this.bound[name] = this.linkModule(options.bind[name], () => {
+			this.links[name] = this.linkModule(options.attach[name], () => {
 				if (--this.active == 0)
 					this.stop();
 			});
 		}
 
-		if (this.active == 0)
+		if (options?.attach != null && this.active == 0)
 			this.stop();
 	}
 
 	protected override async handleInitialize(server: libServer.Server): Promise<void> {
 		if (this.setupLambda != null)
-			await this.setupLambda(server, this.bound);
+			await this.setupLambda(server, this.links);
 	}
 	protected override async handleRequest(client: libClient.ClientRequest, params?: object): Promise<void> {
 		if (this.handleLambda != null)
-			await this.handleLambda(client, params, this.bound);
+			await this.handleLambda(client, params, this.links);
 	}
 	protected override async handleStop(): Promise<void> {
 		if (this.stopLambda != null)
-			await this.stopLambda(this.bound);
+			await this.stopLambda(this.links);
 	}
 }
-export type CallbackSetup = (this: ModuleHandler, server: libServer.Server, bound: Record<string, AttachedModule>) => Promise<void>;
-export type CallbackHandle = (this: ModuleHandler, client: libClient.ClientRequest, params: object | undefined, bound: Record<string, AttachedModule>) => Promise<void>;
-export type CallbackStop = (this: ModuleHandler, bound: Record<string, AttachedModule>) => Promise<void>;
+export type CallbackSetup = (this: ModuleHandler, server: libServer.Server, links: Record<string, AttachedModule>) => Promise<void>;
+export type CallbackHandle = (this: ModuleHandler, client: libClient.ClientRequest, params: object | undefined, links: Record<string, AttachedModule>) => Promise<void>;
+export type CallbackStop = (this: ModuleHandler, links: Record<string, AttachedModule>) => Promise<void>;
