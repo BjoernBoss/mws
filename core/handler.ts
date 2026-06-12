@@ -3,6 +3,7 @@
 import * as libClient from "./client.js";
 import * as libLog from "./log.js";
 import * as libBase from "./base.js";
+import * as libServer from "./server.js";
 
 /*
 *	Translation to be applied for nested children and reversed for any paths produced by the children.
@@ -37,6 +38,14 @@ interface LinkedModules {
 	setup: ((realized: Promise<void> | null) => void) | null;
 }
 
+/*
+*	Modules will be stopped by default, once it is fully unlinked from the server again.
+*	If a module is initialized, or stopped, the stop-handler is called.
+*	An initialization will always be followed by a stop-handler call.
+*	Any request will first happen after successful initialization, and will complete before stop-handlers.
+*	WebSockets will not be automatically closed and must be closed by the module.
+*	Modules can either be attached to other modules (allowing for recursive detaches/cleanups) or to the server.
+*/
 export abstract class ModuleHandler extends libLog.Logger {
 	private _stopped: Promise<void> | null;
 	private _config: {
@@ -52,6 +61,7 @@ export abstract class ModuleHandler extends libLog.Logger {
 	};
 	private _attachment: {
 		links: Set<LinkedModules>;
+		server: libServer.Server | null;
 		attached: boolean;
 		task: {
 			promise: Promise<void> | null;
@@ -67,7 +77,7 @@ export abstract class ModuleHandler extends libLog.Logger {
 		this._config = { name, tagClients: true, tagString: '', stopOnDetach: true };
 		this._handling = { active: new Set<libClient.ClientRequest>(), promise: null, resolver: () => { } };
 		this._stopped = null;
-		this._attachment = { links: new Set<LinkedModules>(), attached: false, task: { promise: null, order: [], count: 0, resolver: () => { } } };
+		this._attachment = { links: new Set<LinkedModules>(), attached: false, server: null, task: { promise: null, order: [], count: 0, resolver: () => { } } };
 	}
 
 	private async _drainTaskQueue(connections: boolean, order: Promise<void> | null): Promise<void> {
@@ -154,8 +164,10 @@ export abstract class ModuleHandler extends libLog.Logger {
 			throw error;
 		return client.claimed;
 	}
-	private async _performAttachSelf(): Promise<void> {
+	private async _performAttachSelf(server: libServer.Server): Promise<boolean> {
+		const firstAttachment = (this._attachment.server == null);
 		this._attachment.attached = true;
+		this._attachment.server = server;
 
 		/* push the next ordered promise, to ensure the attach is fully performed before the next detach */
 		let taskResolver = () => { };
@@ -173,15 +185,17 @@ export abstract class ModuleHandler extends libLog.Logger {
 		this._attachment.task.order.shift();
 		this._pushHandleTask(taskPromise);
 
-		/* notify the module itself about the attached */
+		/* notify the module itself about the initialization */
 		try {
-			await this.handleAttached();
+			if (firstAttachment)
+				await this.handleInitialize(this._attachment.server);
 		}
 		catch (err: any) {
-			this.error(`Unhandled exception while attaching: ${err.message}`);
+			this.error(`Unhandled exception while initializing: ${err.message}`);
 			this.stop();
 		}
 		taskResolver();
+		return firstAttachment;
 	}
 	private async _performDetachSelf(): Promise<void> {
 		if (!this._attachment.attached)
@@ -203,30 +217,16 @@ export abstract class ModuleHandler extends libLog.Logger {
 		if (this._config.stopOnDetach)
 			this.stop();
 
-		/* kill any connections and wait for any current tasks and connections to complete */
-		for (const client of this._handling.active)
-			client.killConnection('Module detached');
-		await this._drainTaskQueue(true, taskPromise);
-
-		/* convert the task back to the unordered next step */
+		/* wait for any current tasks and connections to complete and remove the ordered task */
+		await this._drainTaskQueue(false, taskPromise);
 		this._attachment.task.order.shift();
-		this._pushHandleTask(taskPromise);
-
-		/* notify the module itself about the detached */
-		try {
-			await this.handleDetached();
-		}
-		catch (err: any) {
-			this.error(`Unhandled exception while detaching: ${err.message}`);
-			this.stop();
-		}
 		taskResolver();
 
 		/* check if the module was stopped and await the proper stopping */
 		if (this._stopped != null)
 			await this._stopped;
 	}
-	private _performAttachToParent(parent: ModuleHandler | null, unlinked: () => void, detail: string): AttachedModule {
+	private _performAttachToParent(parent: ModuleHandler | libServer.Server, unlinked: () => void, detail: string): AttachedModule {
 		const recSearchParents = (parent: ModuleHandler): boolean => {
 			if (parent == this)
 				return false;
@@ -236,14 +236,20 @@ export abstract class ModuleHandler extends libLog.Logger {
 			}
 			return true;
 		};
-		const validateLinkState = (): boolean => {
+		const validateLinkState = (parentServer: libServer.Server | null): boolean => {
 			if (this._stopped != null) {
-				this.warning(`Stopped module cannot be attached to [${parent?.logIdentity ?? 'root'}]`);
+				this.warning(`Stopped module cannot be attached to [${parent.logIdentity}]`);
+				return false;
+			}
+			const thisServer = this._attachment.server;
+			if (thisServer != null && parentServer != null && thisServer != parentServer) {
+				this.warning(`Module attached to server [${thisServer.logIdentity}] cannot be attached to server [${parentServer.logIdentity}]`);
 				return false;
 			}
 
-			if (parent == null)
+			if (parent instanceof libServer.Server)
 				return true;
+
 			if (parent._stopped != null) {
 				this.warning(`Module cannot be attached to stopped module [${parent.logIdentity}]`);
 				return false;
@@ -263,47 +269,53 @@ export abstract class ModuleHandler extends libLog.Logger {
 		const taskPromise: Promise<void> = new Promise<void>((res) => taskResolver = res);
 		let logged: boolean = false, stopping = false;
 		const link: LinkedModules = {
-			parent,
+			parent: (parent instanceof libServer.Server ? null : parent),
 			child: this,
 			setup: async (realized: Promise<void> | null): Promise<void> => {
 				if (stopping)
 					return;
+				const parentServer = (parent instanceof libServer.Server ? parent : parent._attachment.server);
 
 				/* check if the attachment is possible in theory */
-				if (!validateLinkState())
+				let firstAttachment = false;
+				if (!validateLinkState(parentServer))
 					link.cleanup();
 
 				/* check if the attachment is still certain (uncertainty can only happen once on the first time
 				*	attaching, as the second execution is performed after the parent has just been attached) */
-				else if (parent == null || parent._attachment.attached) {
+				else if (parentServer != null) {
 					link.setup = null;
 					if (!this._attachment.attached) {
 						if (realized != null)
 							this._pushHandleTask(realized);
-						await this._performAttachSelf();
+						firstAttachment = await this._performAttachSelf(parentServer);
 					}
 
 					logged = !stopping;
-					if (logged)
-						this.info(`Attached to [${parent?.logIdentity ?? 'root'}]${detail}`);
+					if (logged) {
+						if (parent instanceof libServer.Server || !firstAttachment)
+							this.info(`Attached to [${parent.logIdentity}]${detail}`);
+						else
+							this.info(`Attached to [${parent.logIdentity}] and server [${parentServer.logIdentity}]${detail}`);
+					}
 				}
 			},
 			cleanup: async (): Promise<void> => {
 				if (stopping) return unlinkPromise;
 				link.setup = null;
 				if (logged)
-					this.info(`Detached from [${parent?.logIdentity ?? 'root'}]${detail}`);
+					this.info(`Detached from [${parent.logIdentity}]${detail}`);
 
 				/* remove the link from the parent and add its cleanup to its task list (cleanup calls are only linked as task to the parent,
 				*	as the child does not care for them; this implies that the module's stop method itself does not await them either) */
-				if (parent != null) {
+				if (!(parent instanceof libServer.Server)) {
 					parent._attachment.links.delete(link);
 					parent._pushHandleTask(taskPromise);
 				}
 
 				/* remove the link from this handler and check if the object should be detached */
 				this._attachment.links.delete(link);
-				if (this._attachment.attached && !this._checkIsModuleAttached(this))
+				if (!this._checkIsModuleAttached(this))
 					await this._performDetachSelf();
 
 				/* start the actual unlink call */
@@ -325,7 +337,7 @@ export abstract class ModuleHandler extends libLog.Logger {
 
 		/* register the link between the parent and this handler */
 		this._attachment.links.add(link);
-		if (parent != null)
+		if (!(parent instanceof libServer.Server))
 			parent._attachment.links.add(link);
 
 		/* try to immediately perform the initial load and setup the attach module interface */
@@ -339,29 +351,29 @@ export abstract class ModuleHandler extends libLog.Logger {
 		};
 	}
 
-	public _rootAttach(unlinked: () => void): AttachedModule {
-		return this._performAttachToParent(null, unlinked, '');
+	public _rootAttachToServer(server: libServer.Server, unlinked: () => void): AttachedModule {
+		return this._performAttachToParent(server, unlinked, '');
 	}
 
-	/* module is attached directly or indirectly to the server (will be the first call being performed before any other calls) */
-	protected async handleAttached(): Promise<void> { }
+	/* module is attached directly or indirectly to the server (will be the first call being performed before any other calls; will only be called once) */
+	protected async handleInitialize(server: libServer.Server): Promise<void> { }
 
 	/* handle the client request (guaranteed to not have been claimed yet; if the promise resolves, client must either have been handled or must
 	*	not be handled anymore; long-running handlers must check 'client.claimed' or await 'client.responded' to allow timely server shutdown) */
 	protected abstract handleRequest(client: libClient.ClientRequest, params?: object): Promise<void>;
 
-	/* module has been detached and it not attached to the server anymore, but not yet stopped
-	*	(will only be called after an attach call; all clients are guaranteed to have left, but
-	*	accepted WebSockets will be left intact and must be closed manually by this module) */
-	protected async handleDetached(): Promise<void> { }
-
-	/* stop this module (will only be called when detached; will only be called once; module should
-	*	cleanup any resources and timers and cleanup any remaining WebSockets not disonnected on detach) */
+	/* module has been stopped (all clients are guaranteed to have left, but accepted WebSockets will be left intact and
+	*	must be closed manually by this module; will only be called once; module should cleanup any resources and timers) */
 	protected async handleStop(): Promise<void> { }
 
 	/* name of the module */
 	public get moduleName(): string {
 		return this._config.name;
+	}
+
+	/* server the module has been attached to (null if not yet attached) */
+	public get moduleServer(): libServer.Server | null {
+		return this._attachment.server;
 	}
 
 	/* enable or disable the module tagging the logging of clients [default: true] */
@@ -400,9 +412,11 @@ export abstract class ModuleHandler extends libLog.Logger {
 		let resolver = () => { };
 		this._stopped = new Promise<void>((res) => resolver = res);
 
-		/* trigger the detaching and kill all links and drain the remaining task queue (no need to kill connections manually,
-		*	as the detaching will take care of this; will not await the unlinked calls of links where this element is the child) */
+		/* kill any connections and kill all links and drain the remaining task queue
+		*	(will not await the unlinked calls of links where this element is the child) */
 		this._performDetachSelf();
+		for (const client of this._handling.active)
+			client.killConnection('Module detached');
 		for (const link of this._attachment.links)
 			link.cleanup();
 		this.info('Handler stopped');
@@ -617,21 +631,19 @@ export class CheckModule extends ModuleHandler {
 *	Simple module handler implementation, which allows requests to be handled by lambdas, and child modules to be bound.
 *	Stops itself once all children have been unlinked. Forwards parameter to lambda functions.
 */
-export function lambda(options?: { bind?: Record<string, ModuleHandler>, attach?: CallbackAttach, detach?: CallbackDetach, handle?: CallbackHandle, stop?: CallbackStop, name?: string }): LambdaModule {
+export function lambda(options?: { bind?: Record<string, ModuleHandler>, setup?: CallbackSetup, handle?: CallbackHandle, stop?: CallbackStop, name?: string }): LambdaModule {
 	return new LambdaModule(options);
 }
 export class LambdaModule extends ModuleHandler {
-	private attachLambda?: CallbackAttach;
-	private detachLambda?: CallbackDetach;
+	private setupLambda?: CallbackSetup;
 	private handleLambda?: CallbackHandle;
 	private stopLambda?: CallbackStop;
 	private bound: Record<string, AttachedModule>;
 	private active: number;
 
-	constructor(options?: { bind?: Record<string, ModuleHandler>, attach?: CallbackAttach, detach?: CallbackDetach, handle?: CallbackHandle, stop?: CallbackStop, name?: string }) {
+	constructor(options?: { bind?: Record<string, ModuleHandler>, setup?: CallbackSetup, handle?: CallbackHandle, stop?: CallbackStop, name?: string }) {
 		super(options?.name ?? 'lambda');
-		this.attachLambda = options?.attach;
-		this.detachLambda = options?.detach;
+		this.setupLambda = options?.setup;
 		this.handleLambda = options?.handle;
 		this.stopLambda = options?.stop;
 
@@ -649,24 +661,19 @@ export class LambdaModule extends ModuleHandler {
 			this.stop();
 	}
 
-	protected override async handleAttached(): Promise<void> {
-		if (this.attachLambda != null)
-			await this.attachLambda(this.bound);
+	protected override async handleInitialize(server: libServer.Server): Promise<void> {
+		if (this.setupLambda != null)
+			await this.setupLambda(server, this.bound);
 	}
 	protected override async handleRequest(client: libClient.ClientRequest, params?: object): Promise<void> {
 		if (this.handleLambda != null)
 			await this.handleLambda(client, params, this.bound);
-	}
-	protected override async handleDetached(): Promise<void> {
-		if (this.detachLambda != null)
-			await this.detachLambda(this.bound);
 	}
 	protected override async handleStop(): Promise<void> {
 		if (this.stopLambda != null)
 			await this.stopLambda(this.bound);
 	}
 }
-export type CallbackAttach = (this: ModuleHandler, bound: Record<string, AttachedModule>) => Promise<void>;
-export type CallbackDetach = (this: ModuleHandler, bound: Record<string, AttachedModule>) => Promise<void>;
+export type CallbackSetup = (this: ModuleHandler, server: libServer.Server, bound: Record<string, AttachedModule>) => Promise<void>;
 export type CallbackHandle = (this: ModuleHandler, client: libClient.ClientRequest, params: object | undefined, bound: Record<string, AttachedModule>) => Promise<void>;
 export type CallbackStop = (this: ModuleHandler, bound: Record<string, AttachedModule>) => Promise<void>;

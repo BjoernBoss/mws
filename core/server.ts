@@ -176,19 +176,18 @@ export class Server extends libLog.Logger {
 		}
 
 		/* register the handler properly and register the cleanup callback */
-		const attached = handler._rootAttach(() => listener.stop());
+		const attached = handler._rootAttachToServer(this, () => listener.stop());
 		const wss = new libWs.WebSocketServer({ noServer: true });
 		this._stop.listener.push(listener.stop);
 
 		/* register the corresponding connection handlers and error handlers */
 		const clientConfig = (options?.client != null ? libClient.BurntClientConfig.from(options.client) : this._config.client);
-		const clientCache = (options?.cache instanceof libCache.CacheHost ? options.cache : (options?.cache == null ? this._cache : libCache.createCache(options?.cache)));
 		server.on('request', (req, resp) => {
-			const client = libClient.ClientRequest.fromRequest(protocol, req, resp, { cache: clientCache, config: clientConfig });
+			const client = libClient.ClientRequest.fromRequest(protocol, req, resp, { cache: this._cache, config: clientConfig });
 			this.handleClient(req, client, attached, idListener);
 		});
 		server.on('upgrade', (req, sock, head) => {
-			const client = libClient.ClientRequest.fromUpgrade(protocol, req, sock, head, { cache: clientCache, config: clientConfig, wss });
+			const client = libClient.ClientRequest.fromUpgrade(protocol, req, sock, head, { cache: this._cache, config: clientConfig, wss });
 			this.handleClient(req, client, attached, idListener);
 		});
 		server.once('error', (err) => {
@@ -265,7 +264,7 @@ export class Server extends libLog.Logger {
 		const cleanup = (): Promise<void> => attached.unlink();
 		this._stop.listener.push(cleanup);
 
-		const attached = module._rootAttach(() => {
+		const attached = module._rootAttachToServer(this, () => {
 			if (unlinked != null)
 				unlinked();
 			if (!this._stop.stopping)
@@ -297,10 +296,6 @@ export interface ListenOptions {
 
 	/* client configuration to use for this listener, otherwise the server's is used */
 	client?: libClient.ClientConfig | libClient.BurntClientConfig;
-
-	/* default cache configuration to be used, otherwise the server's is used
-	*	Important: cache host should be shared where possible as otherwise multiple unshared caches could exist and immutable ids might overwrite each other */
-	cache?: libCache.CacheHost | libCache.CacheConfig | libCache.BurntCacheConfig;
 
 	/* tls configuration to be used */
 	tls?: { key: string, cert: string };
