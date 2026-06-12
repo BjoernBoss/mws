@@ -4,6 +4,7 @@ import * as libLog from "./log.js";
 import * as libHelper from "./helper.js";
 import * as libBase from "./base.js";
 import * as libFs from "fs";
+import * as libFsPromises from "fs/promises";
 import * as libStream from "stream";
 import * as libCrypto from "crypto";
 
@@ -11,7 +12,7 @@ const UNIQUE_ID_CHARS = '0123456789abcdefghijklmnopqrstuvwxyz'
 const UNIQUE_ID_LENGTH = 14;
 const ID_EXTENSION_REGEX = RegExp(`^\\.[${UNIQUE_ID_CHARS}]{${UNIQUE_ID_LENGTH}}$`, 'i');
 
-function ReadStats(path: string): null | [number, number] {
+function readStats(path: string): null | [number, number] {
 	try {
 		const stats = libFs.statSync(path);
 		if (stats.isFile())
@@ -22,6 +23,33 @@ function ReadStats(path: string): null | [number, number] {
 		throw new Error(`Filesystem error while checking [${path}]: ${err.message}`);
 	}
 	return null;
+}
+async function atomicWrite(path: string, content: Buffer, logger: libLog.Logger, options?: { what?: string, temporary?: string }): Promise<boolean> {
+	const tempPath = (options?.temporary ?? `${path}.temp`);
+
+	let written = false;
+	try {
+		logger.trace(`Writing ${options?.what ?? 'data'} to [${path}]`);
+
+		/* write the content to the temporary file */
+		await libFsPromises.writeFile(tempPath, content);
+		written = true;
+		await libFsPromises.rename(tempPath, path);
+		return true;
+	} catch (err: any) {
+		if (written)
+			logger.error(`Failed to replace the original file [${path}]: ${err.message}`);
+		else
+			logger.error(`Failed to write to temporary file [${tempPath}]: ${err.message}`);
+
+		try {
+			await libFsPromises.unlink(tempPath);
+		} catch (err: any) {
+			if (err.code != 'ENOENT')
+				logger.warning(`Failed to remove temporary file [${tempPath}]: ${err.message}`);
+		}
+	}
+	return false;
 }
 
 interface CacheEntry {
@@ -38,11 +66,13 @@ class CacheManager {
 	private allocated: number = 0;
 	private totalCapacity: number;
 	private largestSize: number;
+	private nextAge: number;
 
 	public constructor(logger: libLog.Logger, cacheSize: number, fileSizeLimit: number) {
 		this.logger = logger;
 		this.totalCapacity = cacheSize;
 		this.largestSize = fileSizeLimit;
+		this.nextAge = 0;
 	}
 
 	private reduce(maximum: number): void {
@@ -132,6 +162,9 @@ class CacheManager {
 		this.drop(path);
 		return null;
 	}
+	public allocAge(): number {
+		return ++this.nextAge;
+	}
 }
 
 interface ImmutableEntry {
@@ -216,7 +249,7 @@ class ImmutableManager {
 			const content: string = JSON.stringify(output);
 
 			/* ignore any read/write failures */
-			await libHelper.atomicWrite(this.writeBack.path, content, { what: 'immutable state', logger: this.logger });
+			await atomicWrite(this.writeBack.path, Buffer.from(content, 'utf-8'), this.logger, { what: 'immutable state' });
 		}
 
 		this.writeBack.writing = null;
@@ -228,13 +261,7 @@ class ImmutableManager {
 		/* load the current file and parse it as json (skip any content failed to be read or if the file did not exist) */
 		let state: unknown = null;
 		try {
-			const data = await new Promise<string>((resolve, reject) => libFs.readFile(path, { encoding: 'utf-8' }, (err: any, data: string) => {
-				if (err == null)
-					resolve(data);
-				else
-					reject(err);
-			}));
-			state = JSON.parse(data);
+			state = JSON.parse(await libFsPromises.readFile(path, { encoding: 'utf-8' }));
 		} catch (err: any) {
 			if (err.code != 'ENOENT')
 				this.logger.error(`Error while loading immutable state from [${path}]: ${err.message}`);
@@ -270,7 +297,7 @@ class ImmutableManager {
 			return true;
 
 		/* fetch the file states of the actual filesystem entry */
-		const stats = ReadStats(entry.fileSystem!);
+		const stats = readStats(entry.fileSystem!);
 		if (stats == null) {
 			this.logger.warning(`Immutable path [${entry.fileSystem}] does not exist`);
 			delete this.map[entry.identifier];
@@ -422,14 +449,14 @@ class AlreadyCached implements Cached {
 	public stream(options?: { start?: number, end?: number }): libStream.Readable {
 		return libStream.Readable.from(this.entry.data.subarray(options?.start, (options?.end == null ? undefined : options.end + 1)));
 	}
-	public async readAsync(): Promise<Buffer> {
+	public async read(): Promise<Buffer> {
 		return this.entry.data;
 	}
 	public readSync(): Buffer {
 		return this.entry.data;
 	}
-	public encoded(encoding: libBase.EncodingType): EncodedCache {
-		return EncodedCache(this.cache, this, this.entry, encoding, this.entry.age);
+	public encoded(encoding?: libBase.EncodingType): EncodedCache {
+		return EncodedCache(this.cache, this, this.entry, this.entry.age, encoding);
 	}
 }
 class NotCached implements Cached {
@@ -509,24 +536,21 @@ class NotCached implements Cached {
 	public stream(options?: { start?: number, end?: number }): libStream.Readable {
 		return this.makeStream(options);
 	}
-	public async readAsync(): Promise<Buffer> {
+	public async read(): Promise<Buffer> {
 		return StreamToAsync(this.makeStream());
 	}
 	public readSync(): Buffer {
 		/* just let the errors propagate out */
 		const data = libFs.readFileSync(this.path);
 
-		/* check if the file-size changed mid operation */
-		if (data.byteLength != this.size)
-			throw new Error(`File size changed mid operation: [${data.byteLength}] != [${this.size}]`);
-
-		/* add the read buffer back to the cache (using the fetched data from before
-		*	reading the file - to detect a file-change since before reading the file) */
-		this.cache.add(this.path, data, this.mtime, this.age);
+		/* add the read buffer back to the cache (using the fetched data from before reading the file - to
+		*	detect a file-change since before reading the file; dont error as stream also just proceeds) */
+		if (data.byteLength == this.size)
+			this.cache.add(this.path, data, this.mtime, this.age);
 		return data;
 	}
-	public encoded(encoding: libBase.EncodingType): EncodedCache {
-		return EncodedCache(this.cache, this, null, encoding, this.age);
+	public encoded(encoding?: libBase.EncodingType): EncodedCache {
+		return EncodedCache(this.cache, this, null, this.age, encoding);
 	}
 }
 
@@ -554,15 +578,25 @@ function StreamToAsync(stream: libStream.Readable): Promise<Buffer> {
 		});
 	});
 }
-function EncodedCache(cache: CacheManager, reader: Cached, entry: CacheEntry | null, encoding: libBase.EncodingType, age: number): EncodedCache {
+function EncodedCache(cache: CacheManager, reader: Cached, entry: CacheEntry | null, age: number, encoding?: libBase.EncodingType): EncodedCache {
+	/* check if no encoding is used, in which case the source reader can just be wrapped */
+	if (encoding == null) {
+		return {
+			contentSize: () => reader.fileSize(),
+			stream: () => reader.stream(),
+			read: () => reader.read(),
+			readSync: () => reader.readSync()
+		};
+	}
+
 	/* check if the given encoding has already been cached */
 	if (entry != null && encoding.name in entry.encodings) {
 		const encoded = entry.encodings[encoding.name];
 		return {
 			contentSize: () => encoded.byteLength,
 			stream: () => libStream.Readable.from(encoded),
-			readSync: () => encoded,
-			readAsync: async () => encoded
+			read: async () => encoded,
+			readSync: () => encoded
 		};
 	}
 
@@ -621,7 +655,7 @@ function EncodedCache(cache: CacheManager, reader: Cached, entry: CacheEntry | n
 	return {
 		contentSize: () => null,
 		stream: () => makeStream(),
-		readAsync: () => StreamToAsync(makeStream()),
+		read: () => StreamToAsync(makeStream()),
 		readSync: () => {
 			/* will be returned as buffer anyways, so might as well
 			*	try to write it back to the cache, no matter if its too large */
@@ -653,13 +687,13 @@ export interface Cached {
 	stream(options?: { start?: number, end?: number }): libStream.Readable;
 
 	/* [throws] object or encoded entry must not be used anymore after reading or streaming from it */
-	readAsync(): Promise<Buffer>;
+	read(): Promise<Buffer>;
 
 	/* [throws] object or encoded entry must not be used anymore after reading or streaming from it */
 	readSync(): Buffer;
 
-	/* create an encoded version of this cached entry */
-	encoded(encoding: libBase.EncodingType): EncodedCache;
+	/* create an encoded version of this cached entry (no encoding is equivalent to identity) */
+	encoded(encoding?: libBase.EncodingType): EncodedCache;
 }
 
 export interface EncodedCache {
@@ -670,7 +704,7 @@ export interface EncodedCache {
 	stream(): libStream.Readable;
 
 	/* [throws] object or encoded entry must not be used anymore after reading or streaming from it */
-	readAsync(): Promise<Buffer>;
+	read(): Promise<Buffer>;
 
 	/* [throws] object or encoded entry must not be used anymore after reading or streaming from it */
 	readSync(): Buffer;
@@ -707,7 +741,7 @@ export class CacheHost extends libLog.Logger {
 
 		/* check if the file exists and read its file-size and mtime (not necessary
 		*	for immutable entries, as their stats are already up-to-date) */
-		const stats = (immutable == null ? ReadStats(path) : [immutable.size, immutable.mtime]);
+		const stats = (immutable == null ? readStats(path) : [immutable.size, immutable.mtime]);
 		if (stats == null)
 			return null;
 		const [fileSize, mtime] = stats;
@@ -716,7 +750,7 @@ export class CacheHost extends libLog.Logger {
 		entry = this._cacheManager.find(path, { mtime, size: fileSize });
 		if (entry != null)
 			return new AlreadyCached(this._cacheManager, path, entry, isImmutable);
-		return new NotCached(this._cacheManager, path, fileSize, mtime, Date.now(), isImmutable);
+		return new NotCached(this._cacheManager, path, fileSize, mtime, this._cacheManager.allocAge(), isImmutable);
 	}
 
 	/* configuration used by this cache host */
@@ -727,13 +761,13 @@ export class CacheHost extends libLog.Logger {
 	/* [throws] if [checkFreshness] is true, re-validate the file stats on disk before serving from cache (defaults
 	*	to false); resolve immutable ids automatically (Cached to interact with cache; null, if it does not exist,
 	*	string if the immutable path has been permanently moved to the new path in source space) */
-	public getImmutable(path: string, options?: { checkFreshness?: boolean }): Cached | string | null {
+	public fetchImmutable(path: string, options?: { checkFreshness?: boolean }): Cached | string | null {
 		return this.resolveCache(path, options?.checkFreshness ?? false, true);
 	}
 
 	/* [throws] if [checkFreshness] is true re-validate the file stats on disk before serving from cache (defaults
 	*	to false); no immutable ids are resolved (Cached to interact with cache; null, if it does not exist) */
-	public getActual(path: string, options?: { checkFreshness?: boolean }): Cached | null {
+	public fetchDirect(path: string, options?: { checkFreshness?: boolean }): Cached | null {
 		return this.resolveCache(path, options?.checkFreshness ?? false, false) as (Cached | null);
 	}
 
@@ -741,15 +775,44 @@ export class CacheHost extends libLog.Logger {
 	*	[checkFreshness]: if true, re-validate the file stats on disk to detect changes (defaults to false); creates
 	*	a path to a file, which looks similar to the source, except that the name includes a unique id, which will be used
 	*	to identity the given file state (will be removed from the final target path to be served, to identify the actual source) */
-	public makeImmutable(handler: string, path: string, options?: { checkFreshness?: boolean }): string {
+	public immutable(handler: string, path: string, options?: { checkFreshness?: boolean }): string {
 		return this._immutableManager.make(handler, path, options?.checkFreshness ?? false);
 	}
 
 	/* flush all cached data and invalidate immutable stats so they are re-checked on next access */
-	public flushCache(): void {
+	public flush(): void {
 		this.info('Flushing cache and invalidating immutable entries');
 		this._cacheManager.flush();
 		this._immutableManager.invalidate();
+	}
+
+	/* [throws] read the data directly into a buffer (designed for modules to interact with) */
+	public async read(path: string, options?: { checkFreshness?: boolean }): Promise<Buffer | null> {
+		const entry = this.resolveCache(path, options?.checkFreshness ?? false, false) as (Cached | null);
+		if (entry == null)
+			return null;
+		return entry.read();
+	}
+
+	/* [throws] write data atomically to the disk and update the cache (designed for modules to interact
+	*	with; writes as utf-8; writes data first to temporary file and then replaces the file atomically) */
+	public async write(path: string, data: Buffer | string, options?: { what?: string, temporary?: string }): Promise<void> {
+		if (typeof data == 'string')
+			data = Buffer.from(data, 'utf-8');
+
+		/* write the data atomically to the destination */
+		if (!await atomicWrite(path, data, this, { what: (options?.what ?? 'via cache'), temporary: options?.temporary }))
+			throw new Error('Failed to atomically write data');
+		if (!this._cacheManager.cacheable(data.byteLength))
+			return;
+		const age = this._cacheManager.allocAge();
+
+		/* fetch the new state and update the cache (let errors propagate out; only if the write-state seems consistent) */
+		const stats = readStats(path);
+		if (stats == null)
+			this._cacheManager.drop(path);
+		else if (stats[0] == data.byteLength)
+			this._cacheManager.add(path, data, stats[1], age);
 	}
 }
 

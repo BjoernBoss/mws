@@ -403,36 +403,3 @@ export function splitFilePath(path: string): [string, string, string] {
 		dot = path.length;
 	return [path.substring(0, name + 1), path.substring(name + 1, dot), path.substring(dot)];
 }
-
-/* perform an atomic write by first writing the file to a temporary path and then replacing it (logs on failures and returns false; strings are encoded as utf-8) */
-export async function atomicWrite(path: string, content: string | Buffer, options?: { what?: string, logger?: libLog.Logger, temporary?: string }): Promise<boolean> {
-	const logger = (options?.logger ?? helperLogger);
-	const tempPath = (options?.temporary ?? `${path}.temp`);
-
-	let written = false;
-	try {
-		logger.trace(`Writing ${options?.what ?? 'data'} to [${path}]`);
-
-		/* write the content to the temporary file */
-		if (typeof content == 'string')
-			await libFs.writeFile(tempPath, content, { encoding: 'utf-8' });
-		else
-			await libFs.writeFile(tempPath, content);
-		written = true;
-		await libFs.rename(tempPath, path);
-		return true;
-	} catch (err: any) {
-		if (written)
-			logger.error(`Failed to replace the original file [${path}]: ${err.message}`);
-		else
-			logger.error(`Failed to write to temporary file [${tempPath}]: ${err.message}`);
-
-		try {
-			await libFs.unlink(tempPath);
-		} catch (err: any) {
-			if (err.code != 'ENOENT')
-				logger.warning(`Failed to remove temporary file [${tempPath}]: ${err.message}`);
-		}
-	}
-	return false;
-}

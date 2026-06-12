@@ -1400,7 +1400,7 @@ export class ClientRequest extends ClientBase {
 		/* read the entry from the cache and check if it has been permanently moved and apply the move */
 		let cached: libCache.Cached | string | null = null;
 		try {
-			cached = this.cache.getImmutable(filePath, { checkFreshness: options.checkFreshness });
+			cached = this.cache.fetchImmutable(filePath, { checkFreshness: options.checkFreshness });
 			if (cached == null)
 				return false;
 		}
