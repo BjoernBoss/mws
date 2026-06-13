@@ -39,10 +39,6 @@ export type LogConsumer = (level: LogLevel | null, date: string, identity: strin
 /* type to invoke to detach the given logger */
 export type Detacher = () => void;
 
-/* type to invoke to update the logging tag (empty string will hide the tag entry;
-*	null will completely remove the tag; other values will update the tag) */
-export type TagUpdate = (value?: string) => void;
-
 /* implementation of a console logger */
 export function createConsoleLogger(): LogConsumer {
 	return (level: LogLevel | null, date: string, identity: string, msg: string) => {
@@ -193,91 +189,48 @@ export function createLogFilter(target: LogConsumer, options?: { level?: LogLeve
 }
 
 /* logger class to extend, supporting various logging classes, and writing to the registered log consumer */
+export function createLogger(identity: string): Logger {
+	return new Logger(identity);
+}
 export class Logger {
-	private _rootIdentity: string;
 	private _logIdentity: string;
-	private _logTagList: { value: string }[];
 
 	public constructor(identity: string) {
 		const id = (LoggerIdMap[identity] ?? 0) + 1;
 		LoggerIdMap[identity] = id;
 
-		this._rootIdentity = `${identity}!${id}`;
-		this._logIdentity = this._rootIdentity;
-		this._logTagList = [];
+		this._logIdentity = `${identity}!${id}`;
 	}
-	private _updateLogIdentity(): void {
-		this._logIdentity = this._rootIdentity;
-
-		for (const tag of this._logTagList) {
-			if (tag.value != '')
-				this._logIdentity += `.${tag.value}`;
-		}
-	}
-	private _performActualLog(level: LogLevel, msg: string, options?: { extension?: string }): void {
-		const identity = (options?.extension == null ? this._logIdentity : this._rootIdentity + (options.extension == '' ? '' : `.${options.extension}`));
+	private _performActualLog(level: LogLevel, msg: string, options?: { identity?: string }): void {
+		const identity = (options?.identity == null ? this._logIdentity : options.identity);
 		logGlobal(level, identity, msg);
 	}
 
-	/* root identity tagged with unique id */
-	public get logRoot(): string {
-		return this._rootIdentity;
+	/* update the log identity */
+	protected logSetIdentity(identity: string): void {
+		this._logIdentity = identity;
 	}
 
-	/* tag extension appended to root identity to form full logging identity */
-	public get logExtension(): string {
-		return this._logIdentity.substring(this._rootIdentity.length + 1);
-	}
-
-	/* full logging identity as shown in logs */
-	public get logIdentity(): string {
+	/* logging identity as shown in logs */
+	public get identity(): string {
 		return this._logIdentity;
 	}
 
-	/* tag the logging with the given identifier and return a callback to update the tag */
-	public tagLog(identifier: string): TagUpdate {
-		let tag: { value: string } | null = { value: identifier };
-
-		this._logTagList.push(tag);
-		if (tag.value != '')
-			this._updateLogIdentity();
-
-		/* setup the handler responsible to update the logging */
-		return (value?: string) => {
-			if (tag == null) return;
-
-			/* check if the tag should be removed or if the value should just be updated */
-			if (value == null) {
-				this._logTagList = this._logTagList.filter((v) => v != tag);
-				tag = null;
-			}
-			else if (value != tag.value)
-				tag.value = value;
-
-			this._updateLogIdentity();
-		};
-	}
-
-	public error(msg: string, options?: { extension?: string }): void {
+	public error(msg: string, options?: { identity?: string }): void {
 		this._performActualLog('error', msg, options);
 	}
-	public info(msg: string, options?: { extension?: string }): void {
+	public info(msg: string, options?: { identity?: string }): void {
 		this._performActualLog('info', msg, options);
 	}
-	public warning(msg: string, options?: { extension?: string }): void {
+	public warning(msg: string, options?: { identity?: string }): void {
 		this._performActualLog('warning', msg, options);
 	}
-	public log(msg: string, options?: { extension?: string }): void {
+	public log(msg: string, options?: { identity?: string }): void {
 		this._performActualLog('log', msg, options);
 	}
-	public trace(msg: string, options?: { extension?: string }): void {
+	public trace(msg: string, options?: { identity?: string }): void {
 		this._performActualLog('trace', msg, options);
 	}
-}
-
-/* create a logger class to create associated logs */
-export function createLogger(identity: string): Logger {
-	return new Logger(identity);
 }
 
 /* register another global logger to receive the logs (returned detacher can be invoked to remove the log) */

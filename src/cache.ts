@@ -362,8 +362,8 @@ class ImmutableManager {
 			this.storeState();
 	}
 
-	public make(handler: string, path: string, checkFreshness: boolean): string {
-		const identifier = `${handler}:${path}`;
+	public make(module: string, path: string, checkFreshness: boolean): string {
+		const identifier = `${module}:${path}`;
 		if (!this.immutableTagging)
 			return path;
 
@@ -788,8 +788,8 @@ export class CacheHost extends libLog.Logger {
 	*	[checkFreshness]: if true, re-validate the file stats on disk to detect changes (defaults to false); creates
 	*	a path to a file, which looks similar to the source, except that the name includes a unique id, which will be used
 	*	to identity the given file state (will be removed from the final target path to be served, to identify the actual source) */
-	public immutable(handler: string, path: string, options?: { checkFreshness?: boolean }): string {
-		return this._immutableManager.make(handler, path, options?.checkFreshness ?? false);
+	public immutable(module: string, path: string, options?: { checkFreshness?: boolean }): string {
+		return this._immutableManager.make(module, path, options?.checkFreshness ?? false);
 	}
 
 	/* flush all cached data and invalidate immutable stats so they are re-checked on next access */

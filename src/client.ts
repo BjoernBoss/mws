@@ -5,6 +5,7 @@ import * as libBuilder from "./builder.js";
 import * as libCache from "./cache.js";
 import * as libHelper from "./helper.js";
 import * as libBase from "./base.js";
+import * as libServer from "./server.js";
 import * as libEvents from "events";
 import * as libFs from "fs";
 import * as libStream from "stream";
@@ -16,15 +17,15 @@ const BAD_HTTP_STRING_REGEX: RegExp = /[\x00-\x1f\x7f]/;
 const BAD_HTTP_HEADER_NAME_REGEX: RegExp = /[\x00-\x1f\x7f\(\)<>@,;:\\"/\[\]\?=\{\} \t]/;
 
 class ClientContext {
-	public dropLogTag: () => void;
 	public path: string;
+	public identity: string;
 	public translationCount: number;
 	public busyCount: number;
 	public headerPatchCount: number;
 	public htmlPatchCount: number;
 
-	constructor(path: string, translationCount: number, busyCount: number, headerPatchCount: number, htmlPatchCount: number) {
-		this.dropLogTag = () => { };
+	constructor(path: string, identity: string, translationCount: number, busyCount: number, headerPatchCount: number, htmlPatchCount: number) {
+		this.identity = identity;
 		this.path = path;
 		this.translationCount = translationCount;
 		this.busyCount = busyCount;
@@ -174,11 +175,17 @@ class HttpRequestResponse extends libStream.Writable {
 	}
 }
 
+type ClientSocketEvents = { 'data': (data: Buffer) => void, 'close': () => void };
+
 /* look at the state and modify the headers accordingly (only add or remove headers, must not try to alter the response) */
 export type HeaderPatch = (status: libBase.StatusType, headers: Record<string, string>) => void;
 
 /* look at the page and modify it or the headers accordingly (can be interrupted by returning an alternate response) */
 export type HtmlPatch = (page: libBuilder.HtmlPage, status: libBase.StatusType, headers: Record<string, string>) => Promise<void>;
+
+/* type to invoke to update the logging tag (empty string will hide the tag entry;
+*	null will completely remove the tag; other values will update the tag) */
+export type SocketLogTag = (value?: string) => void;
 
 /*
 *	Does not throw any exceptions, unless explicitly stated.
@@ -237,13 +244,13 @@ export class ClientRequest extends ClientBase {
 	private _native: {
 		response: HttpResponseInterface;
 		writer: libStream.Writable;
-		socket?: { socket: libStream.Duplex, head: Buffer, wss?: libWs.WebSocketServer };
+		socket?: { socket: libStream.Duplex, head: Buffer, wss: libWs.WebSocketServer };
 		timeout?: number;
 	};
 	private _request: libHttp.IncomingMessage;
-	private _cache: libCache.CacheHost;
+	private _server: libServer.Server;
 
-	private constructor(cache: libCache.CacheHost, config: BurntClientConfig, protocol: string, request: libHttp.IncomingMessage, response: libHttp.ServerResponse | { socket: libStream.Duplex, head: Buffer, wss?: libWs.WebSocketServer }) {
+	private constructor(server: libServer.Server, config: BurntClientConfig, protocol: string, request: libHttp.IncomingMessage, response: libHttp.ServerResponse | { socket: libStream.Duplex, head: Buffer, wss: libWs.WebSocketServer }) {
 		super(new libUrl.URL(`${protocol}://${request.headers.host?.toLowerCase() ?? '_'}${request.url}`), 'request', config);
 		this._headerPatcher = [];
 		this._htmlPatcher = [];
@@ -266,7 +273,7 @@ export class ClientRequest extends ClientBase {
 		this._state.breakResolve = breakResolve;
 
 		this._request = request;
-		this._cache = cache;
+		this._server = server;
 
 		/* setup the throughput measurement to detect any stalling connections */
 		this._throughput = { timer: null, deadline: 0, start: 0, active: true, busyCheck: [] };
@@ -907,12 +914,12 @@ export class ClientRequest extends ClientBase {
 		return stream.pipe(output);
 	}
 
-	public _pushTranslation(map: Record<string, string | null>, identity: string): ClientContext | null {
+	public _pushTranslation(map: Record<string, string | null> | null, identity: string): ClientContext | null {
 		let sanitized: Record<string, string | null> | null = null;
 		let match: [string, string | null] | null = null;
 
 		/* check if this is only an identity map, in which case nothing complex needs to be evaluated */
-		if (Object.keys(map).length == 1 && map['/'] == '/')
+		if (map == null || Object.keys(map).length == 1 && map['/'] == '/')
 			match = ['/', '/'];
 
 		/* create the merged reverse map and check if the map applies to the current translation */
@@ -931,43 +938,32 @@ export class ClientRequest extends ClientBase {
 				return null;
 		}
 
-		const current = new ClientContext(this._path, this._translation.length,
+		const current = new ClientContext(this._path, this.identity, this._translation.length,
 			this._throughput.busyCheck.length, this._headerPatcher.length, this._htmlPatcher.length);
 
 		/* setup the new path, all path translations, and the tagged logging identity */
 		this._path = libHelper.rebasePath(match[0], match[1]!, this._path);
 		if (sanitized != null)
 			this._translation.push(sanitized);
-		if (identity != '') {
-			const update = this.tagLog(identity);
-			current.dropLogTag = () => update();
-		}
+		if (identity != '')
+			this.logSetIdentity(`${this.identity}.${identity}`);
 		return current;
 	}
 	public _restoreSnapshot(snapshot: ClientContext): void {
 		this._path = snapshot.path;
+		this.logSetIdentity(snapshot.identity);
 		this._translation.splice(snapshot.translationCount);
 		this._throughput.busyCheck.splice(snapshot.busyCount);
 		this._headerPatcher.splice(snapshot.headerPatchCount);
 		this._htmlPatcher.splice(snapshot.htmlPatchCount);
-		snapshot.dropLogTag();
 	}
-
-	/* instantiate a request client from a web request structure (must be followed by one finalizeConnection call under all circumstances) */
-	public static fromRequest(protocol: string, request: libHttp.IncomingMessage, response: libHttp.ServerResponse, options?: { config?: BurntClientConfig | ClientConfig, cache?: libCache.CacheHost | libCache.CacheConfig | libCache.BurntCacheConfig }): ClientRequest {
-		const cache = (options?.cache instanceof libCache.CacheHost ? options.cache : libCache.createCache(options?.cache));
-		return new ClientRequest(cache, BurntClientConfig.from(options?.config), protocol, request, response);
+	public static _fromRequest(protocol: string, request: libHttp.IncomingMessage, response: libHttp.ServerResponse, config: BurntClientConfig, server: libServer.Server): ClientRequest {
+		return new ClientRequest(server, config, protocol, request, response);
 	}
-
-	/* instantiate a request client from a web socket upgrade structure (instantiates a new no-server wss if none is provided; must be followed by one finalizeConnection call under all circumstances) */
-	public static fromUpgrade(protocol: string, request: libHttp.IncomingMessage, socket: libStream.Duplex, head: Buffer, options?: { config?: BurntClientConfig | ClientConfig, cache?: libCache.CacheHost | libCache.CacheConfig | libCache.BurntCacheConfig, wss?: libWs.WebSocketServer }): ClientRequest {
-		const cache = (options?.cache instanceof libCache.CacheHost ? options.cache : libCache.createCache(options?.cache));
-		return new ClientRequest(cache, BurntClientConfig.from(options?.config), protocol, request, { socket, head, wss: options?.wss });
+	public static _fromUpgrade(protocol: string, request: libHttp.IncomingMessage, socket: libStream.Duplex, head: Buffer, config: BurntClientConfig, server: libServer.Server, wss: libWs.WebSocketServer): ClientRequest {
+		return new ClientRequest(server, config, protocol, request, { socket, head, wss });
 	}
-
-	/* finalize the connection by ensuring the response is completed and pontentially also closed (must be called once at
-	*	the end; must have been fully processed and responded to; default responds with not-found for unhandled requests) */
-	public async finalizeConnection(): Promise<void> {
+	public async _finalizeConnection(): Promise<void> {
 		/* ensure the connection is default replied with not-found */
 		if (this._state.response == ResponseState.none)
 			this.respondNotFound();
@@ -1031,9 +1027,14 @@ export class ClientRequest extends ClientBase {
 		this.markAsBroken((closing ? '' : description), closing);
 	}
 
-	/* cache host to be used with this client */
+	/* server the client originates from */
+	public get server(): libServer.Server {
+		return this._server;
+	}
+
+	/* cache host used by this server and client */
 	public get cache(): libCache.CacheHost {
-		return this._cache;
+		return this._server.cache;
 	}
 
 	/* request has not yet been acknowledged in any way */
@@ -1651,8 +1652,7 @@ export class ClientRequest extends ClientBase {
 			});
 
 			/* start the upgrade process (web-socket upgrade handler will automatically send error messages) */
-			const wss = (native.wss ?? new libWs.WebSocketServer({ noServer: true, clientTracking: false }));
-			wss.handleUpgrade(this._request, native.socket, native.head, (ws, _) => {
+			native.wss.handleUpgrade(this._request, native.socket, native.head, (ws, _) => {
 				if (!settled && this._state.response == ResponseState.headerSent) {
 					settled = true, this._state.response = ResponseState.completed;
 
@@ -1692,7 +1692,10 @@ export class ClientSocket extends ClientBase {
 		closed: (() => void) | null, defer: number;
 	};
 	private _emitter: libEvents.EventEmitter;
-	private _extension: string;
+	private _log: {
+		identity: string;
+		tagList: { value: string }[];
+	}
 
 	private constructor(ws: libWs.WebSocket, source: ClientRequest) {
 		super(source, 'socket', source.config);
@@ -1702,7 +1705,7 @@ export class ClientSocket extends ClientBase {
 		this._emitter = new libEvents.EventEmitter();
 
 		this._ws.on('pong', () => {
-			this.trace(`Alive check pong received`, { extension: this._extension });
+			this.trace(`Alive check pong received`, { identity: this._log.identity });
 			this.selfIsAlive();
 		});
 		this._ws.on('message', (data) => {
@@ -1732,13 +1735,15 @@ export class ClientSocket extends ClientBase {
 			this.handleClosing(`WebSocket error: ${err.message}`);
 		});
 
+		/* perserve the log extension of the base and preserve it to be re-used for internal logs */
+		const extIndex = source.identity.indexOf('.');
+		if (extIndex > 0)
+			this.logSetIdentity(`${this.identity}${source.identity.substring(extIndex)}`);
+		source.log(`WebSocket accepted: [${this.identity}]`);
+		this._log = { identity: source.identity, tagList: [] };
+
 		/* start the first alive check (no need to consider the socket timeout, as it will have been cleared already) */
 		this.selfIsAlive();
-
-		/* perserve the log extension of the base and preserve it to be re-used for internal logs */
-		source.log(`WebSocket accepted: [${this.logIdentity}]`);
-		this.tagLog(source.logExtension);
-		this._extension = source.logExtension;
 	}
 	private checkIsAlive(): void {
 		if (this._closing.promise != null)
@@ -1756,7 +1761,7 @@ export class ClientSocket extends ClientBase {
 
 		/* try to ping the remote to check the liveliness */
 		try {
-			this.trace(`Sending ping to determine if connection is alive`, { extension: this._extension });
+			this.trace(`Sending ping to determine if connection is alive`, { identity: this._log.identity });
 			this._ws.ping();
 		} catch (err: any) {
 			this.handleClosing(`WebSocket error while pinging: ${err.message}`);
@@ -1783,14 +1788,14 @@ export class ClientSocket extends ClientBase {
 
 			/* check if a termination should be triggered and otherwise start the grace termination timer */
 			if (terminate != null) {
-				this.error(terminate, { extension: this._extension });
+				this.error(terminate, { identity: this._log.identity });
 				this._ws.terminate();
 			}
 			else {
 				this._alive.timer = setTimeout(() => {
 					this._alive.timer = null;
 					if (this._closing.closed != null) {
-						this.error('Closing connection', { extension: this._extension });
+						this.error('Closing connection', { identity: this._log.identity });
 						this._ws.terminate();
 					}
 				}, this.config.killGraceTimeout);
@@ -1803,9 +1808,19 @@ export class ClientSocket extends ClientBase {
 		this._closing.closed = null;
 
 		this.emitEventSync('close');
-		this.trace('Socket connection closed', { extension: this._extension });
+		this.trace('Socket connection closed', { identity: this._log.identity });
 
 		closed();
+	}
+	private updateLogIdentity(): void {
+		let identity = this._log.identity;
+
+		for (const tag of this._log.tagList) {
+			if (tag.value != '')
+				identity += `.${tag.value}`;
+		}
+
+		this.logSetIdentity(identity);
 	}
 
 	public static _fromRequest(ws: libWs.WebSocket, source: ClientRequest) {
@@ -1833,6 +1848,30 @@ export class ClientSocket extends ClientBase {
 		return this._closing.promise!;
 	}
 
+	/* tag the logging with the given identifier and return a callback to update the tag */
+	public tagLog(identifier: string): SocketLogTag {
+		let tag: { value: string } | null = { value: identifier };
+
+		this._log.tagList.push(tag);
+		if (tag.value != '')
+			this.updateLogIdentity();
+
+		/* setup the handler responsible to update the logging */
+		return (value?: string) => {
+			if (tag == null) return;
+
+			/* check if the tag should be removed or if the value should just be updated */
+			if (value == null) {
+				this._log.tagList = this._log.tagList.filter((v) => v != tag);
+				tag = null;
+			}
+			else if (value != tag.value)
+				tag.value = value;
+
+			this.updateLogIdentity();
+		};
+	}
+
 	/* -------- event handler interfaces -------- */
 	public on<K extends keyof ClientSocketEvents>(event: K, listener: ClientSocketEvents[K]): ClientSocket {
 		this._emitter.on(event, listener); return this;
@@ -1848,11 +1887,10 @@ export class ClientSocket extends ClientBase {
 			this._emitter.emit(event, ...args);
 		}
 		catch (err: any) {
-			this.error(`Unhandled exception in ${event} listener: ${err.message}`, { extension: this._extension });
+			this.error(`Unhandled exception in ${event} listener: ${err.message}`, { identity: this._log.identity });
 		}
 	}
 }
-type ClientSocketEvents = { 'data': (data: Buffer) => void, 'close': () => void };
 
 export interface ClientConfig {
 	/* default server name to be used in the http:server header [empty value prevents server header; Default: 'Modular Web Server'] */

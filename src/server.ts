@@ -10,18 +10,22 @@ import * as libNet from "net";
 import * as libWs from "ws";
 import * as libFs from "fs";
 import * as libEvents from "events";
+import * as libStream from "stream";
 
 const CONNECTION_TIMEOUT_CHECKING = 10_000;
 
+type ListenerEvents = { 'listening': (address: libNet.AddressInfo | null) => void, 'failed': (err: Error) => void, 'stopped': () => void };
+
 export class Server extends libLog.Logger {
 	private _stop: {
-		listener: (() => Promise<void>)[];
+		list: (() => Promise<void>)[];
 		stoppedResolver: () => void;
 		stoppedPromise: Promise<void>;
 		stopping: boolean;
 	};
 	private _cache: libCache.CacheHost;
 	private _config: BurntServerConfig;
+	private _nextEndpoint: number;
 
 	constructor(config?: ServerConfig) {
 		super('server');
@@ -32,192 +36,16 @@ export class Server extends libLog.Logger {
 			this._cache = config.cache;
 		else
 			this._cache = libCache.createCache(config?.cache);
+		this._nextEndpoint = 0;
 
 		let stoppedResolver = () => { };
-		this._stop = { listener: [], stoppedPromise: new Promise<void>((res) => stoppedResolver = res), stoppedResolver: () => { }, stopping: false };
+		this._stop = { list: [], stoppedPromise: new Promise<void>((res) => stoppedResolver = res), stoppedResolver: () => { }, stopping: false };
 		this._stop.stoppedResolver = stoppedResolver;
-	}
-
-	private async handleClient(request: libHttp.IncomingMessage, client: libClient.ClientRequest, handler: libHandler.AttachedModule, logger: libLog.Logger): Promise<void> {
-		logger.log(`Client [${client.logIdentity}] connected using [method: ${request.method ?? '_'}] from [${request.socket.remoteAddress}]:${request.socket.remotePort} to [${client.url.hostname}]:[${request.url}] (user-agent: [${request.headers['user-agent'] ?? ''}])`);
-
-		try {
-			await handler.handle(client);
-		} catch (err: any) {
-			client.respondInternalError(`Uncaught exception: ${err.message}`);
-		}
-
-		/* kill the connection on any errors, as the finalizing normally ensures that the response is completed */
-		try {
-			await client.finalizeConnection();
-		} catch (err: any) {
-			logger.error(`Fatal error while finalizing [${client.logIdentity}]: ${err.message}`);
-			request.destroy(new Error('Unhandled exception'));
-		}
-
-		logger.log(`Client [${client.logIdentity}] completed`);
-	}
-	private fetchAddress(server: libHttp.Server): libNet.AddressInfo | null {
-		const raw = server.address();
-		if (raw == null)
-			return null;
-		if (typeof raw == 'string')
-			return { address: raw, port: 0, family: 'unix' };
-		return raw;
-	}
-	private async performServerCleanup(server: libHttp.Server, logger: libLog.Logger | null, who: string, attached: libHandler.AttachedModule, wss: libWs.WebSocketServer): Promise<void> {
-		/* close the server and any existing connections within it */
-		const address = this.fetchAddress(server);
-		if (address != null && logger != null)
-			this.info(`Stopping ${who} on [${address.address}]:${address.port} [family: ${address.family}] as listener [${logger.logIdentity}] with handler [${attached.module.logIdentity}]`);
-		const serverStopped = new Promise<void>((res) => server.close(() => res()));
-		server.closeAllConnections();
-
-		/* close all of the web-sockets (after unlinking the module to
-		*	ensure it has a chance to clean the connections itself) */
-		await attached.unlink();
-
-		const sockets: Promise<void>[] = [];
-		for (const ws of [...wss.clients]) {
-			if (ws.readyState == libWs.WebSocket.CLOSED)
-				continue;
-			sockets.push(new Promise<void>((res) => ws.on('close', () => res())));
-			ws.terminate();
-		}
-		await Promise.all(sockets);
-
-		/* await the server being fully stopped */
-		await serverStopped;
-	}
-	private emitEventSync<T extends Record<string, (...args: any[]) => any>, K extends keyof T>(emitter: libEvents.EventEmitter, event: K, ...args: Parameters<T[K]>): void {
-		try {
-			emitter.emit(event as string, ...args);
-		}
-		catch (err: any) {
-			this.error(`Unhandled exception in ${event as string} listener: ${err.message}`);
-		}
-	}
-	private makeServer(options?: ListenOptions): libHttp.Server {
-		if (options?.tls != null) {
-			const config = {
-				requireHostHeader: true,
-				key: libFs.readFileSync(options.tls.key),
-				cert: libFs.readFileSync(options.tls.cert),
-				connectionsCheckingInterval: CONNECTION_TIMEOUT_CHECKING
-			};
-			return libHttps.createServer(config);
-		}
-		if (options?.server != null)
-			return options.server.server;
-
-		return libHttp.createServer({ requireHostHeader: true, connectionsCheckingInterval: CONNECTION_TIMEOUT_CHECKING });
 	}
 
 	/* listener is automatically stopped when the server is stopped or the handler stops itself */
 	public listen(handler: libHandler.ModuleHandler, options?: ListenOptions): Listener {
-		const protocol = ((options?.tls != null || options?.server?.secure === true) ? 'https' : 'http');
-		const who = `${protocol}:${options?.hostname ?? ''}:${options?.port ?? 0}`;
-		const emitter = new libEvents.EventEmitter();
-		const logger = libLog.createLogger('listener');
-
-		/* setup the listener interface to be returned */
-		let stopping: Promise<void> | null = null, listenLogged = false;
-		let server: libHttp.Server | null = null;
-		const listener: Listener = {
-			on: function (event: string, cb: (...args: any[]) => void) { emitter.on(event, cb); return this; },
-			once: function (event: string, cb: (...args: any[]) => void) { emitter.once(event, cb); return this; },
-			off: function (event: string, cb: (...args: any[]) => void) { emitter.off(event, cb); return this; },
-			stop: () => {
-				if (stopping != null)
-					return stopping;
-
-				/* already setup the promise to ensure nested stop-calls will already see it set */
-				let resolver = () => { };
-				stopping = new Promise<void>((res) => resolver = res);
-
-				(async () => {
-					if (server != null)
-						await this.performServerCleanup(server, (listenLogged ? logger : null), who, attached, wss);
-
-					/* check if the cleanup can be removed from the stop list (only if stopping is not already in progress) */
-					if (!this._stop.stopping)
-						this._stop.listener = this._stop.listener.filter((v) => v != listener.stop);
-
-					this.emitEventSync(emitter, 'stopped');
-					resolver();
-				})();
-				return stopping;
-			}
-		};
-		const performFailure = (err: Error) => {
-			/* defer the failure to allow the caller to attach listeners */
-			process.nextTick(() => {
-				if (stopping == null)
-					this.emitEventSync(emitter, 'failed', err);
-				listener.stop();
-			});
-		};
-
-		/* check if the server is being stopped, in which case nothing will be listened to */
-		if (this._stop.stopping) {
-			this.error(`Stopped server cannot listen to ${who}`);
-			performFailure(new Error('Server already stopped'));
-			return listener;
-		}
-
-		/* setup the origin server */
-		try {
-			server = this.makeServer(options);
-		} catch (err: any) {
-			this.error(`Error creating server ${who}: ${err.message}`);
-			performFailure(err);
-			return listener;
-		}
-
-		/* register the handler properly and register the cleanup callback */
-		const attached = handler._rootAttachToServer(this, () => listener.stop());
-		const wss = new libWs.WebSocketServer({ noServer: true });
-		this._stop.listener.push(listener.stop);
-
-		/* register the corresponding connection handlers and error handlers */
-		const clientConfig = (options?.client != null ? libClient.BurntClientConfig.from(options.client) : this._config.client);
-		server.on('request', (req, resp) => {
-			const client = libClient.ClientRequest.fromRequest(protocol, req, resp, { cache: this._cache, config: clientConfig });
-			this.handleClient(req, client, attached, logger);
-		});
-		server.on('upgrade', (req, sock, head) => {
-			const client = libClient.ClientRequest.fromUpgrade(protocol, req, sock, head, { cache: this._cache, config: clientConfig, wss });
-			this.handleClient(req, client, attached, logger);
-		});
-		server.once('error', (err) => {
-			if (stopping != null) return;
-			this.error(`Error while listening to ${who}: ${err.message}`);
-			this.emitEventSync(emitter, 'failed', err);
-			listener.stop();
-		});
-		server.on('listening', () => {
-			if (stopping != null) return;
-			const address = this.fetchAddress(server)!;
-			this.info(`Successfully started ${who} on [${address.address}]:${address.port} [family: ${address.family}] as listener [${logger.logIdentity}] with handler [${handler.logIdentity}]`);
-			listenLogged = true;
-			this.emitEventSync(emitter, 'listening', address);
-		});
-
-		/* configure the server to have a minimum header receive timeout, overall connection-loss timeout,
-		*	and keep-alive timeout (no request-timeout, as this is handled manually by the throughput control) */
-		server.headersTimeout = this._config.headerTimeout;
-		server.timeout = this._config.connectionTimeout;
-		server.keepAliveTimeout = this._config.keepAliveTimeout;
-		server.requestTimeout = 0;
-
-		/* start the actual server listening */
-		try {
-			server.listen(options?.port, options?.hostname);
-		} catch (err: any) {
-			this.error(`Error starting listener ${who}: ${err.message}`);
-			performFailure(err);
-		}
-		return listener;
+		return Listener._fromParams(this, handler, ++this._nextEndpoint, this._stop, options ?? {});
 	}
 
 	/* shutdown the server and unlink all modules (immediately kills all open connections and listener; can be called multiple times) */
@@ -229,7 +57,7 @@ export class Server extends libLog.Logger {
 		/* stop all connections and listener */
 		this.info('Stopping server connections and modules');
 		const promises: Promise<void>[] = [];
-		for (const cb of this._stop.listener)
+		for (const cb of this._stop.list)
 			promises.push(cb());
 		await Promise.all(promises);
 
@@ -261,31 +89,304 @@ export class Server extends libLog.Logger {
 	/* link the given module to the server (automatically unlinked upon server stop) */
 	public linkModule(module: libHandler.ModuleHandler, unlinked?: () => void): libHandler.AttachedModule {
 		const cleanup = (): Promise<void> => attached.unlink();
-		this._stop.listener.push(cleanup);
+		this._stop.list.push(cleanup);
 
 		const attached = module._rootAttachToServer(this, () => {
 			if (unlinked != null)
 				unlinked();
 			if (!this._stop.stopping)
-				this._stop.listener = this._stop.listener.filter((v) => v != cleanup);
+				this._stop.list = this._stop.list.filter((v) => v != cleanup);
 		});
 
 		return attached;
 	}
 }
 
-/* either 'listening' or 'failed' is fired, followed at some point by a 'stopped' event */
-export interface Listener {
+/*
+*	Either 'listening' or 'failed' is fired, followed at some point by a 'stopped' event.
+*	'address' of 'listening' event is null for serverless listener.
+*/
+export class Listener {
+	private _host: {
+		self: Server;
+		stop: {
+			stopping: boolean;
+			list: (() => Promise<void>)[];
+		};
+	};
+	private _self: {
+		endpoint: string;
+		listening: string | null;
+		protocol: string;
+	};
+	private _stop: {
+		stoppedResolver: () => void;
+		stoppedPromise: Promise<void>;
+		stopping: boolean;
+	};
+	private _native: {
+		server: libHttp.Server | null;
+		wss: libWs.WebSocketServer;
+		attached: libHandler.AttachedModule;
+	};
+	private _handling: {
+		count: number;
+		promise: Promise<void> | null;
+		resolver: () => void;
+	};
+	private _emitter: libEvents.EventEmitter;
+	private _config: libClient.BurntClientConfig;
+
+	private constructor(server: Server, id: number, hostStop: { stopping: boolean, list: (() => Promise<void>)[] }, clientConfig: libClient.BurntClientConfig, handler: libHandler.ModuleHandler) {
+		this._host = { self: server, stop: hostStop };
+		this._self = { endpoint: `ep!${id}`, listening: null, protocol: '' };
+		this._emitter = new libEvents.EventEmitter();
+		this._config = clientConfig;
+		this._handling = { count: 0, promise: null, resolver: () => { } };
+
+		let stoppedResolver = () => { };
+		this._stop = { stoppedPromise: new Promise<void>((res) => stoppedResolver = res), stoppedResolver: () => { }, stopping: false };
+		this._stop.stoppedResolver = stoppedResolver;
+
+		/* register the handler and the cleanup callback */
+		const attached = handler._rootAttachToServer(this._host.self, () => this.stop());
+		const wss = new libWs.WebSocketServer({ noServer: true });
+		this._native = { wss, attached, server: null };
+		this._host.stop.list.push(this.stop);
+	}
+	private emitEventSync<K extends keyof ListenerEvents>(event: K, ...args: Parameters<ListenerEvents[K]>): void {
+		try {
+			this._emitter.emit(event as string, ...args);
+		}
+		catch (err: any) {
+			this._host.self.error(`Unhandled exception in ${event as string} listener: ${err.message}`);
+		}
+	}
+	private performServerListening(address: string | libNet.AddressInfo | null): void {
+		if (typeof address == 'string')
+			address = { address, port: 0, family: 'unix' };
+
+		if (address == null)
+			this._self.listening = 'serverless';
+		else
+			this._self.listening = `[${address.address}]:${address.port} [family: ${address.family}]`;
+
+		this._host.self.info(`Successfully started ${this._self.endpoint} on ${this._self.listening} with handler [${this._native.attached.module.identity}]`);
+		this.emitEventSync('listening', address);
+	}
+	private async handleClient(request: libHttp.IncomingMessage, client: libClient.ClientRequest): Promise<void> {
+		if (this._handling.count++ == 0)
+			this._handling.promise = new Promise<void>((res) => this._handling.resolver = res);
+		const endpoint = `${this._host.self.identity}.${this._self.endpoint}`;
+
+		/* register the completed log immediately to ensure it is logged as the first thing before the other completed awaits execute */
+		client.log(`Connected to [${endpoint}] using [method: ${request.method ?? '_'}] from [${request.socket.remoteAddress}]:${request.socket.remotePort} to [${client.url.hostname}]:[${request.url}] (user-agent: [${request.headers['user-agent'] ?? ''}])`);
+		client.completed.then(() => client.log(`Completed on [${endpoint}]`));
+
+		try {
+			await this._native.attached.handle(client);
+		} catch (err: any) {
+			client.respondInternalError(`Uncaught exception: ${err.message}`);
+		}
+
+		/* kill the connection on any errors, as the finalizing normally ensures that the response is completed */
+		try {
+			await client._finalizeConnection();
+		} catch (err: any) {
+			client.error(`Fatal error while finalizing [${client.identity}]: ${err.message}`);
+			request.destroy(new Error('Unhandled exception'));
+		}
+
+		if (--this._handling.count == 0) {
+			this._handling.promise = null;
+			this._handling.resolver();
+		}
+	}
+	private configure(options: ListenOptions): void {
+		this._self.protocol = ((options?.tls != null || options?.server?.secure === true || (options?.server == null && options?.shallow?.secure === true)) ? 'https' : 'http');
+		const who = `${this._self.protocol}:${options?.hostname ?? ''}:${options?.port ?? 0}`;
+
+		/* defer the failure to allow the caller to attach listeners */
+		const performFailure = (err: Error): void => {
+			process.nextTick(() => {
+				if (!this._stop.stopping)
+					this.emitEventSync('failed', err);
+				this.stop();
+			});
+		};
+
+		/* check if the server is being stopped, in which case nothing will be listened to */
+		if (this._host.stop.stopping) {
+			this._host.self.error(`Stopped server cannot listen to ${who}`);
+			return performFailure(new Error('Server already stopped'));
+		}
+
+		let server: libHttp.Server | null = null;
+		try {
+			/* setup the actual server server */
+			if (options?.tls != null) {
+				const config = {
+					requireHostHeader: true,
+					key: libFs.readFileSync(options.tls.key),
+					cert: libFs.readFileSync(options.tls.cert),
+					connectionsCheckingInterval: CONNECTION_TIMEOUT_CHECKING
+				};
+				server = libHttps.createServer(config);
+			}
+			else if (options?.server != null)
+				server = options.server.server;
+			else if (options?.shallow != null)
+				server = libHttp.createServer({ requireHostHeader: true, connectionsCheckingInterval: CONNECTION_TIMEOUT_CHECKING });
+		} catch (err: any) {
+			this._host.self.error(`Error creating server ${who}: ${err.message}`);
+			return performFailure(err);
+		}
+
+		/* check if this is a serverless run, in which case the server does not need to be configured further */
+		if (server == null)
+			return this.performServerListening(null);
+		this._native.server = server;
+
+		/* register the corresponding connection handlers and error handlers */
+		server.on('request', (req, resp) => this.handleRequest(req, resp));
+		server.on('upgrade', (req, sock, head) => this.handleUpgrade(req, sock, head));
+		server.once('error', (err) => {
+			if (this._stop.stopping) return;
+			this._host.self.error(`Error while listening to ${who}: ${err.message}`);
+			this.emitEventSync('failed', err);
+			this.stop();
+		});
+		server.on('listening', () => {
+			if (!this._stop.stopping)
+				this.performServerListening(server.address());
+		});
+
+		/* configure the server to have a minimum header receive timeout, overall connection-loss timeout,
+		*	and keep-alive timeout (no request-timeout, as this is handled manually by the throughput control) */
+		server.headersTimeout = this._host.self.config.headerTimeout;
+		server.timeout = this._host.self.config.connectionTimeout;
+		server.keepAliveTimeout = this._host.self.config.keepAliveTimeout;
+		server.requestTimeout = 0;
+
+		/* start the actual server listening */
+		try {
+			server.listen(options?.port, options?.hostname);
+		} catch (err: any) {
+			this._host.self.error(`Error starting listener ${who}: ${err.message}`);
+			return performFailure(err);
+		}
+	}
+
+	public static _fromParams(server: Server, handler: libHandler.ModuleHandler, id: number, hostStop: { stopping: boolean, list: (() => Promise<void>)[] }, options: ListenOptions): Listener {
+		const clientConfig = (options?.client != null ? libClient.BurntClientConfig.from(options.client) : server.config.client);
+		const listener = new Listener(server, id, hostStop, clientConfig, handler);
+		listener.configure(options);
+		return listener;
+	}
+
+	/* manually pass a request through the listener (takes ownership of the request; will kill the connection if the listener is not running anymore) */
+	public async handleRequest(request: libHttp.IncomingMessage, response: libHttp.ServerResponse): Promise<void> {
+		if (this._stop.stopping) {
+			request.destroy(new Error('Listener not running anymore'));
+			return;
+		}
+
+		const client = libClient.ClientRequest._fromRequest(this._self.protocol, request, response, this._config, this._host.self);
+		await this.handleClient(request, client);
+	}
+
+	/* manually pass an upgrade through the listener (takes ownership of the connection; immediately closes the connection if the listener is not running anymore) */
+	public async handleUpgrade(request: libHttp.IncomingMessage, socket: libStream.Duplex, head: Buffer): Promise<void> {
+		if (this._stop.stopping) {
+			request.destroy(new Error('Listener not running anymore'));
+			return;
+		}
+
+		const client = libClient.ClientRequest._fromUpgrade(this._self.protocol, request, socket, head, this._config, this._host.self, this._native.wss);
+		await this.handleClient(request, client);
+	}
+
+	/* server this listener belongs to */
+	public get server(): Server {
+		return this._host.self;
+	}
+
+	/* client configuration used for this listener */
+	public get config(): libClient.BurntClientConfig {
+		return this._config;
+	}
+
 	/* stop the listener and return promise which resolves once fully stopped */
-	stop(): Promise<void>;
+	public async stop(): Promise<void> {
+		if (this._stop.stopping)
+			return this._stop.stoppedPromise;
+		this._stop.stopping = true;
+
+		/* close the server and any existing connections within it */
+		let serverStopped: Promise<void> | null = null;
+		if (this._native.server != null) {
+			serverStopped = new Promise<void>((res) => this._native.server!.close(() => res()));
+			this._native.server.closeAllConnections();
+		}
+		else
+			serverStopped = Promise.resolve();
+
+		await this._native.attached.unlink();
+
+		/* close all of the web-sockets (after unlinking the module to
+		*	ensure it has a chance to clean the connections itself) */
+		const sockets: Promise<void>[] = [];
+		for (const ws of [...this._native.wss.clients]) {
+			if (ws.readyState == libWs.WebSocket.CLOSED)
+				continue;
+			sockets.push(new Promise<void>((res) => ws.on('close', () => res())));
+			ws.terminate();
+		}
+		await Promise.all(sockets);
+
+		/* wait for any handled connections to be over and for the server to be fully stopped */
+		while (this._handling.promise != null)
+			await this._handling.promise;
+		await serverStopped;
+
+		if (this._self.listening != null)
+			this._host.self.info(`Stopped ${this._self.endpoint} on ${this._self.listening} with handler [${this._native.attached.module.identity}]`);
+
+		/* check if the cleanup can be removed from the stop list (only if stopping is not already in progress) */
+		if (!this._host.stop.stopping)
+			this._host.stop.list = this._host.stop.list.filter((v) => v != this.stop);
+
+		this.emitEventSync('stopped');
+		this._stop.stoppedResolver();
+		return this._stop.stoppedPromise;
+	}
+
+	/* resolves once the server has stopped */
+	public get stopped(): Promise<void> {
+		return this._stop.stoppedPromise;
+	}
+
+	/* check if the server is still running */
+	public get running(): boolean {
+		return !this._stop.stopping;
+	}
 
 	/* -------- event handler interfaces -------- */
-	on<K extends keyof ListenerEvents>(event: K, listener: ListenerEvents[K]): Listener;
-	off<K extends keyof ListenerEvents>(event: K, listener: ListenerEvents[K]): Listener;
-	once<K extends keyof ListenerEvents>(event: K, listener: ListenerEvents[K]): Listener;
+	public on<K extends keyof ListenerEvents>(event: K, listener: ListenerEvents[K]): Listener {
+		this._emitter.on(event, listener);
+		return this;
+	}
+	public off<K extends keyof ListenerEvents>(event: K, listener: ListenerEvents[K]): Listener {
+		this._emitter.once(event, listener);
+		return this;
+	}
+	public once<K extends keyof ListenerEvents>(event: K, listener: ListenerEvents[K]): Listener {
+		this._emitter.off(event, listener);
+		return this;
+	}
 }
-type ListenerEvents = { 'listening': (address: libNet.AddressInfo) => void, 'failed': (err: Error) => void, 'stopped': () => void };
 
+/* server order: (tls > server > shallow > http.Server) */
 export interface ListenOptions {
 	/* port to listen on (omit/0 for an OS-assigned port) */
 	port?: number;
@@ -302,6 +403,9 @@ export interface ListenOptions {
 	/* custom configured server to be used (connectionsCheckingInterval must be configured
 	*	accordingly beforehand; ownership will be taken; secure to encode https compared to http) */
 	server?: { server: libHttp.Server, secure: boolean };
+
+	/* create a serverless listener, designed to only be passed connections to */
+	shallow?: { secure: boolean };
 }
 
 /* wrapper to create a simple server */

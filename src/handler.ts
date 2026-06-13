@@ -4,6 +4,7 @@ import * as libClient from "./client.js";
 import * as libLog from "./log.js";
 import * as libBase from "./base.js";
 import * as libServer from "./server.js";
+import * as libCache from "./cache.js";
 
 interface LinkedModules {
 	parent: ModuleHandler | null;
@@ -127,18 +128,14 @@ export abstract class ModuleHandler extends libLog.Logger {
 		return false;
 	}
 	private async _processIncomingClient(client: libClient.ClientRequest, params?: Params, translate?: PathTranslation): Promise<boolean> {
-		/* check if the client is already being handled or has already
-		*	been handled and otherwise process any outstanding tasks */
-		if (this._handling.active.has(client) || client.claimed)
-			return client.claimed;
+		/* ensure that any outstanding tasks have completed and then check if the client can be processed by this module */
 		await this._drainTaskQueue(false, null);
-
-		/* ensure that the handler is attached and push the mapping and path (client will validate it) */
-		if (!this._attachment.attached)
+		if (!this._attachment.attached || this._handling.active.has(client) || client.claimed || client.server != this._attachment.server)
 			return client.claimed;
-		const mapping = translate ?? { '/': '/' };
-		const logTag = (this._config.tagClients ? (this._config.tagString == '' ? this.logIdentity : this._config.tagString) : '');
-		const snapshot = client._pushTranslation(mapping, logTag);
+
+		/* setup the new mapping and path translation and check if the translation can be applied */
+		const logTag = (this._config.tagClients ? (this._config.tagString == '' ? this.identity : this._config.tagString) : '');
+		const snapshot = client._pushTranslation(translate ?? null, logTag);
 		if (snapshot == null)
 			return client.claimed;
 
@@ -241,12 +238,12 @@ export abstract class ModuleHandler extends libLog.Logger {
 		};
 		const validateLinkState = (parentServer: libServer.Server | null): boolean => {
 			if (this._stopped != null) {
-				this.warning(`Stopped module cannot be attached to [${parent.logIdentity}]`);
+				this.warning(`Stopped module cannot be attached to [${parent.identity}]`);
 				return false;
 			}
 			const thisServer = this._attachment.server;
 			if (thisServer != null && parentServer != null && thisServer != parentServer) {
-				this.warning(`Module attached to server [${thisServer.logIdentity}] cannot be attached to server [${parentServer.logIdentity}]`);
+				this.warning(`Module attached to server [${thisServer.identity}] cannot be attached to server [${parentServer.identity}]`);
 				return false;
 			}
 
@@ -254,7 +251,7 @@ export abstract class ModuleHandler extends libLog.Logger {
 				return true;
 
 			if (parent._stopped != null) {
-				this.warning(`Module cannot be attached to stopped module [${parent.logIdentity}]`);
+				this.warning(`Module cannot be attached to stopped module [${parent.identity}]`);
 				return false;
 			}
 			if (!recSearchParents(parent)) {
@@ -297,9 +294,9 @@ export abstract class ModuleHandler extends libLog.Logger {
 					logged = !stopping;
 					if (logged) {
 						if (parent instanceof libServer.Server || !firstAttachment)
-							this.info(`Attached to [${parent.logIdentity}]${detail}`);
+							this.info(`Attached to [${parent.identity}]${detail}`);
 						else
-							this.info(`Attached to [${parent.logIdentity}] and server [${parentServer.logIdentity}]${detail}`);
+							this.info(`Attached to [${parent.identity}] and server [${parentServer.identity}]${detail}`);
 					}
 				}
 			},
@@ -307,7 +304,7 @@ export abstract class ModuleHandler extends libLog.Logger {
 				if (stopping) return unlinkPromise;
 				stopping = true, link.setup = null;
 				if (logged)
-					this.info(`Detached from [${parent.logIdentity}]${detail}`);
+					this.info(`Detached from [${parent.identity}]${detail}`);
 
 				/* remove the link from the parent and add its cleanup to its task list (cleanup calls are only linked as task to the parent,
 				*	as the child does not care for them; this implies that the module's stop method itself does not await them either) */
@@ -370,13 +367,20 @@ export abstract class ModuleHandler extends libLog.Logger {
 	protected async handleStop(): Promise<void> { }
 
 	/* name of the module */
-	public get moduleName(): string {
+	public get name(): string {
 		return this._config.name;
 	}
 
-	/* server the module has been attached to (null if not yet attached) */
-	public get moduleServer(): libServer.Server | null {
+	/* server the module has been attached to (null if not yet initialized) */
+	public get server(): libServer.Server | null {
 		return this._attachment.server;
+	}
+
+	/* [throws] cache host to be used by this module (throws if not yet initialized) */
+	public get cache(): libCache.CacheHost {
+		if (this._attachment.server == null)
+			throw new Error('Not yet initialized');
+		return this._attachment.server.cache;
 	}
 
 	/* enable or disable the module tagging the logging of clients [default: true] */
@@ -453,7 +457,7 @@ export class DispatchModule extends ModuleHandler {
 
 		for (const [key, handler] of Object.entries(map)) {
 			if (key in this.mapping) {
-				this.warning(`Ignoring duplicate mapping [${key}] by [${handler.logIdentity}]`);
+				this.warning(`Ignoring duplicate mapping [${key}] by [${handler.identity}]`);
 				continue;
 			}
 
@@ -480,7 +484,7 @@ export class DispatchModule extends ModuleHandler {
 		}
 
 		if (bestMatch != null) {
-			client.trace(`Client dispatched to handler [${this.mapping[bestMatch].module.logIdentity}] for path [${bestMatch}]`);
+			client.trace(`Client dispatched to handler [${this.mapping[bestMatch].module.identity}] for path [${bestMatch}]`);
 			await this.mapping[bestMatch].handle(client, { translate: { [bestMatch]: '/' } });
 		}
 		else
@@ -504,7 +508,7 @@ export class HostModule extends ModuleHandler {
 		this.mapping = {};
 		for (const [host, handler] of Object.entries(map)) {
 			if (host in this.mapping) {
-				this.warning(`Ignoring duplicate mapping of host [${host}] by [${handler.logIdentity}]`);
+				this.warning(`Ignoring duplicate mapping of host [${host}] by [${handler.identity}]`);
 				continue;
 			}
 
@@ -541,7 +545,7 @@ export class HostModule extends ModuleHandler {
 		}
 
 		if (bestMatch != null) {
-			client.trace(`Client dispatched to handler [${this.mapping[bestMatch].module.logIdentity}] for host [${bestMatch}]`);
+			client.trace(`Client dispatched to handler [${this.mapping[bestMatch].module.identity}] for host [${bestMatch}]`);
 			await this.mapping[bestMatch].handle(client);
 		}
 		else
