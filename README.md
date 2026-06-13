@@ -1,128 +1,297 @@
-# \[MWS\] Modular-WebServer to Host various Modules for File Servers and Small Games
+# MWS - Modular Web Server
 ![TypeScript](https://img.shields.io/badge/language-TypeScript-blue?style=flat-square)
 [![License](https://img.shields.io/badge/license-BSD--3--Clause-brightgreen?style=flat-square)](LICENSE.txt)
 
-A lightweight TypeScript web server for hosting independent modules (file servers, games) with HTTP/HTTPS and WebSocket support. Modules are isolated from each other and from the core, and each module is responsible for a sub-branch in the URL path tree.
+A lightweight TypeScript framework for hosting isolated modules behind HTTP/HTTPS and WebSocket endpoints. Each module owns a subtree in the URL space and is isolated from its siblings. Modules compose into trees for path-based routing, hostname routing, and request interception.
 
-## Getting Started
-Clone the project and install dependencies:
+The server integrates various automation features, such as error handling, validations, caching... Further, it contains integrated logging for proper connection tracing and logging.
 
-	$ git clone https://github.com/BjoernBoss/mws-base.git
-	$ cd mws-base
-	$ npm install
+## Installation
+Only depends on [`ws`](https://github.com/websockets/ws) at runtime.
 
-Build and start the server:
+	$ npm install mws
 
-	$ npm run start
+Requires Node.js 22 or later.
 
-To build without starting (and optionally executing manually):
+## Quick Start
 
-	$ npm run build
-	$ node ./main.js
+```typescript
+import { Server, ModuleHandler, ClientRequest, Media } from "mws";
 
-This compiles all TypeScript sources and modules and runs `node main.js`, which loads `modules/setup.js` and starts listening on the configured ports. The `Run` method in the `modules/setup.js` script is hereby the primary interface to configure the server and corresponding modules to be loaded.
+class HelloModule extends ModuleHandler {
+	constructor() {
+		super('hello');
+	}
 
-An example for a `setup.js` could look like:
-
-```JavaScript
-import { Config as libConfig } from "core/config.js";
-
-export async function Run(server) {
-	try {
-		await libConfig.cacheWriteBack('./some_local_path/immutable.cache');
-
-		const mod = await import("my-module/app.js");
-		server.listenHttp(8080, new mod.MyModule(), (host) => host == 'localhost');
-	} catch (e) {
-		throw new Error(`Failed to load module: ${e.message}`);
+	protected override async handleRequest(client: ClientRequest): Promise<void> {
+		client.respond('Hello, World!', { media: Media.Text });
 	}
 }
+
+const server = new Server();
+server.listen(new HelloModule(), { port: 8080 });
 ```
 
-## Writing a Module
-Each module lives in `modules/<name>/` with its own `package.json`. The npm workspaces configuration automatically resolves cross-module imports. To write a module, extend the abstract `ModuleHandler` from `core/handler.ts`:
+For HTTPS, pass a TLS configuration:
 
-```TypeScript
-import * as libHandler from "core/handler.js";
-import * as libClient from "core/client.js";
-import * as libRequest from "core/request.js";
+```typescript
+server.listen(new HelloModule(), {
+	port: 443,
+	tls: { key: './privkey.pem', cert: './fullchain.pem' }
+});
+```
 
-export class MyModule extends libHandler.ModuleHandler {
+## Writing Modules
+
+A module extends `ModuleHandler` and implements up to three lifecycle hooks:
+
+```typescript
+import { ModuleHandler, ClientRequest, Server } from "mws";
+
+export class MyModule extends ModuleHandler {
 	constructor() {
 		super('my-module');
 	}
 
-	protected override async handleAttached(): Promise<void> {
-		/* module is now reachable in the URL space */
+	/* Called once when first attached to a server (directly or through a parent module) */
+	protected override async handleInitialize(server: Server): Promise<void> {
+		/* allocate resources, start timers */
 	}
-	protected override async handleRequest(client: libClient.HttpRequest, params?: object): Promise<void> {
-		client.respond('Hello from my module!', { media: libRequest.Media.Text });
+
+	/* Called for every incoming request routed to this module */
+	protected override async handleRequest(client: ClientRequest, params?: object): Promise<void> {
+		/* respond to the client */
 	}
-	protected override async handleUpgrade(client: libClient.HttpUpgrade, params?: object): Promise<void> {
-		/* handle WebSocket upgrades */
-	}
-	protected override async handleDetached(): Promise<void> {
-		/* module removed from URL space; all connections have drained (WebSockets need to be closed manually) */
-	}
+
+	/* Called once after the module has stopped and all clients have left;
+	   accepted WebSockets are still open and must be closed manually */
 	protected override async handleStop(): Promise<void> {
-		/* close timers and release resources */
+		/* release resources, close WebSockets */
 	}
 }
 ```
-Any requests not handled by a module, may be handled by parent modules, should they host child modules. If no module handles a request, a default `404 Not Found` is sent.
 
-**Important:** `server.stop()` waits for all active request handlers to complete before shutting down. Long-running handlers **must** check `client.claimed` or await `client.responded` to detect when the connection has been broken, and exit promptly. A handler that blocks unconditionally (e.g. an uncancellable `await`) will prevent the server from shutting down.
+Only `handleRequest` is required. Unhandled requests can be handled by parent modules or receive an automatic `404 Not Found`.
 
-The framework also provides default helper implementations of modules:
+Modules form a tree via `linkModule()`. They only ever see requests relative to their `root`. Path translation happens automatically when dispatching to children — client paths are rebased relative to each child module's position in the tree. A module can be linked to multiple parents and will only be initialized once, on first attachment to a server.
 
-- **`LambdaModule`** handles requests/upgrades via callback functions
-- **`DispatchModule`** routes requests by URL path prefix to child modules
-- **`HostModule`** routes requests by URL hostname prefix to child modules
-- **`UnhandledModule`** wraps a module and catches unhandled requests with a fallback
-- **`WrapModule`** intercepts requests before/after passing them to an inner module
+### Header and HTML Patching
 
-```JavaScript
-const dispatch = new libHandler.DispatchModule({
-	'/api': apiModule,
-	'/static': fileModule
+Parent modules can register patches that modify outgoing headers or HTML pages before they are sent to the client:
+
+```typescript
+/* called just before headers are sent (in reverse registration order) */
+client.patchHeaders((status, headers) => {
+	headers['X-Custom'] = 'value';
 });
-const unhandled = new libHandler.UnhandledModule(dispatch, {
-	handle: async (client) => { client.respond('Custom not found', { status: libRequest.Status.NotFound }); }
+
+/* called just before an HTML page is finalized (in reverse registration order) */
+client.patchHtmlPage(async (page, status, headers) => {
+	page.head.push(build.LoadScript('/analytics.js'));
 });
-server.listenHttp(8080, unhandled, (host) => host == 'localhost');
 ```
 
-### Internal Methods
-Methods prefixed with `_` (e.g. `_attachToRoot`, `_pushTranslation`, `_finishConnection`) are framework-internal and **must not** be called by module implementations. They are used by the server and handler infrastructure to manage connection lifecycle and path translation. Despite being `public` in TypeScript (required for cross-class access within the framework), they are not part of the public API and may change without notice.
+Patches are scoped to the current handler context and automatically removed when the handler returns.
 
-## Core Components
-The `core` workspace provides all server functionality:
+### Shutdown
 
-| File | Purpose |
-|---|---|
-| `handler.ts` | `ModuleHandler` abstract class, and helper modules: `LambdaModule`, `DispatchModule`, `HostModule`, `UnhandledModule`, `WrapModule` |
-| `client.ts` | `HttpRequest` (response helpers, body receiving, file serving), `HttpUpgrade` and `ClientSocket` (WebSocket), `HttpClient` type union |
-| `request.ts` | HTTP status codes, media types, range parsing, and encoding negotiation (gzip, deflate, brotli, zstd) |
-| `server.ts` | `Server` class managing HTTP/HTTPS listeners with host-header validation |
-| `config.ts` | `CoreConfig` class and global `Config` instance for server name, timeouts, cache settings, common response headers, throughput controls |
-| `cache.ts` | File cache with LRU eviction, immutable file versioning, sync/async read, and streaming |
-| `builder.ts` | Programmatic HTML page construction, placeholder expansion, HTML escaping via `HtmlGuard` |
-| `location.ts` | Path sanitization, joining, and sub-directory checks |
-| `log.ts` | Logging with console, file (with rotation), and custom logger support |
+`server.stop()` waits for all active request handlers to complete before shutting down. Long-running handlers **must** check `client.claimed` or await `client.responded` to detect when the connection has been broken, and exit promptly.
 
-## Configuration
-The `modules/setup.js` `Run` method receives a `Server` instance and is responsible for all configuration:
+### Stopping Individual Modules
 
-- **Config:** `libConfig.Config` exposes server name, timeouts, and cache settings (via `core/config.js`). Default initialized via `libConfig.Initialize()`, which is called by `main.js`
-- **Logging:** `libLog.AddLogger(...)` for file or custom loggers (via `core/log.js`)
-- **Listeners:** `server.listenHttp(port, module, hostCheck)` or `server.listenHttps(port, key, cert, module, hostCheck)`
+Calling `module.stop()` detaches the module and waits for its active clients to drain. By default, a module stops automatically when all its parents unlink it; this can be disabled with `module.stopOnDetach(false)`.
+
+## Helper Modules
+
+Factory functions create common module patterns without subclassing:
+
+### dispatch — Path Routing
+
+Routes requests to children by longest URL path match. Stops itself once all children have been unlinked.
+
+```typescript
+import { Server, dispatch } from "mws";
+
+const server = new Server();
+server.listen(dispatch({
+	'/api': apiModule,
+	'/static': staticModule
+}), { port: 8080 });
+```
+
+### host — Hostname Routing
+
+Routes requests to children by longest hostname match (supports sub-domain matching).
+
+```typescript
+import { Server, host } from "mws";
+
+server.listen(host({
+	'api.example.com': apiModule,
+	'example.com': mainModule
+}), { port: 8080 });
+```
+
+### bind — Parameter and Translation Binding
+
+Forwards all requests to a single child handler, optionally injecting `params` and a path `translate` map.
+
+```typescript
+import { bind } from "mws";
+
+const bound = bind(myModule, {
+	params: { role: 'admin' },
+	translate: { '/v2': '/' }
+});
+```
+
+### check — Host and Port Validation
+
+Validates the request hostname and port before forwarding. Responds `404` and kills the connection on mismatch.
+
+```typescript
+import { check } from "mws";
+
+const checked = check(myModule, ['localhost', '127.0.0.1'], { port: 8080 });
+```
+
+### lambda — Callback-Based Handler
+
+Handles requests via callbacks instead of subclassing, with optional attached child modules.
+
+```typescript
+import { lambda, ClientRequest, Server, AttachedModule } from "mws";
+
+const handler = lambda({
+	attach: { api: apiModule },
+	setup: async function (server: Server, links: Record<string, AttachedModule>) {
+		/* runs on first attachment */
+	},
+	handle: async function (client: ClientRequest, params, links) {
+		if (client.isSubPathOf('/api'))
+			await links.api.handle(client, { translate: { '/api': '/' } });
+		else
+			client.respondNotFound();
+	},
+	stop: async function (links) {
+		/* cleanup */
+	}
+});
+```
+
+## Request Handling
+
+`ClientRequest` automatically manages requests to handle errors, prevent double-responses, and ensure expected HTTP behavior.
+
+### Receiving Data
+
+```typescript
+/* as a complete buffer */
+const data = await client.receiveAllBuffer(1_000_000);
+
+/* as a decoded string */
+const text = await client.receiveAllText('utf-8', 1_000_000);
+
+/* as a readable stream */
+const stream = client.receiveData(1_000_000);
+
+/* directly to a file (fails if the file already exists) */
+await client.receiveToFile('/uploads/file.bin', 10_000_000);
+```
+
+### Responding
+
+```typescript
+/* simple text or buffer */
+client.respond('OK', { media: Media.Text, status: Status.Ok });
+
+/* streaming response */
+const writer = client.respondData({ media: Media.Json, dynamicEncode: true });
+writer.end(JSON.stringify(data));
+
+/* file with automatic range requests, etag, last-modified, encoding, and caching */
+if (!await client.tryRespondFile('/var/www/index.html'))
+	client.respondNotFound();
+
+/* HTML page */
+await client.respondHtml(page, { status: Status.Ok });
+```
+
+Convenience methods: `respondOk`, `respondNotFound`, `respondBadRequest`, `respondForbidden`, `respondInternalError`, `respondConflict`, `respondSeeOther`, `respondTemporaryRedirect`, `respondPermanentRedirect`, `respondCreated`, and others.
+
+## WebSocket
+
+```typescript
+protected override async handleRequest(client: ClientRequest): Promise<void> {
+	const ws = await client.acceptWebSocket();
+	if (ws == null) return;
+
+	ws.on('data', (data: Buffer) => {
+		ws.send(data);
+	});
+	ws.on('close', () => {
+		/* cleanup */
+	});
+}
+```
+
+`ClientSocket` handles alive checks automatically via configurable ping/pong intervals (`ClientConfig.webSocketTimeout`, `ClientConfig.webSocketAliveTimeout`).
+
+Non-upgrade requests that reach `acceptWebSocket()` receive an automatic `426 Upgrade Required` response.
 
 ## Caching
 
-MWS has a two-layer caching system: a server-side in-memory file cache and HTTP cache headers for client-side caching.
-The in-memory file cache is used to serve frequently used content. Optionally, it determines freshness before every read.
+`Server` provides integrated caching with a two-layer system:
 
-On top of the in-memory caching, the cache system also allows for immutable versioned unique paths to be used, which allows clients to cache entries immutably.
-For this, the given paths are tagged with a unique id (`style.css` becomes `style.<id>.css`), which is then associated with the given version of the file. This allows content to serve the file as immutable, as the path will change, if the file changes.
+### In-Memory File Cache
 
-Other features for caching include the support for `etag` and `last-modified` to allow clients to identify freshness of their cached content.
+An LRU cache for frequently served files. Encoded variants (gzip, brotli, ...) are cached alongside the original.
+
+`client.tryRespondFile()` reads through this cache automatically.
+
+### Immutable Versioned Paths
+
+File paths can be tagged with a unique version identifier so clients can cache them immutably:
+
+```typescript
+/* style.css becomes style.<id>.css — the id changes when the file changes */
+const versionedPath = server.cache.immutable('my-handler', '/static/style.css');
+```
+
+When a request arrives for an immutable path, the cache strips the version tag, serves the underlying file, and redirects stale version tags to the current one. Set `CacheConfig.immutableStatePath` to persist version mappings across restarts.
+
+### Direct Cache Access
+
+```typescript
+const buffer = await server.cache.read('/path/to/data.json');
+await server.cache.write('/path/to/output.json', JSON.stringify(data));
+server.cache.flush();
+```
+
+## HTML Building
+
+The `build` namespace provides programmatic HTML construction with automatic escaping:
+
+```typescript
+import { build } from "mws";
+
+const page = new build.HtmlPage({
+	head: [
+		build.Title('My Page'),
+		build.Meta('viewport', 'width=device-width, initial-scale=1'),
+		build.LoadStyle('/style.css'),
+		build.LoadScript('/app.js', { defer: '' })
+	],
+	body: [
+		build.Div({ id: 'root' }, [
+			build.Text('Hello, World!')
+		])
+	]
+});
+```
+
+Plain strings passed as `HtmlString` values are automatically HTML-escaped. Use `build.Safe(content)` to mark trusted content that should not be escaped.
+
+## Internal Methods
+
+Methods prefixed with `_` (e.g. `_rootAttachToServer`, `_pushTranslation`, `_restoreSnapshot`) are framework-internal and **must not** be called by module implementations. They are `public` for cross-class access within the framework, but are not part of the public API and may change without notice.

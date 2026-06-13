@@ -1,9 +1,0 @@
-{
-	"type": "module",
-	"private": true,
-	"name": "mws",
-	"scripts": {
-		"build": "tsc"
-	},
-	"main": "index.js"
-}

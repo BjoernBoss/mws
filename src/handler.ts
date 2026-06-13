@@ -547,8 +547,9 @@ export class HostModule extends ModuleHandler {
 }
 
 /*
-*	Simple module interface implementation, which forwards any requests to a lambda.
-*	Stops itself once the child has been unlinked. Own parameters are not forwarded.
+*	Simple module interface implementation, which forwards any requests to a child handler
+*	with optional parameter and translation binding. Stops itself once the child has been unlinked.
+*	Own parameters are not forwarded.
 */
 export function bind(handler: ModuleHandler, options?: { params?: object, translate?: PathTranslation, name?: string }): BindModule {
 	return new BindModule(handler, options);

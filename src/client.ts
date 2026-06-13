@@ -201,8 +201,8 @@ export type HtmlPatch = (page: libBuilder.HtmlPage, status: libBase.StatusType, 
 *	
 *	A response sent while another is being prepared (acknowledged) will override it and close the connection.
 *	A response sent while data is already being streamed (header sent) will break the connection.
-*	Normal responses automatically add Config.responseCacheControl, if no other cache control is specified.
-*	File responses will automatically add Config.fileCacheControl/Config.immutableCacheControl, if no other cache control is specified.
+*	Normal responses automatically add ClientConfig.responseCacheControl, if no other cache control is specified.
+*	File responses will automatically add ClientConfig.fileCacheControl/ClientConfig.immutableCacheControl, if no other cache control is specified.
 *	Responses will either use the dedicated responder interface and its highWaterMark, or a responder interface, which caches up to socket.highWaterMark.
 *
 *	Upgrade requests, which were not accepted, will be closed after responding.
@@ -1340,7 +1340,7 @@ export class ClientRequest extends ClientBase {
 
 	/* respond with html, can be built on by parent modules, sent once the request has been fully processed
 	*	(default status is ok; for HEAD builds, no actual content will be constructed or estimated in size)
-	*	automatically adds Config.responseCacheControl, if no other cache control is specified */
+	*	automatically adds ClientConfig.responseCacheControl, if no other cache control is specified */
 	public async respondHtml(page: libBuilder.HtmlPage, options?: { status?: libBase.StatusType, headers?: Record<string, string> }): Promise<void> {
 		if (this._state.response != ResponseState.none)
 			return this.badClientUsage('HTML response on already claimed connection', false);
@@ -1373,7 +1373,7 @@ export class ClientRequest extends ClientBase {
 	/* [no-throw but errors] send data with [media type] and [status] and return a writable stream (default: status is ok, media is unknown, dynamicEncode is true);
 	*	if a content size is provided, stream expects exactly this amount of bytes; if [dynamicEncode], the encoder will be dynamically negotiated
 	*	based on the content; for a HEAD request, no encoding will be negotiated, no lengths verified, and the written data will just be drained
-	*	(can immediately be ended using '.end()'); automatically adds Config.responseCacheControl, if no other cache control is specified */
+	*	(can immediately be ended using '.end()'); automatically adds ClientConfig.responseCacheControl, if no other cache control is specified */
 	public respondData(options?: { status?: libBase.StatusType, media?: libBase.MediaType, contentSize?: number, dynamicEncode?: boolean, headers?: Record<string, string> }): libStream.Writable {
 		const status: libBase.StatusType = options?.status ?? libBase.Status.Ok;
 		const headers = (options?.headers ?? {});
@@ -1388,7 +1388,7 @@ export class ClientRequest extends ClientBase {
 	*	re-validate the file stats on disk before serving from cache; the media type can be overwritten (defaults to extracting media-type
 	*	from the file-path); [encoding] describes the encoding of a pre-encoded file (warning: no checks against accepted encodings
 	*	performed!); status will be [Ok], [partial-content], [not-modified] or according errors cache aware and etag/last-modified aware;
-	*	automatically adds Config.fileCacheControl/Config.immutableCacheControl, if no other cache control is specified */
+	*	automatically adds ClientConfig.fileCacheControl/ClientConfig.immutableCacheControl, if no other cache control is specified */
 	public async tryRespondFile(filePath: string, options?: { encoded?: string, media?: libBase.MediaType, headers?: Record<string, string>, checkFreshness?: boolean }): Promise<boolean> {
 		if (options == null)
 			options = {};
@@ -1678,7 +1678,7 @@ export class ClientRequest extends ClientBase {
 /*
 *	WebSocket with integrated alive checks.
 *	Structured WebSocket, which takes care of error handling.
-*	close() is guaranteed to be called exactly once and no data or others will follow.
+*	The 'close' event is guaranteed to fire exactly once and no 'data' events will follow.
 *	Takes ownership of the socket.
 */
 export class ClientSocket extends ClientBase {

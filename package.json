@@ -1,20 +1,40 @@
 {
+	"name": "mws",
+	"version": "1.0.0",
 	"type": "module",
-	"private": true,
-	"dependencies": {
-		"ws": "^8.18.1"
+	"description": "Modular WebServer — a TypeScript framework for hosting isolated modules behind HTTP/HTTPS+WebSocket endpoints",
+	"license": "BSD-3-Clause",
+	"main": "dist/index.js",
+	"types": "dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"default": "./dist/index.js"
+		},
+		"./*.js": {
+			"types": "./dist/*.d.ts",
+			"default": "./dist/*.js"
+		},
+		"./package.json": "./package.json"
 	},
-	"workspaces": [
-		"core",
-		"modules/*"
+	"files": [
+		"dist/**/*.js",
+		"dist/**/*.d.ts"
 	],
+	"scripts": {
+		"build": "tsc",
+		"start": "tsc && node ./main.js",
+		"test": "tsc && node --test test.js"
+	},
+	"dependencies": {
+		"ws": "^8.18.1",
+		"@types/ws": "^8.18.1"
+	},
 	"devDependencies": {
 		"@types/node": "^25.6.0",
-		"@types/ws": "^8.18.1",
 		"typescript": "^6.0.3"
 	},
-	"scripts": {
-		"start": "npm run build && node ./main.js",
-		"build": "npm run build --ws --if-present"
+	"engines": {
+		"node": ">=22.0.0"
 	}
 }
