@@ -45,7 +45,7 @@ export const Media = {
 	Png: { fileEnding: ['png'], mediaType: 'image/png', encoding: '', compressible: false },
 	Gif: { fileEnding: ['gif'], mediaType: 'image/gif', encoding: '', compressible: false },
 	Jpg: { fileEnding: ['jpg', 'jpeg'], mediaType: 'image/jpeg', encoding: '', compressible: false },
-	Svg: { fileEnding: ['svg'], mediaType: 'image/svg+xml', encoding: '', compressible: true },
+	Svg: { fileEnding: ['svg'], mediaType: 'image/svg+xml', encoding: 'charset=utf-8', compressible: true },
 	Unknown: { fileEnding: [], mediaType: 'application/octet-stream', encoding: '', compressible: false }
 } as const satisfies Record<string, MediaType>
 
@@ -60,31 +60,31 @@ export const Encoding = {
 		name: 'br',
 		makeDecode: () => libZlib.createBrotliDecompress(),
 		makeEncode: () => libZlib.createBrotliCompress(),
-		encodeBuffer: (buffer: Buffer) => libZlib.brotliCompressSync(buffer)
+		encodeBuffer: (buffer: Buffer): Buffer => libZlib.brotliCompressSync(buffer)
 	},
 	Zstd: {
 		name: 'zstd',
 		makeDecode: () => libZlib.createZstdDecompress(),
 		makeEncode: () => libZlib.createZstdCompress(),
-		encodeBuffer: (buffer: Buffer) => libZlib.zstdCompressSync(buffer)
+		encodeBuffer: (buffer: Buffer): Buffer => libZlib.zstdCompressSync(buffer)
 	},
 	Gzip: {
 		name: 'gzip',
 		makeDecode: () => libZlib.createGunzip(),
 		makeEncode: () => libZlib.createGzip(),
-		encodeBuffer: (buffer: Buffer) => libZlib.gzipSync(buffer)
+		encodeBuffer: (buffer: Buffer): Buffer => libZlib.gzipSync(buffer)
 	},
 	Deflate: {
 		name: 'deflate',
 		makeDecode: () => libZlib.createInflate(),
 		makeEncode: () => libZlib.createDeflate(),
-		encodeBuffer: (buffer: Buffer) => libZlib.deflateSync(buffer)
+		encodeBuffer: (buffer: Buffer): Buffer => libZlib.deflateSync(buffer)
 	},
 	Identity: {
 		name: 'identity',
 		makeDecode: () => new libStream.PassThrough(),
 		makeEncode: () => new libStream.PassThrough(),
-		encodeBuffer: (buffer: Buffer) => buffer
+		encodeBuffer: (buffer: Buffer): Buffer => buffer
 	}
 } as const satisfies Record<string, EncodingType>
 

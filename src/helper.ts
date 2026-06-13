@@ -342,7 +342,7 @@ export function joinSanitized(a: string, b: string): string {
 	return sanitize(bSlash ? a + b : `${a}/${b}`, false);
 }
 
-/* check if the sanitized path is a sub-path of or equal to the sanitized base path */
+/* check if the sanitized path is a sub-path of or equal to the sanitized base path (can be /base or /base/...) */
 export function isSubPath(base: string, path: string): boolean {
 	if (base.length > path.length)
 		return false;
@@ -353,13 +353,13 @@ export function isSubPath(base: string, path: string): boolean {
 	return (path[base.length] == '/' || base.endsWith('/'));
 }
 
-/* check if the sanitized path is a true sub-path of the sanitized base path */
+/* check if the sanitized path is a true sub-path of the sanitized base path (must be truly inside: /base/...) */
 export function isInside(base: string, path: string): boolean {
 	if (base.length >= path.length)
 		return false;
 	if (!path.startsWith(base))
 		return false;
-	return (path[base.length] == '/' || base.endsWith('/'));
+	return ((path[base.length] == '/' && base.length + 1 < path.length) || base.endsWith('/'));
 }
 
 /* return the remaining path for the sub directory path in base (must be a true sub-directory) */

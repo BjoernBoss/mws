@@ -20,36 +20,41 @@ function readStats(path: string): null | [number, number] {
 	} catch (err: any) {
 		if (err.code == 'ENOENT')
 			return null;
-		throw new Error(`Filesystem error while checking [${path}]: ${err.message}`);
+		throw err;
 	}
 	return null;
 }
-async function atomicWrite(path: string, content: Buffer, logger: libLog.Logger, options?: { what?: string, temporary?: string }): Promise<boolean> {
+async function atomicWrite(path: string, content: Buffer, logger: libLog.Logger, options?: { what?: string, temporary?: string, create?: boolean }): Promise<boolean> {
 	const tempPath = (options?.temporary ?? `${path}.temp`);
+	logger.trace(`Writing ${options?.what ?? 'data'} to [${path}]`);
+
+	if (options?.create === true) {
+		try { libFsPromises.writeFile(path, content, { flag: 'wx' }); }
+		catch (err: any) {
+			if (err.code == 'EEXIST')
+				return false;
+			throw new Error(`Failed to create file: ${err.message}`);
+		}
+		return true;
+	}
 
 	let written = false;
 	try {
-		logger.trace(`Writing ${options?.what ?? 'data'} to [${path}]`);
-
-		/* write the content to the temporary file */
 		await libFsPromises.writeFile(tempPath, content);
 		written = true;
 		await libFsPromises.rename(tempPath, path);
-		return true;
 	} catch (err: any) {
-		if (written)
-			logger.error(`Failed to replace the original file [${path}]: ${err.message}`);
-		else
-			logger.error(`Failed to write to temporary file [${tempPath}]: ${err.message}`);
-
 		try {
 			await libFsPromises.unlink(tempPath);
 		} catch (err: any) {
 			if (err.code != 'ENOENT')
 				logger.warning(`Failed to remove temporary file [${tempPath}]: ${err.message}`);
 		}
+		if (written)
+			throw new Error(`Failed to replace the original file: ${err.message}`);
+		throw new Error(`Failed to write to temporary file [${tempPath}]: ${err.message}`);
 	}
-	return false;
+	return true;
 }
 
 interface CacheEntry {
@@ -101,9 +106,10 @@ class CacheManager {
 			this.reduce(this.totalCapacity - data.byteLength);
 
 		/* add the entry to the cache */
-		this.logger.log(`Added [${path}] to the cache (Size: ${data.byteLength})`);
 		this.allocated += data.byteLength;
 		this.map[path] = { data, encodings: {}, mtime, touched: ++this.nextStamp, age };
+
+		this.logger.log(`Added [${path}] to the cache (Size: ${data.byteLength} / Allocated: ${this.allocated})`);
 	}
 	public addEncoding(path: string, data: Buffer, age: number, name: string): void {
 		if (!this.cacheable(data.byteLength))
@@ -124,14 +130,14 @@ class CacheManager {
 			return;
 
 		/* add the entry to the cache */
-		this.logger.log(`Added encoding [${name}] of [${path}] to the cache (Size: ${data.byteLength})`);
 		this.allocated += data.byteLength;
 		this.map[path].encodings[name] = data;
+
+		this.logger.log(`Added encoding [${name}] of [${path}] to the cache (Size: ${data.byteLength} / Allocated: ${this.allocated})`);
 	}
 	public drop(path: string): void {
 		if (!(path in this.map))
 			return;
-		this.logger.log(`Dropped [${path}] and encodings from the cache`);
 
 		/* remove all cached encodings and the entry itself */
 		const entry = this.map[path];
@@ -139,6 +145,8 @@ class CacheManager {
 			this.allocated -= entry.encodings[key].byteLength;
 		this.allocated -= entry.data.byteLength;
 		delete this.map[path];
+
+		this.logger.log(`Dropped [${path}] and encodings from the cache (Allocated: ${this.allocated})`);
 	}
 	public cacheable(size: number): boolean {
 		return (size <= this.largestSize && size <= this.totalCapacity);
@@ -249,7 +257,11 @@ class ImmutableManager {
 			const content: string = JSON.stringify(output);
 
 			/* ignore any read/write failures */
-			await atomicWrite(this.writeBack.path, Buffer.from(content, 'utf-8'), this.logger, { what: 'immutable state' });
+			try {
+				await atomicWrite(this.writeBack.path, Buffer.from(content, 'utf-8'), this.logger, { what: 'immutable state' });
+			} catch (err: any) {
+				this.logger.error(`Failed to write immutable state to [${this.writeBack.path}]: ${err.message}`);
+			}
 		}
 
 		this.writeBack.writing = null;
@@ -710,6 +722,7 @@ export interface EncodedCache {
 	readSync(): Buffer;
 }
 
+/* all cache host operations which may throw errors and will not log them, and dont guarantee to contain the failing file path */
 export class CacheHost extends libLog.Logger {
 	private _cacheManager: CacheManager;
 	private _immutableManager: ImmutableManager;
@@ -788,23 +801,33 @@ export class CacheHost extends libLog.Logger {
 
 	/* [throws] read the data directly into a buffer (designed for modules to interact with) */
 	public async read(path: string, options?: { checkFreshness?: boolean }): Promise<Buffer | null> {
-		const entry = this.resolveCache(path, options?.checkFreshness ?? false, false) as (Cached | null);
-		if (entry == null)
-			return null;
-		return entry.read();
+		try {
+			const entry = this.resolveCache(path, options?.checkFreshness ?? false, false) as (Cached | null);
+			if (entry == null)
+				return null;
+			return entry.read();
+		}
+
+		/* special abstraction to ensure check-before-use does not result in not-found */
+		catch (err: any) {
+			if (err.code == 'ENOENT')
+				return null;
+			throw err;
+		}
 	}
 
-	/* [throws] write data atomically to the disk and update the cache (designed for modules to interact
-	*	with; writes as utf-8; writes data first to temporary file and then replaces the file atomically) */
-	public async write(path: string, data: Buffer | string, options?: { what?: string, temporary?: string }): Promise<void> {
+	/* [throws] write data atomically to the disk and update the cache (designed for modules to interact with;
+	*	writes as utf-8; writes data first to temporary file and then replaces the file atomically; for create,
+	*	must not replace an existing file; returns false if the file already existed and could not be created) */
+	public async write(path: string, data: Buffer | string, options?: { what?: string, temporary?: string, create?: boolean }): Promise<boolean> {
 		if (typeof data == 'string')
 			data = Buffer.from(data, 'utf-8');
 
-		/* write the data atomically to the destination */
-		if (!await atomicWrite(path, data, this, { what: (options?.what ?? 'via cache'), temporary: options?.temporary }))
-			throw new Error('Failed to atomically write data');
+		/* write the data atomically to the destination (let errors propagate out) */
+		if (!await atomicWrite(path, data, this, { what: (options?.what ?? 'via cache'), temporary: options?.temporary, create: options?.create }))
+			return false;
 		if (!this._cacheManager.cacheable(data.byteLength))
-			return;
+			return true;
 		const age = this._cacheManager.allocAge();
 
 		/* fetch the new state and update the cache (let errors propagate out; only if the write-state seems consistent) */
@@ -813,6 +836,26 @@ export class CacheHost extends libLog.Logger {
 			this._cacheManager.drop(path);
 		else if (stats[0] == data.byteLength)
 			this._cacheManager.add(path, data, stats[1], age);
+		return true;
+	}
+
+	/* [throws] remove the data from the physical disk and from the cache (returns false if it did not exist) */
+	public async remove(path: string): Promise<boolean> {
+		let existed: boolean = true;
+
+		/* try to remove the physical file */
+		try {
+			libFsPromises.unlink(path);
+		}
+		catch (err: any) {
+			if (err.code != 'ENOENT')
+				throw err;
+			existed = false;
+		}
+
+		/* remove the data from the cache */
+		this._cacheManager.drop(path);
+		return existed;
 	}
 }
 

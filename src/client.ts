@@ -70,12 +70,12 @@ class ClientBase extends libLog.Logger {
 		return this._config
 	}
 
-	/* check if the path relative to the current module is a sub path of the given test base path */
+	/* check if the path relative to the current module is a sub path or the same of the given test base path (can be /base or /base/...) */
 	public isSubPathOf(base: string): boolean {
 		return libHelper.isSubPath(base, this._path);
 	}
 
-	/* check if the path relative to the current module is inside of the given test base path */
+	/* check if the path relative to the current module is inside of the given test base path (must be truly inside; /base/...) */
 	public isInsideOf(base: string): boolean {
 		return libHelper.isInside(base, this._path);
 	}
@@ -1405,7 +1405,7 @@ export class ClientRequest extends ClientBase {
 				return false;
 		}
 		catch (err: any) {
-			this.respondInternalError(`Failed to read file: ${err.message}`);
+			this.respondInternalError(`Failed to read file [${filePath}]: ${err.message}`);
 			return true;
 		}
 		if (typeof cached == 'string') {
@@ -1518,7 +1518,7 @@ export class ClientRequest extends ClientBase {
 			source.pipe(stream);
 			source.once('error', (err: any) => {
 				if (settled) return; settled = true;
-				this.respondInternalError(`Failed to stream file: ${err.message}`);
+				this.respondInternalError(`Failed to stream file [${filePath}]: ${err.message}`);
 				stream.destroy(err);
 			});
 			stream.once('error', (err: any) => {
