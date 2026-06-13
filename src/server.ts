@@ -28,7 +28,7 @@ export class Server extends libLog.Logger {
 	private _nextEndpoint: number;
 
 	constructor(config?: ServerConfig) {
-		super('server');
+		super(config?.name ?? 'server');
 
 		this.info(`Server created`);
 		this._config = new BurntServerConfig(config);
@@ -128,6 +128,7 @@ export class Listener {
 		server: libHttp.Server | null;
 		wss: libWs.WebSocketServer;
 		attached: libHandler.AttachedModule;
+		cleanup: () => Promise<void>;
 	};
 	private _handling: {
 		count: number;
@@ -139,7 +140,7 @@ export class Listener {
 
 	private constructor(server: Server, id: number, hostStop: { stopping: boolean, list: (() => Promise<void>)[] }, clientConfig: libClient.BurntClientConfig, handler: libHandler.ModuleHandler) {
 		this._host = { self: server, stop: hostStop };
-		this._self = { endpoint: `ep!${id}`, listening: null, protocol: '' };
+		this._self = { endpoint: `endpoint!${id}`, listening: null, protocol: '' };
 		this._emitter = new libEvents.EventEmitter();
 		this._config = clientConfig;
 		this._handling = { count: 0, promise: null, resolver: () => { } };
@@ -151,8 +152,8 @@ export class Listener {
 		/* register the handler and the cleanup callback */
 		const attached = handler._rootAttachToServer(this._host.self, () => this.stop());
 		const wss = new libWs.WebSocketServer({ noServer: true });
-		this._native = { wss, attached, server: null };
-		this._host.stop.list.push(this.stop);
+		this._native = { wss, attached, server: null, cleanup: () => this.stop() };
+		this._host.stop.list.push(this._native.cleanup);
 	}
 	private emitEventSync<K extends keyof ListenerEvents>(event: K, ...args: Parameters<ListenerEvents[K]>): void {
 		try {
@@ -203,8 +204,8 @@ export class Listener {
 		}
 	}
 	private configure(options: ListenOptions): void {
-		this._self.protocol = ((options?.tls != null || options?.server?.secure === true || (options?.server == null && options?.shallow?.secure === true)) ? 'https' : 'http');
-		const who = `${this._self.protocol}:${options?.hostname ?? ''}:${options?.port ?? 0}`;
+		this._self.protocol = ((options.tls != null || options.server?.secure === true || (options.server == null && options.serverless?.secure === true)) ? 'https' : 'http');
+		const who = (options.tls == null && options.server == null && options.serverless != null ? 'serverless' : `${this._self.protocol}|${options.hostname ?? ''}:${options.port ?? 0}`);
 
 		/* defer the failure to allow the caller to attach listeners */
 		const performFailure = (err: Error): void => {
@@ -214,17 +215,18 @@ export class Listener {
 				this.stop();
 			});
 		};
+		this._host.self.trace(`Setting up listening to [${who}] and handler [${this._native.attached.module.identity}]`);
 
 		/* check if the server is being stopped, in which case nothing will be listened to */
 		if (this._host.stop.stopping) {
-			this._host.self.error(`Stopped server cannot listen to ${who}`);
+			this._host.self.error(`Stopped server cannot listen to [${who}]`);
 			return performFailure(new Error('Server already stopped'));
 		}
 
 		let server: libHttp.Server | null = null;
 		try {
 			/* setup the actual server server */
-			if (options?.tls != null) {
+			if (options.tls != null) {
 				const config = {
 					requireHostHeader: true,
 					key: libFs.readFileSync(options.tls.key),
@@ -233,12 +235,12 @@ export class Listener {
 				};
 				server = libHttps.createServer(config);
 			}
-			else if (options?.server != null)
+			else if (options.server != null)
 				server = options.server.server;
-			else if (options?.shallow != null)
+			else if (options.serverless == null)
 				server = libHttp.createServer({ requireHostHeader: true, connectionsCheckingInterval: CONNECTION_TIMEOUT_CHECKING });
 		} catch (err: any) {
-			this._host.self.error(`Error creating server ${who}: ${err.message}`);
+			this._host.self.error(`Error creating server [${who}]: ${err.message}`);
 			return performFailure(err);
 		}
 
@@ -252,7 +254,7 @@ export class Listener {
 		server.on('upgrade', (req, sock, head) => this.handleUpgrade(req, sock, head));
 		server.once('error', (err) => {
 			if (this._stop.stopping) return;
-			this._host.self.error(`Error while listening to ${who}: ${err.message}`);
+			this._host.self.error(`Error while listening to [${who}]: ${err.message}`);
 			this.emitEventSync('failed', err);
 			this.stop();
 		});
@@ -270,15 +272,15 @@ export class Listener {
 
 		/* start the actual server listening */
 		try {
-			server.listen(options?.port, options?.hostname);
+			server.listen(options.port, options.hostname);
 		} catch (err: any) {
-			this._host.self.error(`Error starting listener ${who}: ${err.message}`);
+			this._host.self.error(`Error starting listener [${who}]: ${err.message}`);
 			return performFailure(err);
 		}
 	}
 
 	public static _fromParams(server: Server, handler: libHandler.ModuleHandler, id: number, hostStop: { stopping: boolean, list: (() => Promise<void>)[] }, options: ListenOptions): Listener {
-		const clientConfig = (options?.client != null ? libClient.BurntClientConfig.from(options.client) : server.config.client);
+		const clientConfig = (options.client != null ? libClient.BurntClientConfig.from(options.client) : server.config.client);
 		const listener = new Listener(server, id, hostStop, clientConfig, handler);
 		listener.configure(options);
 		return listener;
@@ -354,7 +356,7 @@ export class Listener {
 
 		/* check if the cleanup can be removed from the stop list (only if stopping is not already in progress) */
 		if (!this._host.stop.stopping)
-			this._host.stop.list = this._host.stop.list.filter((v) => v != this.stop);
+			this._host.stop.list = this._host.stop.list.filter((v) => v != this._native.cleanup);
 
 		this.emitEventSync('stopped');
 		this._stop.stoppedResolver();
@@ -405,7 +407,7 @@ export interface ListenOptions {
 	server?: { server: libHttp.Server, secure: boolean };
 
 	/* create a serverless listener, designed to only be passed connections to */
-	shallow?: { secure: boolean };
+	serverless?: { secure: boolean };
 }
 
 /* wrapper to create a simple server */
@@ -414,6 +416,9 @@ export function createServer(config?: ServerConfig): Server {
 }
 
 export interface ServerConfig {
+	/* logging string used for the server (default: server) */
+	name?: string;
+
 	/* default timeout for request headers to be fully received [0 disables the timeout; in milliseconds; Default: 30_000] */
 	headerTimeout?: number;
 
