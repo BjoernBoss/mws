@@ -22,7 +22,6 @@ export class Server extends libLog.Logger {
 	};
 	private _cache: libCache.CacheHost;
 	private _config: BurntServerConfig;
-	private _nextId: number;
 
 	constructor(config?: ServerConfig) {
 		super('server');
@@ -33,15 +32,14 @@ export class Server extends libLog.Logger {
 			this._cache = config.cache;
 		else
 			this._cache = libCache.createCache(config?.cache);
-		this._nextId = 0;
 
 		let stoppedResolver = () => { };
 		this._stop = { listener: [], stoppedPromise: new Promise<void>((res) => stoppedResolver = res), stoppedResolver: () => { }, stopping: false };
 		this._stop.stoppedResolver = stoppedResolver;
 	}
 
-	private async handleClient(request: libHttp.IncomingMessage, client: libClient.ClientRequest, handler: libHandler.AttachedModule, id: number): Promise<void> {
-		this.log(`Listener[${id}]: Client [${client.logIdentity}] connected using [method: ${request.method ?? '_'}] from [${request.socket.remoteAddress}]:${request.socket.remotePort} to [${client.url.hostname}]:[${request.url}] (user-agent: [${request.headers['user-agent'] ?? ''}])`);
+	private async handleClient(request: libHttp.IncomingMessage, client: libClient.ClientRequest, handler: libHandler.AttachedModule, logger: libLog.Logger): Promise<void> {
+		logger.log(`Client [${client.logIdentity}] connected using [method: ${request.method ?? '_'}] from [${request.socket.remoteAddress}]:${request.socket.remotePort} to [${client.url.hostname}]:[${request.url}] (user-agent: [${request.headers['user-agent'] ?? ''}])`);
 
 		try {
 			await handler.handle(client);
@@ -53,11 +51,11 @@ export class Server extends libLog.Logger {
 		try {
 			await client.finalizeConnection();
 		} catch (err: any) {
-			this.error(`Fatal error while finalizing client: ${err.message}`);
+			logger.error(`Fatal error while finalizing [${client.logIdentity}]: ${err.message}`);
 			request.destroy(new Error('Unhandled exception'));
 		}
 
-		this.log(`Listener[${id}]: Client [${client.logIdentity}] completed`);
+		logger.log(`Client [${client.logIdentity}] completed`);
 	}
 	private fetchAddress(server: libHttp.Server): libNet.AddressInfo | null {
 		const raw = server.address();
@@ -67,11 +65,11 @@ export class Server extends libLog.Logger {
 			return { address: raw, port: 0, family: 'unix' };
 		return raw;
 	}
-	private async performServerCleanup(server: libHttp.Server, id: number | null, who: string, attached: libHandler.AttachedModule, wss: libWs.WebSocketServer): Promise<void> {
+	private async performServerCleanup(server: libHttp.Server, logger: libLog.Logger | null, who: string, attached: libHandler.AttachedModule, wss: libWs.WebSocketServer): Promise<void> {
 		/* close the server and any existing connections within it */
 		const address = this.fetchAddress(server);
-		if (address != null && id != null)
-			this.info(`Stopping ${who} on [${address.address}]:${address.port} [family: ${address.family}] as listener [${id}] with handler [${attached.module.logIdentity}]`);
+		if (address != null && logger != null)
+			this.info(`Stopping ${who} on [${address.address}]:${address.port} [family: ${address.family}] as listener [${logger.logIdentity}] with handler [${attached.module.logIdentity}]`);
 		const serverStopped = new Promise<void>((res) => server.close(() => res()));
 		server.closeAllConnections();
 
@@ -118,8 +116,9 @@ export class Server extends libLog.Logger {
 	/* listener is automatically stopped when the server is stopped or the handler stops itself */
 	public listen(handler: libHandler.ModuleHandler, options?: ListenOptions): Listener {
 		const protocol = ((options?.tls != null || options?.server?.secure === true) ? 'https' : 'http');
-		const who = `${protocol}:${options?.hostname ?? ''}:${options?.port ?? 0}`, idListener = this._nextId++;
+		const who = `${protocol}:${options?.hostname ?? ''}:${options?.port ?? 0}`;
 		const emitter = new libEvents.EventEmitter();
+		const logger = libLog.createLogger('listener');
 
 		/* setup the listener interface to be returned */
 		let stopping: Promise<void> | null = null, listenLogged = false;
@@ -138,7 +137,7 @@ export class Server extends libLog.Logger {
 
 				(async () => {
 					if (server != null)
-						await this.performServerCleanup(server, (listenLogged ? idListener : null), who, attached, wss);
+						await this.performServerCleanup(server, (listenLogged ? logger : null), who, attached, wss);
 
 					/* check if the cleanup can be removed from the stop list (only if stopping is not already in progress) */
 					if (!this._stop.stopping)
@@ -184,11 +183,11 @@ export class Server extends libLog.Logger {
 		const clientConfig = (options?.client != null ? libClient.BurntClientConfig.from(options.client) : this._config.client);
 		server.on('request', (req, resp) => {
 			const client = libClient.ClientRequest.fromRequest(protocol, req, resp, { cache: this._cache, config: clientConfig });
-			this.handleClient(req, client, attached, idListener);
+			this.handleClient(req, client, attached, logger);
 		});
 		server.on('upgrade', (req, sock, head) => {
 			const client = libClient.ClientRequest.fromUpgrade(protocol, req, sock, head, { cache: this._cache, config: clientConfig, wss });
-			this.handleClient(req, client, attached, idListener);
+			this.handleClient(req, client, attached, logger);
 		});
 		server.once('error', (err) => {
 			if (stopping != null) return;
@@ -199,7 +198,7 @@ export class Server extends libLog.Logger {
 		server.on('listening', () => {
 			if (stopping != null) return;
 			const address = this.fetchAddress(server)!;
-			this.info(`Successfully started ${who} on [${address.address}]:${address.port} [family: ${address.family}] as listener [${idListener}] with handler [${handler.logIdentity}]`);
+			this.info(`Successfully started ${who} on [${address.address}]:${address.port} [family: ${address.family}] as listener [${logger.logIdentity}] with handler [${handler.logIdentity}]`);
 			listenLogged = true;
 			this.emitEventSync(emitter, 'listening', address);
 		});

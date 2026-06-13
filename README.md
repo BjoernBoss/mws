@@ -50,7 +50,7 @@ server.listen(new HelloModule(), {
 A module extends `ModuleHandler` and implements up to three lifecycle hooks:
 
 ```typescript
-import { ModuleHandler, ClientRequest, Server } from "@bjoernboss/mws";
+import { ModuleHandler, ClientRequest, Server, Params } from "@bjoernboss/mws";
 
 export class MyModule extends ModuleHandler {
 	constructor() {
@@ -63,7 +63,7 @@ export class MyModule extends ModuleHandler {
 	}
 
 	/* Called for every incoming request routed to this module */
-	protected override async handleRequest(client: ClientRequest, params?: object): Promise<void> {
+	protected override async handleRequest(client: ClientRequest, params?: Params): Promise<void> {
 		/* respond to the client */
 	}
 

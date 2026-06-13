@@ -29,7 +29,7 @@ async function atomicWrite(path: string, content: Buffer, logger: libLog.Logger,
 	logger.trace(`Writing ${options?.what ?? 'data'} to [${path}]`);
 
 	if (options?.create === true) {
-		try { libFsPromises.writeFile(path, content, { flag: 'wx' }); }
+		try { await libFsPromises.writeFile(path, content, { flag: 'wx' }); }
 		catch (err: any) {
 			if (err.code == 'EEXIST')
 				return false;
@@ -844,9 +844,7 @@ export class CacheHost extends libLog.Logger {
 		let existed: boolean = true;
 
 		/* try to remove the physical file */
-		try {
-			libFsPromises.unlink(path);
-		}
+		try { await libFsPromises.unlink(path); }
 		catch (err: any) {
 			if (err.code != 'ENOENT')
 				throw err;

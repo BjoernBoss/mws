@@ -5,17 +5,27 @@ import * as libLog from "./log.js";
 import * as libBase from "./base.js";
 import * as libServer from "./server.js";
 
+interface LinkedModules {
+	parent: ModuleHandler | null;
+	child: ModuleHandler;
+	cleanup: () => Promise<void>;
+	setup: ((realized: Promise<void> | null) => void) | null;
+}
+
 /*
 *	Translation to be applied for nested children and reversed for any paths produced by the children.
 *	Paths are matched by longest path. A null translation is considered not being mapped and will not be forwarded.
 */
 export type PathTranslation = Record<string, string | null>;
 
+/* Request and handler specific parameters to be passed to the corresponding handler */
+export type Params = Record<string, any>;
+
 export interface AttachedModule {
 	/* forward the given client to the module, and translate the paths and logging accordingly, if the module
 	*	is designated for the client; returns false if the client is still unhandled after the handler; params
 	*	are passed on to the module without modification; no translation is equivalent to [/] => [/] */
-	handle(client: libClient.ClientRequest, options?: { params?: object, translate?: PathTranslation }): Promise<boolean>;
+	handle(client: libClient.ClientRequest, options?: { params?: Params, translate?: PathTranslation }): Promise<boolean>;
 
 	/* detach the module from the parent module handler (registered unlinked callback will be invoked before this promise
 	*	is completed; clients dispatched to the module will not be disconnected directly any may still be active) */
@@ -29,13 +39,6 @@ export interface AttachedModule {
 
 	/* resolves once the module has been unlinked */
 	unlinked(): Promise<void>;
-}
-
-interface LinkedModules {
-	parent: ModuleHandler | null;
-	child: ModuleHandler;
-	cleanup: () => Promise<void>;
-	setup: ((realized: Promise<void> | null) => void) | null;
 }
 
 /*
@@ -123,7 +126,7 @@ export abstract class ModuleHandler extends libLog.Logger {
 		}
 		return false;
 	}
-	private async _processIncomingClient(client: libClient.ClientRequest, params?: object, translate?: PathTranslation): Promise<boolean> {
+	private async _processIncomingClient(client: libClient.ClientRequest, params?: Params, translate?: PathTranslation): Promise<boolean> {
 		/* check if the client is already being handled or has already
 		*	been handled and otherwise process any outstanding tasks */
 		if (this._handling.active.has(client) || client.claimed)
@@ -134,7 +137,7 @@ export abstract class ModuleHandler extends libLog.Logger {
 		if (!this._attachment.attached)
 			return client.claimed;
 		const mapping = translate ?? { '/': '/' };
-		const logTag = (this._config.tagClients ? (this._config.tagString == '' ? this._config.name : this._config.tagString) : '');
+		const logTag = (this._config.tagClients ? (this._config.tagString == '' ? this.logIdentity : this._config.tagString) : '');
 		const snapshot = client._pushTranslation(mapping, logTag);
 		if (snapshot == null)
 			return client.claimed;
@@ -360,7 +363,7 @@ export abstract class ModuleHandler extends libLog.Logger {
 
 	/* handle the client request (guaranteed to not have been claimed yet; if the promise resolves, client must either have been handled or must
 	*	not be handled anymore; long-running handlers must check 'client.claimed' or await 'client.responded' to allow timely server shutdown) */
-	protected abstract handleRequest(client: libClient.ClientRequest, params?: object): Promise<void>;
+	protected abstract handleRequest(client: libClient.ClientRequest, params?: Params): Promise<void>;
 
 	/* module has been stopped (all clients are guaranteed to have left, but accepted WebSockets will be left intact and
 	*	must be closed manually by this module; will only be called once; module should cleanup any resources and timers) */
@@ -382,7 +385,7 @@ export abstract class ModuleHandler extends libLog.Logger {
 		return this;
 	}
 
-	/* set the tagging string the module should use in the logging of clients with empty string being module name [default: ''] */
+	/* set the tagging string the module should use in the logging of clients with empty string being module log identity [default: ''] */
 	public tagString(tag: string): this {
 		this._config.tagString = tag;
 		return this;
@@ -419,7 +422,6 @@ export abstract class ModuleHandler extends libLog.Logger {
 			client.killConnection('Module detached');
 		for (const link of this._attachment.links)
 			link.cleanup();
-		this.info('Handler stopped');
 		await this._drainTaskQueue(true, null);
 
 		try {
@@ -428,6 +430,7 @@ export abstract class ModuleHandler extends libLog.Logger {
 		catch (err: any) {
 			this.error(`Unhandled exception while stopping: ${err.message}`);
 		}
+		this.info('Handler stopped');
 
 		resolver();
 		return this._stopped;
@@ -465,7 +468,7 @@ export class DispatchModule extends ModuleHandler {
 			this.stop();
 	}
 
-	protected override async handleRequest(client: libClient.ClientRequest, _?: object): Promise<void> {
+	protected override async handleRequest(client: libClient.ClientRequest): Promise<void> {
 		let bestMatch: string | null = null;
 
 		/* iterate over the mappings and look for the corresponding best handler */
@@ -551,15 +554,15 @@ export class HostModule extends ModuleHandler {
 *	with optional parameter and translation binding. Stops itself once the child has been unlinked.
 *	Own parameters are not forwarded.
 */
-export function bind(handler: ModuleHandler, options?: { params?: object, translate?: PathTranslation, name?: string }): BindModule {
+export function bind(handler: ModuleHandler, options?: { params?: Params, translate?: PathTranslation, name?: string }): BindModule {
 	return new BindModule(handler, options);
 }
 export class BindModule extends ModuleHandler {
 	private handler: AttachedModule;
-	private params?: object;
+	private params?: Params;
 	private translate?: PathTranslation;
 
-	constructor(handler: ModuleHandler, options?: { params?: object, translate?: PathTranslation, name?: string }) {
+	constructor(handler: ModuleHandler, options?: { params?: Params, translate?: PathTranslation, name?: string }) {
 		super(options?.name ?? 'bind');
 
 		this.handler = this.linkModule(handler, () => this.stop());
@@ -666,7 +669,7 @@ export class LambdaModule extends ModuleHandler {
 		if (this.setupLambda != null)
 			await this.setupLambda(server, this.links);
 	}
-	protected override async handleRequest(client: libClient.ClientRequest, params?: object): Promise<void> {
+	protected override async handleRequest(client: libClient.ClientRequest, params?: Params): Promise<void> {
 		if (this.handleLambda != null)
 			await this.handleLambda(client, params, this.links);
 	}
@@ -676,5 +679,5 @@ export class LambdaModule extends ModuleHandler {
 	}
 }
 export type CallbackSetup = (this: ModuleHandler, server: libServer.Server, links: Record<string, AttachedModule>) => Promise<void>;
-export type CallbackHandle = (this: ModuleHandler, client: libClient.ClientRequest, params: object | undefined, links: Record<string, AttachedModule>) => Promise<void>;
+export type CallbackHandle = (this: ModuleHandler, client: libClient.ClientRequest, params: Params | undefined, links: Record<string, AttachedModule>) => Promise<void>;
 export type CallbackStop = (this: ModuleHandler, links: Record<string, AttachedModule>) => Promise<void>;
