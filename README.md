@@ -9,14 +9,16 @@ The server integrates various automation features, such as error handling, valid
 ## Installation
 Only depends on [`ws`](https://github.com/websockets/ws) at runtime.
 
-	$ npm install mws
+	$ npm install @bjoernboss/mws
 
 Requires Node.js 22 or later.
+
+Note: Look into the source `TypeScript` code on [`GitHub`](https://github.com/BjoernBoss/mws).
 
 ## Quick Start
 
 ```typescript
-import { Server, ModuleHandler, ClientRequest, Media, addLogger, createConsoleLogger } from "mws";
+import { Server, ModuleHandler, ClientRequest, Media, addLogger, createConsoleLogger } from "@bjoernboss/mws";
 
 addLogger(createConsoleLogger());
 
@@ -48,7 +50,7 @@ server.listen(new HelloModule(), {
 A module extends `ModuleHandler` and implements up to three lifecycle hooks:
 
 ```typescript
-import { ModuleHandler, ClientRequest, Server } from "mws";
+import { ModuleHandler, ClientRequest, Server } from "@bjoernboss/mws";
 
 export class MyModule extends ModuleHandler {
 	constructor() {
@@ -112,7 +114,7 @@ Factory functions create common module patterns without subclassing:
 Routes requests to children by longest URL path match. Stops itself once all children have been unlinked.
 
 ```typescript
-import { Server, dispatch } from "mws";
+import { Server, dispatch } from "@bjoernboss/mws";
 
 const server = new Server();
 server.listen(dispatch({
@@ -126,7 +128,7 @@ server.listen(dispatch({
 Routes requests to children by longest hostname match (supports sub-domain matching).
 
 ```typescript
-import { Server, host } from "mws";
+import { Server, host } from "@bjoernboss/mws";
 
 server.listen(host({
 	'api.example.com': apiModule,
@@ -139,7 +141,7 @@ server.listen(host({
 Forwards all requests to a single child handler, optionally injecting `params` and a path `translate` map.
 
 ```typescript
-import { bind } from "mws";
+import { bind } from "@bjoernboss/mws";
 
 const bound = bind(myModule, {
 	params: { role: 'admin' },
@@ -152,7 +154,7 @@ const bound = bind(myModule, {
 Validates the request hostname and port before forwarding. Responds `404` and kills the connection on mismatch.
 
 ```typescript
-import { check } from "mws";
+import { check } from "@bjoernboss/mws";
 
 const checked = check(myModule, ['localhost', '127.0.0.1'], { port: 8080 });
 ```
@@ -162,7 +164,7 @@ const checked = check(myModule, ['localhost', '127.0.0.1'], { port: 8080 });
 Handles requests via callbacks instead of subclassing, with optional attached child modules.
 
 ```typescript
-import { lambda, ClientRequest, Server, AttachedModule } from "mws";
+import { lambda, ClientRequest, Server, AttachedModule } from "@bjoernboss/mws";
 
 const handler = lambda({
 	attach: { api: apiModule },
@@ -275,7 +277,7 @@ server.cache.flush();
 The `build` namespace provides programmatic HTML construction with automatic escaping:
 
 ```typescript
-import { build } from "mws";
+import { build } from "@bjoernboss/mws";
 
 const page = new build.HtmlPage({
 	head: [

@@ -1,9 +1,17 @@
 {
-	"name": "mws",
+	"name": "@bjoernboss/mws",
 	"version": "1.0.0",
 	"type": "module",
-	"description": "Modular WebServer — a TypeScript framework for hosting isolated modules behind HTTP/HTTPS+WebSocket endpoints",
+	"description": "Modular Web Server — a TypeScript framework for hosting isolated modules behind HTTP/HTTPS+WebSocket endpoints",
 	"license": "BSD-3-Clause",
+	"author": "Bjoern Boss Henrichsen <bjoernbossdev@gmail.com>",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/BjoernBoss/mws.git"
+	},
+	"publishConfig": {
+		"access": "public"
+	},
 	"main": "dist/index.js",
 	"types": "dist/index.d.ts",
 	"exports": {
@@ -22,9 +30,7 @@
 		"dist/**/*.d.ts"
 	],
 	"scripts": {
-		"build": "tsc",
-		"start": "tsc && node ./main.js",
-		"test": "tsc && node --test test.js"
+		"prepare": "tsc"
 	},
 	"dependencies": {
 		"ws": "^8.18.1",
