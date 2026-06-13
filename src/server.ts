@@ -49,20 +49,23 @@ export class Server extends libLog.Logger {
 	}
 
 	/* shutdown the server and unlink all modules (immediately kills all open connections and listener; can be called multiple times) */
-	public async stop(): Promise<void> {
+	public stop(): Promise<void> {
 		if (this._stop.stopping)
 			return this._stop.stoppedPromise;
 		this._stop.stopping = true;
 
-		/* stop all connections and listener */
-		this.info('Stopping server connections and modules');
-		const promises: Promise<void>[] = [];
-		for (const cb of this._stop.list)
-			promises.push(cb());
-		await Promise.all(promises);
+		(async () => {
+			/* stop all connections and listener */
+			this.info('Stopping server connections and modules');
+			const promises: Promise<void>[] = [];
+			for (const cb of this._stop.list)
+				promises.push(cb());
+			await Promise.all(promises);
 
-		this.info('Server stopped');
-		this._stop.stoppedResolver();
+			this.info('Server stopped');
+			this._stop.stoppedResolver();
+		})();
+
 		return this._stop.stoppedPromise;
 	}
 
@@ -174,6 +177,9 @@ export class Listener {
 
 		this._host.self.info(`Successfully started ${this._self.endpoint} on ${this._self.listening} with handler [${this._native.attached.module.identity}]`);
 		this.emitEventSync('listening', address);
+	}
+	private async performStopping(): Promise<void> {
+
 	}
 	private async handleClient(request: libHttp.IncomingMessage, client: libClient.ClientRequest): Promise<void> {
 		if (this._handling.count++ == 0)
@@ -319,47 +325,50 @@ export class Listener {
 	}
 
 	/* stop the listener and return promise which resolves once fully stopped */
-	public async stop(): Promise<void> {
+	public stop(): Promise<void> {
 		if (this._stop.stopping)
 			return this._stop.stoppedPromise;
 		this._stop.stopping = true;
 
-		/* close the server and any existing connections within it */
-		let serverStopped: Promise<void> | null = null;
-		if (this._native.server != null) {
-			serverStopped = new Promise<void>((res) => this._native.server!.close(() => res()));
-			this._native.server.closeAllConnections();
-		}
-		else
-			serverStopped = Promise.resolve();
+		(async () => {
+			/* close the server and any existing connections within it */
+			let serverStopped: Promise<void> | null = null;
+			if (this._native.server != null) {
+				serverStopped = new Promise<void>((res) => this._native.server!.close(() => res()));
+				this._native.server.closeAllConnections();
+			}
+			else
+				serverStopped = Promise.resolve();
 
-		await this._native.attached.unlink();
+			await this._native.attached.unlink();
 
-		/* close all of the web-sockets (after unlinking the module to
-		*	ensure it has a chance to clean the connections itself) */
-		const sockets: Promise<void>[] = [];
-		for (const ws of [...this._native.wss.clients]) {
-			if (ws.readyState == libWs.WebSocket.CLOSED)
-				continue;
-			sockets.push(new Promise<void>((res) => ws.on('close', () => res())));
-			ws.terminate();
-		}
-		await Promise.all(sockets);
+			/* close all of the web-sockets (after unlinking the module to
+			*	ensure it has a chance to clean the connections itself) */
+			const sockets: Promise<void>[] = [];
+			for (const ws of [...this._native.wss.clients]) {
+				if (ws.readyState == libWs.WebSocket.CLOSED)
+					continue;
+				sockets.push(new Promise<void>((res) => ws.on('close', () => res())));
+				ws.terminate();
+			}
+			await Promise.all(sockets);
 
-		/* wait for any handled connections to be over and for the server to be fully stopped */
-		while (this._handling.promise != null)
-			await this._handling.promise;
-		await serverStopped;
+			/* wait for any handled connections to be over and for the server to be fully stopped */
+			while (this._handling.promise != null)
+				await this._handling.promise;
+			await serverStopped;
 
-		if (this._self.listening != null)
-			this._host.self.info(`Stopped ${this._self.endpoint} on ${this._self.listening} with handler [${this._native.attached.module.identity}]`);
+			if (this._self.listening != null)
+				this._host.self.info(`Stopped ${this._self.endpoint} on ${this._self.listening} with handler [${this._native.attached.module.identity}]`);
 
-		/* check if the cleanup can be removed from the stop list (only if stopping is not already in progress) */
-		if (!this._host.stop.stopping)
-			this._host.stop.list = this._host.stop.list.filter((v) => v != this._native.cleanup);
+			/* check if the cleanup can be removed from the stop list (only if stopping is not already in progress) */
+			if (!this._host.stop.stopping)
+				this._host.stop.list = this._host.stop.list.filter((v) => v != this._native.cleanup);
 
-		this.emitEventSync('stopped');
-		this._stop.stoppedResolver();
+			this.emitEventSync('stopped');
+			this._stop.stoppedResolver();
+		})();
+
 		return this._stop.stoppedPromise;
 	}
 
@@ -378,11 +387,11 @@ export class Listener {
 		this._emitter.on(event, listener);
 		return this;
 	}
-	public off<K extends keyof ListenerEvents>(event: K, listener: ListenerEvents[K]): Listener {
+	public once<K extends keyof ListenerEvents>(event: K, listener: ListenerEvents[K]): Listener {
 		this._emitter.once(event, listener);
 		return this;
 	}
-	public once<K extends keyof ListenerEvents>(event: K, listener: ListenerEvents[K]): Listener {
+	public off<K extends keyof ListenerEvents>(event: K, listener: ListenerEvents[K]): Listener {
 		this._emitter.off(event, listener);
 		return this;
 	}

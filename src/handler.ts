@@ -410,7 +410,7 @@ export abstract class ModuleHandler extends libLog.Logger {
 
 	/* close any connections to the module and stop the module itself (stopping must not
 	*	be awaited while stopping itself or a parent as this can result in deadlocks) */
-	public async stop(): Promise<void> {
+	public stop(): Promise<void> {
 		if (this._stopped != null)
 			return this._stopped;
 
@@ -419,24 +419,27 @@ export abstract class ModuleHandler extends libLog.Logger {
 		let resolver = () => { };
 		this._stopped = new Promise<void>((res) => resolver = res);
 
-		/* kill any connections and kill all links and drain the remaining task queue
-		*	(will not await the unlinked calls of links where this element is the child) */
-		this._performDetachSelf();
-		for (const client of this._handling.active)
-			client.killConnection('Module detached');
-		for (const link of this._attachment.links)
-			link.cleanup();
-		await this._drainTaskQueue(true, null);
+		(async () => {
+			/* kill any connections and kill all links and drain the remaining task queue
+					*	(will not await the unlinked calls of links where this element is the child) */
+			this._performDetachSelf();
+			for (const client of this._handling.active)
+				client.killConnection('Module detached');
+			for (const link of this._attachment.links)
+				link.cleanup();
+			await this._drainTaskQueue(true, null);
 
-		try {
-			await this.handleStop();
-		}
-		catch (err: any) {
-			this.error(`Unhandled exception while stopping: ${err.message}`);
-		}
-		this.info('Handler stopped');
+			try {
+				await this.handleStop();
+			}
+			catch (err: any) {
+				this.error(`Unhandled exception while stopping: ${err.message}`);
+			}
+			this.info('Handler stopped');
 
-		resolver();
+			resolver();
+		})();
+
 		return this._stopped;
 	}
 }
