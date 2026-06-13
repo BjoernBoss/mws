@@ -6,10 +6,8 @@ const DEFAULT_FILE_FLUSHING_DELAY: number = 2_000;
 const DEFAULT_FILE_BUF_MAXIMUM_LINES = 1_000;
 const DEFAULT_FILE_SIZE_SWAP_FILE = 10_000_000;
 
-/* setup the initial default console-logger */
 const LoggerIdMap: Record<string, number> = {};
 const GlobalLogConsumers: Set<LogConsumer> = new Set<LogConsumer>();
-addLogger(createConsoleLogger());
 
 function formatLevel(level: LogLevel): string {
 	switch (level) {
@@ -309,12 +307,6 @@ export function addLogger(cb: LogConsumer): Detacher {
 	return () => {
 		wrapped(null, '', '', '');
 	};
-}
-
-/* remove all registered global loggers (default logger is a single console logger) */
-export function clearLoggers(): void {
-	for (const log of GlobalLogConsumers)
-		log(null, '', '', '');
 }
 
 /* perform a global log to all registered loggers */

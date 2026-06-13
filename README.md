@@ -16,7 +16,9 @@ Requires Node.js 22 or later.
 ## Quick Start
 
 ```typescript
-import { Server, ModuleHandler, ClientRequest, Media } from "mws";
+import { Server, ModuleHandler, ClientRequest, Media, addLogger, createConsoleLogger } from "mws";
+
+addLogger(createConsoleLogger());
 
 class HelloModule extends ModuleHandler {
 	constructor() {
