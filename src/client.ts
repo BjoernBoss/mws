@@ -1741,7 +1741,7 @@ export class ClientSocket extends ClientBase {
 		if (extIndex > 0)
 			this.logSetIdentity(`${this.identity}${source.identity.substring(extIndex)}`);
 		source.log(`WebSocket accepted: [${this.identity}]`);
-		this._log = { identity: source.identity, tagList: [] };
+		this._log = { identity: this.identity, tagList: [] };
 
 		/* start the first alive check (no need to consider the socket timeout, as it will have been cleared already) */
 		this.selfIsAlive();

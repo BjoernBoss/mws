@@ -13,8 +13,6 @@ Only depends on [`ws`](https://github.com/websockets/ws) at runtime.
 
 Requires Node.js 22 or later.
 
-Note: Look into the source `TypeScript` code on [`GitHub`](https://github.com/BjoernBoss/mws).
-
 ## Quick Start
 
 ```typescript
