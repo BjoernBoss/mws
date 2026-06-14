@@ -164,7 +164,7 @@ export abstract class ModuleHandler extends libLog.Logger {
 			throw error;
 		return client.claimed;
 	}
-	private async _performAttachSelf(server: libServer.Server): Promise<boolean> {
+	private async _performAttachSelf(server: libServer.Server): Promise<void> {
 		const firstAttachment = (this._attachment.server == null);
 		this._attachment.attached = true;
 		this._attachment.server = server;
@@ -186,16 +186,16 @@ export abstract class ModuleHandler extends libLog.Logger {
 		this._pushHandleTask(taskPromise);
 
 		/* notify the module itself about the initialization */
-		try {
-			if (firstAttachment)
-				await this.handleInitialize(this._attachment.server);
+		if (firstAttachment) {
+			try { await this.handleInitialize(this._attachment.server); }
+			catch (err: any) {
+				this.error(`Unhandled exception while initializing: ${err.message}`);
+				this.stop();
+			}
+			this.info(`Handler initialized to server [${this._attachment.server.identity}]`);
 		}
-		catch (err: any) {
-			this.error(`Unhandled exception while initializing: ${err.message}`);
-			this.stop();
-		}
+
 		taskResolver();
-		return firstAttachment;
 	}
 	private async _performDetachSelf(): Promise<void> {
 		if (!this._attachment.attached)
@@ -277,7 +277,6 @@ export abstract class ModuleHandler extends libLog.Logger {
 				const parentServer = (parent instanceof libServer.Server ? parent : parent._attachment.server);
 
 				/* check if the attachment is possible in theory */
-				let firstAttachment = false;
 				if (!validateLinkState(parentServer))
 					link.cleanup();
 
@@ -288,16 +287,12 @@ export abstract class ModuleHandler extends libLog.Logger {
 					if (!this._attachment.attached) {
 						if (realized != null)
 							this._pushHandleTask(realized);
-						firstAttachment = await this._performAttachSelf(parentServer);
+						await this._performAttachSelf(parentServer);
 					}
 
 					logged = !stopping;
-					if (logged) {
-						if (parent instanceof libServer.Server || !firstAttachment)
-							this.info(`Attached to [${parent.identity}]${detail}`);
-						else
-							this.info(`Attached to [${parent.identity}] and server [${parentServer.identity}]${detail}`);
-					}
+					if (logged)
+						this.info(`Attached to [${parent.identity}]${detail}`);
 				}
 			},
 			cleanup: async (): Promise<void> => {
@@ -429,9 +424,7 @@ export abstract class ModuleHandler extends libLog.Logger {
 				link.cleanup();
 			await this._drainTaskQueue(true, null);
 
-			try {
-				await this.handleStop();
-			}
+			try { await this.handleStop(); }
 			catch (err: any) {
 				this.error(`Unhandled exception while stopping: ${err.message}`);
 			}
