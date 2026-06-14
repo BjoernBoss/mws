@@ -13,36 +13,36 @@ interface LinkedModules {
 	setup: ((realized: Promise<void> | null) => void) | null;
 }
 
-/*
+/**
 *	Translation to be applied for nested children and reversed for any paths produced by the children.
 *	Paths are matched by longest path. A null translation is considered not being mapped and will not be forwarded.
 */
 export type PathTranslation = Record<string, string | null>;
 
-/* Request and handler specific parameters to be passed to the corresponding handler */
+/** Request and handler specific parameters to be passed to the corresponding handler */
 export type Params = Record<string, any>;
 
 export interface AttachedModule {
-	/* forward the given client to the module, and translate the paths and logging accordingly, if the module
-	*	is designated for the client; returns false if the client is still unhandled after the handler; params
-	*	are passed on to the module without modification; no translation is equivalent to [/] => [/] */
+	/** forward the given client to the module, and translate the paths and logging accordingly, if the module
+	 *	is designated for the client; returns false if the client is still unhandled after the handler; params
+	 *	are passed on to the module without modification; no translation is equivalent to [/] => [/] */
 	handle(client: libClient.ClientRequest, options?: { params?: Params, translate?: PathTranslation }): Promise<boolean>;
 
-	/* detach the module from the parent module handler (registered unlinked callback will be invoked before this promise
-	*	is completed; clients dispatched to the module will not be disconnected directly any may still be active) */
+	/** detach the module from the parent module handler (registered unlinked callback will be invoked before this promise
+	 *	is completed; clients dispatched to the module will not be disconnected directly any may still be active) */
 	unlink(): Promise<void>;
 
-	/* original module that was attached */
+	/** original module that was attached */
 	module: ModuleHandler;
 
-	/* check if the link is still valid (i.e. no unlink has been initiated) */
+	/** check if the link is still valid (i.e. no unlink has been initiated) */
 	linked(): boolean;
 
-	/* resolves once the module has been unlinked */
+	/** resolves once the module has been unlinked */
 	unlinked(): Promise<void>;
 }
 
-/*
+/**
 *	Modules will be stopped by default, once it is fully unlinked from the server again.
 *	If a module is initialized, or stopped, the stop-handler is called.
 *	An initialization will always be followed by a stop-handler call.
@@ -355,61 +355,61 @@ export abstract class ModuleHandler extends libLog.Logger {
 		return this._performAttachToParent(server, unlinked, '');
 	}
 
-	/* module is attached directly or indirectly to the server (will be the first call being performed before any other calls; will only be called once) */
+	/** module is attached directly or indirectly to the server (will be the first call being performed before any other calls; will only be called once) */
 	protected async handleInitialize(server: libServer.Server): Promise<void> { }
 
-	/* handle the client request (guaranteed to not have been claimed yet; if the promise resolves, client must either have been handled or must
-	*	not be handled anymore; long-running handlers must check 'client.claimed' or await 'client.responded' to allow timely server shutdown) */
+	/** handle the client request (guaranteed to not have been claimed yet; if the promise resolves, client must either have been handled or must
+	 *	not be handled anymore; long-running handlers must check 'client.claimed' or await 'client.responded' to allow timely server shutdown) */
 	protected abstract handleRequest(client: libClient.ClientRequest, params?: Params): Promise<void>;
 
-	/* module has been stopped (all clients are guaranteed to have left, but accepted WebSockets will be left intact and
-	*	must be closed manually by this module; will only be called once; module should cleanup any resources and timers) */
+	/** module has been stopped (all clients are guaranteed to have left, but accepted WebSockets will be left intact and
+	 *	must be closed manually by this module; will only be called once; module should cleanup any resources and timers) */
 	protected async handleStop(): Promise<void> { }
 
-	/* name of the module */
+	/** name of the module */
 	public get name(): string {
 		return this._config.name;
 	}
 
-	/* server the module has been attached to (null if not yet initialized) */
+	/** server the module has been attached to (null if not yet initialized) */
 	public get server(): libServer.Server | null {
 		return this._attachment.server;
 	}
 
-	/* [throws] cache host to be used by this module (throws if not yet initialized) */
+	/** [throws] cache host to be used by this module (throws if not yet initialized) */
 	public get cache(): libCache.CacheHost {
 		if (this._attachment.server == null)
 			throw new Error('Not yet initialized');
 		return this._attachment.server.cache;
 	}
 
-	/* enable or disable the module tagging the logging of clients [default: true] */
+	/** enable or disable the module tagging the logging of clients [default: true] */
 	public tagClients(tag: boolean): this {
 		this._config.tagClients = tag;
 		return this;
 	}
 
-	/* set the tagging string the module should use in the logging of clients with empty string being module log identity [default: ''] */
+	/** set the tagging string the module should use in the logging of clients with empty string being module log identity [default: ''] */
 	public tagString(tag: string): this {
 		this._config.tagString = tag;
 		return this;
 	}
 
-	/* enable or disable the module being stopped once detached the next time from the server [default: true] */
+	/** enable or disable the module being stopped once detached the next time from the server [default: true] */
 	public stopOnDetach(stop: boolean): this {
 		this._config.stopOnDetach = stop;
 		return this;
 	}
 
-	/* link the child to this module (unlinked will be called once the child has been removed or is identified to not
-	*	be suited for this module; will not be called if this module is not attached or will not be attached anymore;
-	*	unless already destroyed; detail is an additional information to be logged upon linking and unlinking) */
+	/** link the child to this module (unlinked will be called once the child has been removed or is identified to not
+	 *	be suited for this module; will not be called if this module is not attached or will not be attached anymore;
+	 *	unless already destroyed; detail is an additional information to be logged upon linking and unlinking) */
 	public linkModule(child: ModuleHandler, unlinked?: () => void, detail?: string): AttachedModule {
 		return child._performAttachToParent(this, (unlinked == null ? () => { } : unlinked), detail ?? '');
 	}
 
-	/* close any connections to the module and stop the module itself (stopping must not
-	*	be awaited while stopping itself or a parent as this can result in deadlocks) */
+	/** close any connections to the module and stop the module itself (stopping must not
+	 *	be awaited while stopping itself or a parent as this can result in deadlocks) */
 	public stop(): Promise<void> {
 		if (this._stopped != null)
 			return this._stopped;
@@ -444,7 +444,7 @@ export abstract class ModuleHandler extends libLog.Logger {
 	}
 }
 
-/*
+/**
 *	Simple module handler implementation, which dispatches requests to different children based on the request path (longest match).
 *	Stops itself once all children have been unlinked. Own parameters are not forwarded.
 */
@@ -495,7 +495,7 @@ export class DispatchModule extends ModuleHandler {
 	}
 }
 
-/*
+/**
 *	Simple module handler implementation, which dispatches requests to different children based on the request hostname (longest match).
 *	Stops itself once all children have been unlinked. Own parameters are not forwarded.
 */
@@ -556,7 +556,7 @@ export class HostModule extends ModuleHandler {
 	}
 }
 
-/*
+/**
 *	Simple module interface implementation, which forwards any requests to a child handler
 *	with optional parameter and translation binding. Stops itself once the child has been unlinked.
 *	Own parameters are not forwarded.
@@ -583,7 +583,7 @@ export class BindModule extends ModuleHandler {
 	}
 }
 
-/*
+/**
 *	Simple module interface implementation, which validates the connected host and port before forwarding the client.
 *	Stops itself once the child has been unlinked. Own parameters are not forwarded.
 */
@@ -638,7 +638,7 @@ export class CheckModule extends ModuleHandler {
 	}
 }
 
-/*
+/**
 *	Simple module handler implementation, which allows requests to be handled by lambdas, and child modules to be attached.
 *	Stops itself once all children have been unlinked. Forwards parameter to lambda functions.
 */

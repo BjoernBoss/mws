@@ -43,12 +43,12 @@ export class Server extends libLog.Logger {
 		this._stop.stoppedResolver = stoppedResolver;
 	}
 
-	/* listener is automatically stopped when the server is stopped or the handler stops itself */
+	/** listener is automatically stopped when the server is stopped or the handler stops itself */
 	public listen(handler: libHandler.ModuleHandler, options?: ListenOptions): Listener {
 		return Listener._fromParams(this, handler, ++this._nextEndpoint, this._stop, options ?? {});
 	}
 
-	/* shutdown the server and unlink all modules (immediately kills all open connections and listener; can be called multiple times) */
+	/** shutdown the server and unlink all modules (immediately kills all open connections and listener; can be called multiple times) */
 	public stop(): Promise<void> {
 		if (this._stop.stopping)
 			return this._stop.stoppedPromise;
@@ -69,27 +69,27 @@ export class Server extends libLog.Logger {
 		return this._stop.stoppedPromise;
 	}
 
-	/* cache host used by this server */
+	/** cache host used by this server */
 	public get cache(): libCache.CacheHost {
 		return this._cache;
 	}
 
-	/* configuration used by this server */
+	/** configuration used by this server */
 	public get config(): BurntServerConfig {
 		return this._config;
 	}
 
-	/* resolves once the server has stopped */
+	/** resolves once the server has stopped */
 	public get stopped(): Promise<void> {
 		return this._stop.stoppedPromise;
 	}
 
-	/* check if the server is still running */
+	/** check if the server is still running */
 	public get running(): boolean {
 		return !this._stop.stopping;
 	}
 
-	/* link the given module to the server (automatically unlinked upon server stop) */
+	/** link the given module to the server (automatically unlinked upon server stop) */
 	public linkModule(module: libHandler.ModuleHandler, unlinked?: () => void): libHandler.AttachedModule {
 		const cleanup = (): Promise<void> => attached.unlink();
 		this._stop.list.push(cleanup);
@@ -105,7 +105,7 @@ export class Server extends libLog.Logger {
 	}
 }
 
-/*
+/**
 *	Either 'listening' or 'failed' is fired, followed at some point by a 'stopped' event.
 *	'address' of 'listening' event is null for serverless listener.
 */
@@ -177,9 +177,6 @@ export class Listener {
 
 		this._host.self.info(`Successfully started ${this._self.endpoint} on ${this._self.listening} with handler [${this._native.attached.module.identity}]`);
 		this.emitEventSync('listening', address);
-	}
-	private async performStopping(): Promise<void> {
-
 	}
 	private async handleClient(request: libHttp.IncomingMessage, client: libClient.ClientRequest): Promise<void> {
 		if (this._handling.count++ == 0)
@@ -292,7 +289,7 @@ export class Listener {
 		return listener;
 	}
 
-	/* manually pass a request through the listener (takes ownership of the request; will kill the connection if the listener is not running anymore) */
+	/** manually pass a request through the listener (takes ownership of the request; will kill the connection if the listener is not running anymore) */
 	public async handleRequest(request: libHttp.IncomingMessage, response: libHttp.ServerResponse): Promise<void> {
 		if (this._stop.stopping) {
 			request.destroy(new Error('Listener not running anymore'));
@@ -303,7 +300,7 @@ export class Listener {
 		await this.handleClient(request, client);
 	}
 
-	/* manually pass an upgrade through the listener (takes ownership of the connection; immediately closes the connection if the listener is not running anymore) */
+	/** manually pass an upgrade through the listener (takes ownership of the connection; immediately closes the connection if the listener is not running anymore) */
 	public async handleUpgrade(request: libHttp.IncomingMessage, socket: libStream.Duplex, head: Buffer): Promise<void> {
 		if (this._stop.stopping) {
 			request.destroy(new Error('Listener not running anymore'));
@@ -314,17 +311,17 @@ export class Listener {
 		await this.handleClient(request, client);
 	}
 
-	/* server this listener belongs to */
+	/** server this listener belongs to */
 	public get server(): Server {
 		return this._host.self;
 	}
 
-	/* client configuration used for this listener */
+	/** client configuration used for this listener */
 	public get config(): libClient.BurntClientConfig {
 		return this._config;
 	}
 
-	/* stop the listener and return promise which resolves once fully stopped */
+	/** stop the listener and return promise which resolves once fully stopped */
 	public stop(): Promise<void> {
 		if (this._stop.stopping)
 			return this._stop.stoppedPromise;
@@ -372,12 +369,12 @@ export class Listener {
 		return this._stop.stoppedPromise;
 	}
 
-	/* resolves once the server has stopped */
+	/** resolves once the server has stopped */
 	public get stopped(): Promise<void> {
 		return this._stop.stoppedPromise;
 	}
 
-	/* check if the server is still running */
+	/** check if the server is still running */
 	public get running(): boolean {
 		return !this._stop.stopping;
 	}
@@ -397,52 +394,52 @@ export class Listener {
 	}
 }
 
-/* server order: (tls > server > shallow > http.Server) */
+/** server order: (tls > server > shallow > http.Server) */
 export interface ListenOptions {
-	/* port to listen on (omit/0 for an OS-assigned port) */
+	/** port to listen on (omit/0 for an OS-assigned port) */
 	port?: number;
 
-	/* hostname/interface to bind to (omit to listen on all interfaces) */
+	/** hostname/interface to bind to (omit to listen on all interfaces) */
 	hostname?: string;
 
-	/* client configuration to use for this listener, otherwise the server's is used */
+	/** client configuration to use for this listener, otherwise the server's is used */
 	client?: libClient.ClientConfig | libClient.BurntClientConfig;
 
-	/* tls configuration to be used */
+	/** tls configuration to be used */
 	tls?: { key: string, cert: string };
 
-	/* custom configured server to be used (connectionsCheckingInterval must be configured
-	*	accordingly beforehand; ownership will be taken; secure to encode https compared to http) */
+	/** custom configured server to be used (connectionsCheckingInterval must be configured
+	 *	accordingly beforehand; ownership will be taken; secure to encode https compared to http) */
 	server?: { server: libHttp.Server, secure: boolean };
 
-	/* create a serverless listener, designed to only be passed connections to */
+	/** create a serverless listener, designed to only be passed connections to */
 	serverless?: { secure: boolean };
 }
 
-/* wrapper to create a simple server */
+/** wrapper to create a simple server */
 export function createServer(config?: ServerConfig): Server {
 	return new Server(config);
 }
 
 export interface ServerConfig {
-	/* logging string used for the server (default: server) */
+	/** logging string used for the server (default: server) */
 	name?: string;
 
-	/* default timeout for request headers to be fully received [0 disables the timeout; in milliseconds; Default: 30_000] */
+	/** default timeout for request headers to be fully received [0 disables the timeout; in milliseconds; Default: 30_000] */
 	headerTimeout?: number;
 
-	/* default inactivity timeout — connection is closed if no data is sent or received; resets on any I/O activity, so active transfers are not affected; 
-	*	is temporarily cleared by clients, which handle it themselves via throughput [0 disables the timeout; in milliseconds; Default: 90_000] */
+	/** default inactivity timeout — connection is closed if no data is sent or received; resets on any I/O activity, so active transfers are not affected;
+	 *	is temporarily cleared by clients, which handle it themselves via throughput [0 disables the timeout; in milliseconds; Default: 90_000] */
 	connectionTimeout?: number;
 
-	/* idle time allowed between requests before closing a keep-alive connection [0 falls back to connectionTimeout; in milliseconds; Default: 10_000] */
+	/** idle time allowed between requests before closing a keep-alive connection [0 falls back to connectionTimeout; in milliseconds; Default: 10_000] */
 	keepAliveTimeout?: number;
 
-	/* default client configuration to be used */
+	/** default client configuration to be used */
 	client?: libClient.ClientConfig | libClient.BurntClientConfig;
 
-	/* default cache configuration to be used
-	*	Important: cache host should be shared where possible as otherwise multiple unshared caches could exist and immutable ids might overwrite each other */
+	/** default cache configuration to be used
+	 *	Important: cache host should be shared where possible as otherwise multiple unshared caches could exist and immutable ids might overwrite each other */
 	cache?: libCache.CacheHost | libCache.CacheConfig | libCache.BurntCacheConfig;
 }
 

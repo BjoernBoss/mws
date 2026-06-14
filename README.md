@@ -45,6 +45,28 @@ server.listen(new HelloModule(), {
 });
 ```
 
+## Listeners
+
+`server.listen()` returns a `Listener` that emits `'listening'`, `'failed'`, and `'stopped'` events:
+
+```typescript
+const listener = server.listen(handler, { port: 8080 });
+
+listener.on('listening', (address) => console.log(`Listening on port ${address.port}`));
+listener.on('failed', (err) => console.error(`Failed: ${err.message}`));
+listener.on('stopped', () => console.log('Stopped'));
+```
+
+A serverless listener does not bind to a port. Instead, connections are passed to it manually via `listener.handleRequest()` and `listener.handleUpgrade()` (can also be used for other listeners):
+
+```typescript
+const listener = server.listen(handler, { serverless: { secure: false } });
+
+/* forward requests from an external HTTP server */
+externalServer.on('request', (req, resp) => listener.handleRequest(req, resp));
+externalServer.on('upgrade', (req, sock, head) => listener.handleUpgrade(req, sock, head));
+```
+
 ## Writing Modules
 
 A module extends `ModuleHandler` and implements up to three lifecycle hooks:
@@ -221,6 +243,8 @@ if (!await client.tryRespondFile('/var/www/index.html'))
 await client.respondHtml(page, { status: Status.Ok });
 ```
 
+**Important:** Streams returned by `receiveData()` and `respondData()` can emit `'error'` events. Always register an `'error'` handler on these streams to prevent unhandled errors from crashing the process. Generally: correspondingly tagged functions may throw or error and must handle errors accordingly, to prevent crashing the process.
+
 Convenience methods: `respondOk`, `respondNotFound`, `respondBadRequest`, `respondForbidden`, `respondInternalError`, `respondConflict`, `respondSeeOther`, `respondTemporaryRedirect`, `respondPermanentRedirect`, `respondCreated`, and others.
 
 ## WebSocket
@@ -259,22 +283,25 @@ File paths can be tagged with a unique version identifier so clients can cache t
 
 ```typescript
 /* style.css becomes style.<id>.css — the id changes when the file changes */
-const versionedPath = server.cache.immutable('my-handler', '/static/style.css');
+const versionedPath = server.cache.immutable('my-module', '/static/style.css');
 ```
 
 When a request arrives for an immutable path, the cache strips the version tag, serves the underlying file, and redirects stale version tags to the current one. Set `CacheConfig.immutableStatePath` to persist version mappings across restarts.
 
 ### Direct Cache Access
 
+These methods are designed for modules to be used, and allows directly to write to the disk, and update the cache at the same time. May throw exceptions.
+
 ```typescript
 const buffer = await server.cache.read('/path/to/data.json');
 await server.cache.write('/path/to/output.json', JSON.stringify(data));
+await server.cache.remove('/path/to/old.json');
 server.cache.flush();
 ```
 
 ## HTML Building
 
-The `build` namespace provides programmatic HTML construction with automatic escaping:
+The `build` namespace provides programmatic HTML construction with automatic escaping. It allows parent modules to use the `patchHtmlPage` function, to build around the HTML, before serving it:
 
 ```typescript
 import { build } from "@bjoernboss/mws";

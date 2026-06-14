@@ -58,30 +58,30 @@ class ClientBase extends libLog.Logger {
 		this._config = config;
 	}
 
-	/* raw request origin (no host will result in '_'; host will be lower-case) */
+	/** raw request origin (no host will result in '_'; host will be lower-case) */
 	readonly url: libUrl.URL;
 
-	/* path relative to current module */
+	/** path relative to current module */
 	public get path(): string {
 		return this._path;
 	}
 
-	/* configuration used by this client */
+	/** configuration used by this client */
 	public get config(): BurntClientConfig {
 		return this._config
 	}
 
-	/* check if the path relative to the current module is a sub path or the same of the given test base path (can be /base or /base/...) */
+	/** check if the path relative to the current module is a sub path or the same of the given test base path (can be /base or /base/...) */
 	public isSubPathOf(base: string): boolean {
 		return libHelper.isSubPath(base, this._path);
 	}
 
-	/* check if the path relative to the current module is inside of the given test base path (must be truly inside; /base/...) */
+	/** check if the path relative to the current module is inside of the given test base path (must be truly inside; /base/...) */
 	public isInsideOf(base: string): boolean {
 		return libHelper.isInside(base, this._path);
 	}
 
-	/* create a path relative from the current module into the clients traversed server space */
+	/** create a path relative from the current module into the clients traversed server space */
 	public makePath(path: string): string {
 		path = libHelper.sanitize(path, false);
 		let output = path;
@@ -177,48 +177,48 @@ class HttpRequestResponse extends libStream.Writable {
 
 type ClientSocketEvents = { 'data': (data: Buffer) => void, 'close': () => void };
 
-/* look at the state and modify the headers accordingly (only add or remove headers, must not try to alter the response) */
+/** look at the state and modify the headers accordingly (only add or remove headers, must not try to alter the response) */
 export type HeaderPatch = (status: libBase.StatusType, headers: Record<string, string>) => void;
 
-/* look at the page and modify it or the headers accordingly (can be interrupted by returning an alternate response) */
+/** look at the page and modify it or the headers accordingly (can be interrupted by returning an alternate response) */
 export type HtmlPatch = (page: libBuilder.HtmlPage, status: libBase.StatusType, headers: Record<string, string>) => Promise<void>;
 
-/* type to invoke to update the logging tag (empty string will hide the tag entry;
-*	null will completely remove the tag; other values will update the tag) */
+/** type to invoke to update the logging tag (empty string will hide the tag entry;
+ *	null will completely remove the tag; other values will update the tag) */
 export type SocketLogTag = (value?: string) => void;
 
-/*
-*	Does not throw any exceptions, unless explicitly stated.
-*	Http HEAD aware (will silently drain any data sent from a HEAD request).
-*
-*	Request is considered acknowledged, as soon as a response has been triggered or a preparation started.
-*	Path remains URI encoded, as it was received, and path building will use the same encoded paths.
-*	Repeated request responding may override any ongoing responses and may terminate the connection; depending on the prior state.
-*	Not responded to requests will result in [not-found].
-*
-*	Receiving data: Will automatically decode the stream and ensure a given maximum is not passed
-*		=> Any errors while receiving will either auto-respond or send the connection into the broken state, and fail the receive reader (stream user does not need to respond).
-*		=> Will terminate a connection, if the upload is not consumed or the client errors.
-*		=> Premature destroying of receive reader will result in the connection being gracefully terminated.
-*		=> All data must have been received before the response is completed.
-*	Responding data: Will automatically encode the stream and send the header accordingly
-*		=> Will automatically determine if encoding is to be used
-*		=> Checks if promised number of bytes is provided
-*		=> Will automatically error, if the broken state is detected, and will auto-respond or send the connection into the broken state (stream user does not need to respond).
-*	
-*	A response sent while another is being prepared (acknowledged) will override it and close the connection.
-*	A response sent while data is already being streamed (header sent) will break the connection.
-*	Normal responses automatically add ClientConfig.responseCacheControl, if no other cache control is specified.
-*	File responses will automatically add ClientConfig.fileCacheControl/ClientConfig.immutableCacheControl, if no other cache control is specified.
-*	Responses will either use the dedicated responder interface and its highWaterMark, or a responder interface, which caches up to socket.highWaterMark.
-*
-*	Upgrade requests, which were not accepted, will be closed after responding.
-*	An accept attempt must be fully awaited before completing the handling procedure.
-*
-*	Defaults [Accept-Ranges] normally to 'none' or to 'bytes' for files
-*	Defaults [Vary] to 'Accept-Encoding'.
-*	Defaults [Connection] to 'close' for upgrade requests and for some error responses.
-*/
+/**
+ *	Does not throw any exceptions, unless explicitly stated.
+ *	Http HEAD aware (will silently drain any data sent from a HEAD request).
+ *
+ *	Request is considered acknowledged, as soon as a response has been triggered or a preparation started.
+ *	Path remains URI encoded, as it was received, and path building will use the same encoded paths.
+ *	Repeated request responding may override any ongoing responses and may terminate the connection; depending on the prior state.
+ *	Not responded to requests will result in [not-found].
+ *
+ *	Receiving data: Will automatically decode the stream and ensure a given maximum is not passed
+ *		=> Any errors while receiving will either auto-respond or send the connection into the broken state, and fail the receive reader (stream user does not need to respond).
+ *		=> Will terminate a connection, if the upload is not consumed or the client errors.
+ *		=> Premature destroying of receive reader will result in the connection being gracefully terminated.
+ *		=> All data must have been received before the response is completed.
+ *	Responding data: Will automatically encode the stream and send the header accordingly
+ *		=> Will automatically determine if encoding is to be used
+ *		=> Checks if promised number of bytes is provided
+ *		=> Will automatically error, if the broken state is detected, and will auto-respond or send the connection into the broken state (stream user does not need to respond).
+ *
+ *	A response sent while another is being prepared (acknowledged) will override it and close the connection.
+ *	A response sent while data is already being streamed (header sent) will break the connection.
+ *	Normal responses automatically add ClientConfig.responseCacheControl, if no other cache control is specified.
+ *	File responses will automatically add ClientConfig.fileCacheControl/ClientConfig.immutableCacheControl, if no other cache control is specified.
+ *	Responses will either use the dedicated responder interface and its highWaterMark, or a responder interface, which caches up to socket.highWaterMark.
+ *
+ *	Upgrade requests, which were not accepted, will be closed after responding.
+ *	An accept attempt must be fully awaited before completing the handling procedure.
+ *
+ *	Defaults [Accept-Ranges] normally to 'none' or to 'bytes' for files
+ *	Defaults [Vary] to 'Accept-Encoding'.
+ *	Defaults [Connection] to 'close' for upgrade requests and for some error responses.
+ */
 export class ClientRequest extends ClientBase {
 	private _headerPatcher: HeaderPatch[];
 	private _htmlPatcher: HtmlPatch[];
@@ -522,7 +522,8 @@ export class ClientRequest extends ClientBase {
 		});
 	}
 	private markAsBroken(reason: string, graceful: boolean): void {
-		this.error(`Connection broken: [${reason}]`);
+		if (reason != '')
+			this.error(`Connection broken: [${reason}]`);
 		this._state.response = ResponseState.broken;
 		if (this._state.breaking != null) {
 			if (!graceful)
@@ -1017,7 +1018,7 @@ export class ClientRequest extends ClientBase {
 		this._state.completedResolve();
 	}
 
-	/* respond with an internal error and kill the connection */
+	/** respond with an internal error and kill the connection */
 	public killConnection(reason: string): void {
 		const description = `Connection killed: ${reason}`;
 		const closing = (this._state.response == ResponseState.none || this._state.response == ResponseState.acknowledged);
@@ -1027,58 +1028,58 @@ export class ClientRequest extends ClientBase {
 		this.markAsBroken((closing ? '' : description), closing);
 	}
 
-	/* server the client originates from */
+	/** server the client originates from */
 	public get server(): libServer.Server {
 		return this._server;
 	}
 
-	/* cache host used by this server and client */
+	/** cache host used by this server and client */
 	public get cache(): libCache.CacheHost {
 		return this._server.cache;
 	}
 
-	/* request has not yet been acknowledged in any way */
+	/** request has not yet been acknowledged in any way */
 	public get unhandled(): boolean {
 		return (this._state.response == ResponseState.none);
 	}
 
-	/* request has been acknowledged or already processed */
+	/** request has been acknowledged or already processed */
 	public get claimed(): boolean {
 		return (this._state.response != ResponseState.none);
 	}
 
-	/* resolves whenever the response has been determined (is broken or a response header has been sent) */
+	/** resolves whenever the response has been determined (is broken or a response header has been sent) */
 	public get responded(): Promise<void> {
 		return this._state.respondedPromise;
 	}
 
-	/* resolves whenever the request has been fully processed */
+	/** resolves whenever the request has been fully processed */
 	public get completed(): Promise<void> {
 		return this._state.completedPromise;
 	}
 
-	/* http request headers */
+	/** http request headers */
 	public get headers(): libHttp.IncomingHttpHeaders {
 		return this._request.headers;
 	}
 
-	/* http request method */
+	/** http request method */
 	public get method(): string {
 		return this._request.method ?? '';
 	}
 
-	/* was the http request a head request */
+	/** was the http request a head request */
 	public get isHead(): boolean {
 		return (this._request.method == 'HEAD');
 	}
 
-	/* return the string formatted media-type (or empty string for no media type) */
+	/** return the string formatted media-type (or empty string for no media type) */
 	public getMediaType(): string {
 		const type = libHelper.splitAndTrimList(this.headers['content-type'] ?? null, ';', true)[0] ?? '';
 		return type.toLowerCase();
 	}
 
-	/* check the content-type for a media-type and otherwise return the default type */
+	/** check the content-type for a media-type and otherwise return the default type */
 	public getMediaTypeCharset(defEncoding: string): string {
 		const type = this.headers['content-type'];
 		if (type == null)
@@ -1104,7 +1105,7 @@ export class ClientRequest extends ClientBase {
 		return defEncoding;
 	}
 
-	/* ensure the media-type is one of the list and otherwise return null and auto-respond with [unsupported-media-type] (defaults to first type, if [noneIsFirst]) */
+	/** ensure the media-type is one of the list and otherwise return null and auto-respond with [unsupported-media-type] (defaults to first type, if [noneIsFirst]) */
 	public requireMediaType(types: libBase.MediaType[] | libBase.MediaType, options?: { noneIsFirst?: boolean, headers?: Record<string, string> }): libBase.MediaType | null {
 		if (!Array.isArray(types))
 			types = [types];
@@ -1121,8 +1122,8 @@ export class ClientRequest extends ClientBase {
 		return null;
 	}
 
-	/* ensure the method is one of the list and otherwise return null and auto-respond with [method-not-allowed]
-	*	if [headExplicit] is false, method will substitute HEAD for GET, framework will consume the remaining body */
+	/** ensure the method is one of the list and otherwise return null and auto-respond with [method-not-allowed]
+	 *	if [headExplicit] is false, method will substitute HEAD for GET, framework will consume the remaining body */
 	public requireMethod(methods: string[] | string, options?: { headExplicit?: boolean, headers?: Record<string, string> }): string | null {
 		if (!Array.isArray(methods))
 			methods = [methods];
@@ -1140,40 +1141,40 @@ export class ClientRequest extends ClientBase {
 		return null;
 	}
 
-	/* register a callback to check if the request is still being processed (delays throughput
-	*	termintion and resets connection timeout; will only be considered within this handler context) */
+	/** register a callback to check if the request is still being processed (delays throughput
+	 *	termintion and resets connection timeout; will only be considered within this handler context) */
 	public busyCheck(cb: () => boolean): void {
 		this._throughput.busyCheck.push(cb);
 	}
 
-	/* register a callback to be invoked once the response is sent, to adjust the
-	*	headers to be sent (will only be considered within this handler context) */
+	/** register a callback to be invoked once the response is sent, to adjust the
+	 *	headers to be sent (will only be considered within this handler context) */
 	public patchHeaders(cb: HeaderPatch): void {
 		this._headerPatcher.push(cb);
 	}
 
-	/* register a callback to be invoked if html is built, to adjust the headers or
-	*	the content to be sent (will only be considered within this handler context) */
+	/** register a callback to be invoked if html is built, to adjust the headers or
+	 *	the content to be sent (will only be considered within this handler context) */
 	public patchHtmlPage(cb: HtmlPatch): void {
 		this._htmlPatcher.push(cb);
 	}
 
-	/* respond with [internal-error] and a default text response (always considered an error; reason is logged server-side only) */
+	/** respond with [internal-error] and a default text response (always considered an error; reason is logged server-side only) */
 	public respondInternalError(reason: string, options?: { headers?: Record<string, string> }): void {
 		this.constructQuickResponse(libBase.Status.InternalError, `Failure Reason (not sent): ${reason}`, options?.headers, {
 			media: libBase.Media.Text, body: Buffer.from(`An internal server error occurred while processing the request for [${this.url.pathname}].`, 'utf-8')
 		});
 	}
 
-	/* respond with [forbidden] and a default text response (reason is logged server-side only) */
+	/** respond with [forbidden] and a default text response (reason is logged server-side only) */
 	public respondForbidden(reason: string, options?: { headers?: Record<string, string> }): void {
 		this.constructQuickResponse(libBase.Status.Forbidden, `Forbidden Reason (not sent): ${reason}`, options?.headers, {
 			media: libBase.Media.Text, body: Buffer.from(`Access to [${this.url.pathname}] denied.`, 'utf-8')
 		});
 	}
 
-	/* respond with a any response of the given configuration (defaults to media-type: text/unknown/-, status: ok);
-	*	if [lightResponse], the content length is suppressed for head responses (to accomodate short-circuiting responding) */
+	/** respond with a any response of the given configuration (defaults to media-type: text/unknown/-, status: ok);
+	 *	if [lightResponse], the content length is suppressed for head responses (to accomodate short-circuiting responding) */
 	public respond(content: string | Buffer | null, options?: { media?: libBase.MediaType, status?: libBase.StatusType, headers?: Record<string, string>, lightResponse?: boolean }): void {
 		const status = options?.status ?? libBase.Status.Ok;
 
@@ -1191,14 +1192,14 @@ export class ClientRequest extends ClientBase {
 		});
 	}
 
-	/* respond with [ok] and either a message or a default response */
+	/** respond with [ok] and either a message or a default response */
 	public respondOk(options?: { message?: string, headers?: Record<string, string> }): void {
 		this.constructQuickResponse(libBase.Status.Ok, options?.message ?? null, options?.headers, {
 			media: libBase.Media.Text, body: Buffer.from(options?.message ?? `${this.method} was successful for [${this.url.pathname}].`, 'utf-8')
 		});
 	}
 
-	/* respond with [created] and either a message or a default response (ensure target is properly URI encoded) */
+	/** respond with [created] and either a message or a default response (ensure target is properly URI encoded) */
 	public respondCreated(target: string, options?: { headers?: Record<string, string> }): void {
 		const header = (options?.headers ?? {});
 		header['Location'] = target;
@@ -1208,7 +1209,7 @@ export class ClientRequest extends ClientBase {
 		});
 	}
 
-	/* respond with [not-modified] and no body (ensure the etag and/or last-modified is set) */
+	/** respond with [not-modified] and no body (ensure the etag and/or last-modified is set) */
 	public respondNotModified(options?: { etag?: string, lastModified?: string, headers?: Record<string, string> }): void {
 		const header = (options?.headers ?? {});
 		if (options?.etag != null && !('ETag' in header))
@@ -1219,7 +1220,7 @@ export class ClientRequest extends ClientBase {
 		this.constructQuickResponse(libBase.Status.NotModified, null, header, null);
 	}
 
-	/* respond with [precondition-failed] and a default text response (ensure the etag and/or last-modified is set) */
+	/** respond with [precondition-failed] and a default text response (ensure the etag and/or last-modified is set) */
 	public respondPreconditionFailed(reason: string, options?: { etag?: string, lastModified?: string, headers?: Record<string, string> }): void {
 		const header = (options?.headers ?? {});
 		if (options?.etag != null && !('ETag' in header))
@@ -1232,14 +1233,14 @@ export class ClientRequest extends ClientBase {
 		});
 	}
 
-	/* respond with [bad-request] and a default text response */
+	/** respond with [bad-request] and a default text response */
 	public respondBadRequest(reason: string, options?: { headers?: Record<string, string> }): void {
 		this.constructQuickResponse(libBase.Status.BadRequest, reason, options?.headers, {
 			media: libBase.Media.Text, body: Buffer.from(`Request for [${this.url.pathname}] is perceived as malformed:\n${reason}`, 'utf-8')
 		});
 	}
 
-	/* respond with [range-not-satisfiable] and a default text response */
+	/** respond with [range-not-satisfiable] and a default text response */
 	public respondRangeIssue(range: string, size: number, options?: { headers?: Record<string, string> }): void {
 		const header = (options?.headers ?? {});
 		header['Content-Range'] = `bytes */${size}`;
@@ -1249,28 +1250,28 @@ export class ClientRequest extends ClientBase {
 		});
 	}
 
-	/* respond with [conflict] and a default text response */
+	/** respond with [conflict] and a default text response */
 	public respondConflict(conflict: string, options?: { headers?: Record<string, string> }): void {
 		this.constructQuickResponse(libBase.Status.Conflict, conflict, options?.headers, {
 			media: libBase.Media.Text, body: Buffer.from(`Conflict for resource [${this.url.pathname}]:\n${conflict}`, 'utf-8')
 		});
 	}
 
-	/* respond with [not-found] and a default text response */
+	/** respond with [not-found] and a default text response */
 	public respondNotFound(options?: { headers?: Record<string, string> }): void {
 		this.constructQuickResponse(libBase.Status.NotFound, null, options?.headers, {
 			media: libBase.Media.Text, body: Buffer.from(`Resource [${this.url.pathname}] could not be found.`, 'utf-8')
 		});
 	}
 
-	/* respond with [unsupported-media-type] and a default text response */
+	/** respond with [unsupported-media-type] and a default text response */
 	public respondUnsupported(used: string, allowed: string, options?: { headers?: Record<string, string> }): void {
 		this.constructQuickResponse(libBase.Status.UnsupportedMediaType, `Allowed was [${allowed}] but [${used}] was used`, options?.headers, {
 			media: libBase.Media.Text, body: Buffer.from(`Media type [${used}] not supported for [${this.url.pathname}].\nAllowed: ${allowed}`, 'utf-8')
 		});
 	}
 
-	/* respond with [invalid-method] and a default text response */
+	/** respond with [method-not-allowed] and a default text response */
 	public respondMethodNotAllowed(method: string, allowed: string, options?: { headers?: Record<string, string> }): void {
 		const header = (options?.headers ?? {});
 		header['Allow'] = allowed;
@@ -1280,7 +1281,7 @@ export class ClientRequest extends ClientBase {
 		});
 	}
 
-	/* respond with [request-timeout] and a default text response */
+	/** respond with [request-timeout] and a default text response */
 	public respondRequestTimeout(reason: string, options?: { headers?: Record<string, string> }): void {
 		const header = (options?.headers ?? {});
 		header['Connection'] = 'close';
@@ -1290,14 +1291,14 @@ export class ClientRequest extends ClientBase {
 		});
 	}
 
-	/* respond with [content-too-large] and a default text response */
+	/** respond with [content-too-large] and a default text response */
 	public respondContentTooLarge(allowed: number, atLeastProvided: number, options?: { headers?: Record<string, string> }): void {
 		this.constructQuickResponse(libBase.Status.ContentTooLarge, `[${atLeastProvided}] > [${allowed}]`, options?.headers, {
 			media: libBase.Media.Text, body: Buffer.from(`Content of at least size ${atLeastProvided} too large for [${this.url.pathname}].\nAt most ${allowed} bytes are allowed.`, 'utf-8')
 		});
 	}
 
-	/* respond with [update-required] and a default text response */
+	/** respond with [update-required] and a default text response */
 	public respondUpdateRequired(upgrade: string, options?: { headers?: Record<string, string> }): void {
 		const header = (options?.headers ?? {});
 		if (!('Connection' in header))
@@ -1309,7 +1310,7 @@ export class ClientRequest extends ClientBase {
 		});
 	}
 
-	/* respond with [see-other] to the given target and a default text response (forces method GET; ensure target is properly URI encoded) */
+	/** respond with [see-other] to the given target and a default text response (forces method GET; ensure target is properly URI encoded) */
 	public respondSeeOther(target: string, options?: { headers?: Record<string, string> }): void {
 		const header = (options?.headers ?? {});
 		header['Location'] = target;
@@ -1319,7 +1320,7 @@ export class ClientRequest extends ClientBase {
 		});
 	}
 
-	/* respond with [temporary-redirect] to the given target and a default text response (preserves method; ensure target is properly URI encoded) */
+	/** respond with [temporary-redirect] to the given target and a default text response (preserves method; ensure target is properly URI encoded) */
 	public respondTemporaryRedirect(target: string, options?: { headers?: Record<string, string> }): void {
 		const header = (options?.headers ?? {});
 		header['Location'] = target;
@@ -1329,7 +1330,7 @@ export class ClientRequest extends ClientBase {
 		});
 	}
 
-	/* respond with [permanent-redirect] to the given target and a default text response (preserves method; ensure target is properly URI encoded)  */
+	/** respond with [permanent-redirect] to the given target and a default text response (preserves method; ensure target is properly URI encoded) */
 	public respondPermanentRedirect(target: string, options?: { headers?: Record<string, string> }): void {
 		const header = (options?.headers ?? {});
 		header['Location'] = target;
@@ -1339,9 +1340,9 @@ export class ClientRequest extends ClientBase {
 		});
 	}
 
-	/* respond with html, can be built on by parent modules, sent once the request has been fully processed
-	*	(default status is ok; for HEAD builds, no actual content will be constructed or estimated in size)
-	*	automatically adds ClientConfig.responseCacheControl, if no other cache control is specified */
+	/** respond with html, can be built on by parent modules, sent once the request has been fully processed
+	 *	(default status is ok; for HEAD builds, no actual content will be constructed or estimated in size)
+	 *	automatically adds ClientConfig.responseCacheControl, if no other cache control is specified */
 	public async respondHtml(page: libBuilder.HtmlPage, options?: { status?: libBase.StatusType, headers?: Record<string, string> }): Promise<void> {
 		if (this._state.response != ResponseState.none)
 			return this.badClientUsage('HTML response on already claimed connection', false);
@@ -1371,10 +1372,10 @@ export class ClientRequest extends ClientBase {
 		this.sendFullResponse(status, headers, { media: libBase.Media.Html, body: content });
 	}
 
-	/* [no-throw but errors] send data with [media type] and [status] and return a writable stream (default: status is ok, media is unknown, dynamicEncode is true);
-	*	if a content size is provided, stream expects exactly this amount of bytes; if [dynamicEncode], the encoder will be dynamically negotiated
-	*	based on the content; for a HEAD request, no encoding will be negotiated, no lengths verified, and the written data will just be drained
-	*	(can immediately be ended using '.end()'); automatically adds ClientConfig.responseCacheControl, if no other cache control is specified */
+	/** [no-throw but errors] send data with [media type] and [status] and return a writable stream (default: status is ok, media is unknown, dynamicEncode is true);
+	 *	if a content size is provided, stream expects exactly this amount of bytes; if [dynamicEncode], the encoder will be dynamically negotiated
+	 *	based on the content; for a HEAD request, no encoding will be negotiated, no lengths verified, and the written data will just be drained
+	 *	(can immediately be ended using '.end()'); automatically adds ClientConfig.responseCacheControl, if no other cache control is specified */
 	public respondData(options?: { status?: libBase.StatusType, media?: libBase.MediaType, contentSize?: number, dynamicEncode?: boolean, headers?: Record<string, string> }): libStream.Writable {
 		const status: libBase.StatusType = options?.status ?? libBase.Status.Ok;
 		const headers = (options?.headers ?? {});
@@ -1385,11 +1386,11 @@ export class ClientRequest extends ClientBase {
 		return this.sendClientData(status, options?.media ?? libBase.Media.Unknown, headers, options?.dynamicEncode ?? true, options?.contentSize ?? null);
 	}
 
-	/* try to respond with the given file, return false, if the file does not exist (range aware, HEAD aware); specify [checkFreshness] to
-	*	re-validate the file stats on disk before serving from cache; the media type can be overwritten (defaults to extracting media-type
-	*	from the file-path); [encoding] describes the encoding of a pre-encoded file (warning: no checks against accepted encodings
-	*	performed!); status will be [Ok], [partial-content], [not-modified] or according errors cache aware and etag/last-modified aware;
-	*	automatically adds ClientConfig.fileCacheControl/ClientConfig.immutableCacheControl, if no other cache control is specified */
+	/** try to respond with the given file, return false, if the file does not exist (range aware, HEAD aware); specify [checkFreshness] to
+	 *	re-validate the file stats on disk before serving from cache; the media type can be overwritten (defaults to extracting media-type
+	 *	from the file-path); [encoding] describes the encoding of a pre-encoded file (warning: no checks against accepted encodings
+	 *	performed!); status will be [Ok], [partial-content], [not-modified] or according errors cache aware and etag/last-modified aware;
+	 *	automatically adds ClientConfig.fileCacheControl/ClientConfig.immutableCacheControl, if no other cache control is specified */
 	public async tryRespondFile(filePath: string, options?: { encoded?: string, media?: libBase.MediaType, headers?: Record<string, string>, checkFreshness?: boolean }): Promise<boolean> {
 		if (options == null)
 			options = {};
@@ -1533,9 +1534,9 @@ export class ClientRequest extends ClientBase {
 		});
 	}
 
-	/* [throws] receive the payload of given max length and write it directly to a file; will fail
-	*	if the file already exists and delete the file if it could not be received in full
-	*	automatically responds with given exceptions if the payload cannot be received properly or file operations fail */
+	/** [throws] receive the payload of given max length and write it directly to a file; will fail
+	 *	if the file already exists and delete the file if it could not be received in full
+	 *	automatically responds with given exceptions if the payload cannot be received properly or file operations fail */
 	public async receiveToFile(path: string, maxLength: number | null): Promise<void> {
 		this.trace(`Collecting data from [${this.url.pathname}] to: [${path}]`);
 		return new Promise((resolve, reject) => {
@@ -1580,15 +1581,15 @@ export class ClientRequest extends ClientBase {
 		});
 	}
 
-	/* [no-throw but errors] receive the payload of given max length as a readable stream
-	*	automatically responds with given exceptions if the payload cannot be received properly
-	*	automatically drained if the readable stream is destroyed before reading all data */
+	/** [no-throw but errors] receive the payload of given max length as a readable stream
+	 *	automatically responds with given exceptions if the payload cannot be received properly
+	 *	automatically drained if the readable stream is destroyed before reading all data */
 	public receiveData(maxLength: number | null): libStream.Readable {
 		return this.receiveClientData(maxLength);
 	}
 
-	/* [throws] receive the payload of given max length as a single complete buffer
-	*	automatically responds with given exceptions if the payload cannot be received properly */
+	/** [throws] receive the payload of given max length as a single complete buffer
+	 *	automatically responds with given exceptions if the payload cannot be received properly */
 	public async receiveAllBuffer(maxLength: number | null): Promise<Buffer> {
 		return new Promise((resolve, reject) => {
 			let stream: libStream.Readable = this.receiveClientData(maxLength);
@@ -1600,8 +1601,8 @@ export class ClientRequest extends ClientBase {
 		});
 	}
 
-	/* [throws] receive the payload of given max length as a single complete decoded string
-	*	automatically responds with given exceptions if the payload cannot be received properly */
+	/** [throws] receive the payload of given max length as a single complete decoded string
+	 *	automatically responds with given exceptions if the payload cannot be received properly */
 	public async receiveAllText(encoding: string, maxLength: number | null): Promise<string> {
 		/* wait for the buffer (let all errors propagate out) */
 		const buffer: Buffer = await this.receiveAllBuffer(maxLength);
@@ -1614,8 +1615,8 @@ export class ClientRequest extends ClientBase {
 		}
 	}
 
-	/* marks the object as having been handled and returns a web socket or
-	*	automatically responds with a corresponding error and returns null */
+	/** marks the object as having been handled and returns a web socket or
+	 *	automatically responds with a corresponding error and returns null */
 	public async acceptWebSocket(): Promise<ClientSocket | null> {
 		if (this._state.response != ResponseState.none) {
 			this.badClientUsage('WebSocket upgrade on already claimed connection', false);
@@ -1675,12 +1676,12 @@ export class ClientRequest extends ClientBase {
 	}
 }
 
-/*
-*	WebSocket with integrated alive checks.
-*	Structured WebSocket, which takes care of error handling.
-*	The 'close' event is guaranteed to fire exactly once and no 'data' events will follow.
-*	Takes ownership of the socket.
-*/
+/**
+ *	WebSocket with integrated alive checks.
+ *	Structured WebSocket, which takes care of error handling.
+ *	The 'close' event is guaranteed to fire exactly once and no 'data' events will follow.
+ *	Takes ownership of the socket.
+ */
 export class ClientSocket extends ClientBase {
 	private _ws: libWs.WebSocket;
 	private _alive: {
@@ -1827,7 +1828,7 @@ export class ClientSocket extends ClientBase {
 		return new ClientSocket(ws, source);
 	}
 
-	/* send data to the remote (ignored if connection is being closed) */
+	/** send data to the remote (ignored if connection is being closed) */
 	public send(data: string | Buffer): void {
 		if (this._closing.promise != null)
 			return;
@@ -1839,7 +1840,7 @@ export class ClientSocket extends ClientBase {
 		}
 	}
 
-	/* close the web socket (promise resolved once the close callback has been fully invoked) */
+	/** close the web socket (promise resolved once the close callback has been fully invoked) */
 	public close(): Promise<void> {
 		if (this._closing.promise == null) {
 			this._ws.close();
@@ -1848,7 +1849,7 @@ export class ClientSocket extends ClientBase {
 		return this._closing.promise!;
 	}
 
-	/* tag the logging with the given identifier and return a callback to update the tag */
+	/** tag the logging with the given identifier and return a callback to update the tag */
 	public tagLog(identifier: string): SocketLogTag {
 		let tag: { value: string } | null = { value: identifier };
 
@@ -1893,37 +1894,37 @@ export class ClientSocket extends ClientBase {
 }
 
 export interface ClientConfig {
-	/* default server name to be used in the http:server header [empty value prevents server header; Default: 'Modular Web Server'] */
+	/** default server name to be used in the http:server header [empty value prevents server header; Default: 'Modular Web Server'] */
 	serverName?: string;
 
-	/* default header values to be added to every http response [Default: { 'X-Content-Type-Options': 'nosniff' }] */
+	/** default header values to be added to every http response [Default: { 'X-Content-Type-Options': 'nosniff' }] */
 	commonHeaders?: Record<string, string>;
 
-	/* default web-socket timeout before performing a ping to determine liveness [0 disables the timeout; in milliseconds; Default: 180_000] */
+	/** default web-socket timeout before performing a ping to determine liveness [0 disables the timeout; in milliseconds; Default: 180_000] */
 	webSocketTimeout?: number;
 
-	/* default web-socket timeout to respond to a liveness ping before closing the connection [0 kills the connection without ping test; in milliseconds; Default: 2_000] */
+	/** default web-socket timeout to respond to a liveness ping before closing the connection [0 kills the connection without ping test; in milliseconds; Default: 2_000] */
 	webSocketAliveTimeout?: number;
 
-	/* time for a broken connection or socket to receive the response before force-closing it [0 results in immediate close; in milliseconds; Default: 1_000] */
+	/** time for a broken connection or socket to receive the response before force-closing it [0 results in immediate close; in milliseconds; Default: 1_000] */
 	killGraceTimeout?: number;
 
-	/* default cache-control value for normal cache reads [empty string does not set any cache-control; Default: 'public, max-age=600, must-revalidate' (10 minutes)] */
+	/** default cache-control value for normal cache reads [empty string does not set any cache-control; Default: 'public, max-age=600, must-revalidate' (10 minutes)] */
 	fileCacheControl?: string;
 
-	/* default cache-control value for immutable cache reads [empty string does not set any cache-control; Default: 'public, max-age=2592000, immutable' (30 days)] */
+	/** default cache-control value for immutable cache reads [empty string does not set any cache-control; Default: 'public, max-age=2592000, immutable' (30 days)] */
 	immutableCacheControl?: string;
 
-	/* default cache-control value for any basic responses [empty string does not set any cache-control; Default: 'private, no-cache'] */
+	/** default cache-control value for any basic responses [empty string does not set any cache-control; Default: 'private, no-cache'] */
 	responseCacheControl?: string;
 
-	/* grace period before the throughput is started to be measured or for busy connections [in milliseconds; Default: 10_000] */
+	/** grace period before the throughput is started to be measured or for busy connections [in milliseconds; Default: 10_000] */
 	throughputGrace?: number;
 
-	/* throughput required for combined sending and receiving bodies of requests [0 disables the throughput check, in bytes/second; Default: 1_000] */
+	/** throughput required for combined sending and receiving bodies of requests [0 disables the throughput check, in bytes/second; Default: 1_000] */
 	throughputThreshold?: number;
 
-	/* length of sliding time window for which the throughput must be above the threshold [in milliseconds; Default: 30_000] */
+	/** length of sliding time window for which the throughput must be above the threshold [in milliseconds; Default: 30_000] */
 	throughputWindow?: number;
 }
 

@@ -30,16 +30,16 @@ function formatLine(level: LogLevel, date: string, identity: string, msg: string
 	return `[${date}] ${printLevel}: [${identity}] ${msg}`;
 }
 
-/* supported log level */
+/** supported log level */
 export type LogLevel = 'error' | 'info' | 'warning' | 'log' | 'trace';
 
-/* if [level] is null: is not a log, but the callback is being unregistered */
+/** if [level] is null: is not a log, but the callback is being unregistered */
 export type LogConsumer = (level: LogLevel | null, date: string, identity: string, msg: string) => void;
 
-/* type to invoke to detach the given logger */
+/** type to invoke to detach the given logger */
 export type Detacher = () => void;
 
-/* implementation of a console logger */
+/** implementation of a console logger */
 export function createConsoleLogger(): LogConsumer {
 	return (level: LogLevel | null, date: string, identity: string, msg: string) => {
 		if (level == null)
@@ -71,7 +71,7 @@ export function createConsoleLogger(): LogConsumer {
 	};
 }
 
-/* implementation of a logger which receives a well formatted line */
+/** implementation of a logger which receives a well formatted line */
 export function createLineLogger(cb: (line: string) => void): LogConsumer {
 	return (level: LogLevel | null, date: string, identity: string, msg: string) => {
 		if (level != null)
@@ -79,19 +79,19 @@ export function createLineLogger(cb: (line: string) => void): LogConsumer {
 	};
 }
 
-/* file overwriting preservation mode */
+/** file overwriting preservation mode */
 export enum PreserveMode {
-	/* simply clear the log file once full */
+	/** simply clear the log file once full */
 	none,
 
-	/* preserve the last log file to 'filePath.old' */
+	/** preserve the last log file to 'filePath.old' */
 	last,
 
-	/* preserve all last log files to 'filePath.%time%.old */
+	/** preserve all last log files to 'filePath.%time%.old */
 	all
 }
 
-/* implementation of a file logger, which logs into the file-path and optionally preserves old logs
+/** implementation of a file logger, which logs into the file-path and optionally preserves old logs
 *	(Note: contains a timer, server shutdown should clear all loggers to ensure fast shutdown) */
 export function createFileLogger(filePath: string, options?: { flushingDelayMs?: number, bufMaxLineCount?: number, sizeSwapFile?: number, preserve?: PreserveMode }): LogConsumer {
 	/* setup the logging state (ignore any errors, as they cannot be logged) */
@@ -170,7 +170,7 @@ export function createFileLogger(filePath: string, options?: { flushingDelayMs?:
 	};
 }
 
-/* implementation of a log filter, which can filter by matching level and identity including a given sub-string, and then forwards these logs to the target logger */
+/** implementation of a log filter, which can filter by matching level and identity including a given sub-string, and then forwards these logs to the target logger */
 export function createLogFilter(target: LogConsumer, options?: { level?: LogLevel | LogLevel[], identity?: string | string[] }): LogConsumer {
 	const filterLevel = (options?.level == null ? null : new Set<string>(Array.isArray(options.level) ? options.level : [options.level]));
 	const filterIdentity = (options?.identity == null ? null : (Array.isArray(options.identity) ? options.identity : [options.identity]));
@@ -188,7 +188,7 @@ export function createLogFilter(target: LogConsumer, options?: { level?: LogLeve
 	};
 }
 
-/* logger class to extend, supporting various logging classes, and writing to the registered log consumer */
+/** logger class to extend, supporting various logging classes, and writing to the registered log consumer */
 export function createLogger(identity: string): Logger {
 	return new Logger(identity);
 }
@@ -206,12 +206,12 @@ export class Logger {
 		logGlobal(level, identity, msg);
 	}
 
-	/* update the log identity */
+	/** update the log identity */
 	protected logSetIdentity(identity: string): void {
 		this._logIdentity = identity;
 	}
 
-	/* logging identity as shown in logs */
+	/** logging identity as shown in logs */
 	public get identity(): string {
 		return this._logIdentity;
 	}
@@ -233,7 +233,7 @@ export class Logger {
 	}
 }
 
-/* register another global logger to receive the logs (returned detacher can be invoked to remove the log) */
+/** register another global logger to receive the logs (returned detacher can be invoked to remove the log) */
 export function addLogger(cb: LogConsumer): Detacher {
 	let detached = false;
 	const wrapped = (level: LogLevel | null, date: string, identity: string, msg: string): void => {
@@ -262,7 +262,7 @@ export function addLogger(cb: LogConsumer): Detacher {
 	};
 }
 
-/* perform a global log to all registered loggers */
+/** perform a global log to all registered loggers */
 export function logGlobal(level: LogLevel, identity: string, msg: string): void {
 	const date = new Date().toUTCString();
 	for (const cb of GlobalLogConsumers)

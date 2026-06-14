@@ -18,17 +18,17 @@ for (const media of Object.values(libBase.Media)) {
 for (const encoding of Object.values(libBase.Encoding))
 	EncodingNameToEncodingTypeMapping[encoding.name] = encoding;
 
-/* lookup the encoding for a given name */
+/** lookup the encoding for a given name */
 export function lookupEncoding(name: string): libBase.EncodingType | null {
 	return EncodingNameToEncodingTypeMapping[name.toLowerCase()] ?? null;
 }
 
-/* list of all supported encodings */
+/** list of all supported encodings */
 export function supportedEncodingNames(): string[] {
 	return Object.keys(EncodingNameToEncodingTypeMapping);
 }
 
-/* map extension of file-path/file-name to media type (null if no match was found) */
+/** map extension of file-path/file-name to media type (null if no match was found) */
 export function lookupMediaTypeFromFile(filePath: string): libBase.MediaType | null {
 	const fileExtension = splitFilePath(filePath)[2];
 	if (fileExtension != '') {
@@ -39,14 +39,14 @@ export function lookupMediaTypeFromFile(filePath: string): libBase.MediaType | n
 	return null;
 }
 
-/* format the media type to the proper http header identifier */
+/** format the media type to the proper http header identifier */
 export function buildMediaTypeIdentifier(media: libBase.MediaType): string {
 	if (media.encoding == '')
 		return media.mediaType;
 	return `${media.mediaType}; ${media.encoding}`;
 }
 
-/* does not respect 'no-identity' encoding requests; unknown at-least-size is considered valid (defaults 'identity' to null) */
+/** does not respect 'no-identity' encoding requests; unknown at-least-size is considered valid (defaults 'identity' to null) */
 export function negotiateEncoding(accept: string | null, atLeastSize: number | null, media: libBase.MediaType): libBase.EncodingType | null {
 	if (!media.compressible || accept == null)
 		return null;
@@ -105,7 +105,7 @@ export enum RangeState {
 	malformed
 }
 
-/* parse an http header range request (first and last are correct for all valid range states; will be [0,-1] for an emtpy file) */
+/** parse an http header range request (first and last are correct for all valid range states; will be [0,-1] for an emtpy file) */
 export function parseRangeHeader(range: string | null, fileSize: number): { first: number, last: number, state: RangeState } {
 	if (range == null)
 		return { first: 0, last: fileSize - 1, state: RangeState.noRange };
@@ -160,7 +160,7 @@ export function parseRangeHeader(range: string | null, fileSize: number): { firs
 	return { first: fileSize - last!, last: fileSize - 1, state: RangeState.valid };
 }
 
-/* check if the [etag] matches the list (i.e. in list or list is '*'), will not match for undefined list; if [strong]
+/** check if the [etag] matches the list (i.e. in list or list is '*'), will not match for undefined list; if [strong]
 *	comparison, both must be non-weak, opaque-tags equal (strip W/ prefix and compare opaque-tags regardless of weakness) */
 export function etagMatchesList(etag: string, header: string | null, strong: boolean): boolean {
 	if (header == null)
@@ -181,7 +181,7 @@ export function etagMatchesList(etag: string, header: string | null, strong: boo
 	return false;
 }
 
-/* returns null on invalid times, [>0] for a being greater, [<0] for a being smaller, [=0] for same time */
+/** returns null on invalid times, [>0] for a being greater, [<0] for a being smaller, [=0] for same time */
 export function timestampCompare(a: string, b: string): number | null {
 	const _a = new Date(a).getTime();
 	if (isNaN(_a))
@@ -192,7 +192,7 @@ export function timestampCompare(a: string, b: string): number | null {
 	return (_a - _b);
 }
 
-/* split a list value while removing whitespace and optionally respecting quotes (returns empty list on validly quoted strings) */
+/** split a list value while removing whitespace and optionally respecting quotes (returns empty list on validly quoted strings) */
 export function splitAndTrimList(content: string | null, separator: string, quotesAware: boolean): string[] {
 	if (content == null)
 		return [];
@@ -214,7 +214,7 @@ export function splitAndTrimList(content: string | null, separator: string, quot
 	return output;
 }
 
-/* escape all html-special characters to prevent injection when embedding untrusted values */
+/** escape all html-special characters to prevent injection when embedding untrusted values */
 export function escapeHtml(content: string): string {
 	let out = '';
 	for (let i = 0; i < content.length; ++i) {
@@ -230,7 +230,7 @@ export function escapeHtml(content: string): string {
 	return out;
 }
 
-/* expand the placeholders in the content (format: {#name}, with '{#' being escaped as '{##'; optionally html-escape values) */
+/** expand the placeholders in the content (format: {#name}, with '{#' being escaped as '{##'; optionally html-escape values) */
 export function expandPlaceholders(content: string, args: Record<string, string>, htmlEscape: boolean): string {
 	let out = '', name = '', placeholder = false;
 	for (let i = 0; i < content.length; ++i) {
@@ -264,7 +264,7 @@ export function expandPlaceholders(content: string, args: Record<string, string>
 	return out;
 }
 
-/* escape all placeholders in the content */
+/** escape all placeholders in the content */
 export function escapePlaceholders(content: string): string {
 	let out = '';
 
@@ -278,7 +278,7 @@ export function escapePlaceholders(content: string): string {
 	return out;
 }
 
-/* sanitize path and remove relative path components and convert it to an absolute path */
+/** sanitize path and remove relative path components and convert it to an absolute path */
 export function sanitize(path: string, relative: boolean): string {
 	/* treat the path as absolute, but preserve backward traversals into the root */
 	let out = '/';
@@ -332,7 +332,7 @@ export function sanitize(path: string, relative: boolean): string {
 	return out;
 }
 
-/* join two paths into the sanitized absolute server path-environment */
+/** join two paths into the sanitized absolute server path-environment */
 export function joinSanitized(a: string, b: string): string {
 	if (a.length == 0 || b.length == 0)
 		return sanitize(a.length == 0 ? b : a, false);
@@ -342,7 +342,7 @@ export function joinSanitized(a: string, b: string): string {
 	return sanitize(bSlash ? a + b : `${a}/${b}`, false);
 }
 
-/* check if the sanitized path is a sub-path of or equal to the sanitized base path (can be /base or /base/...) */
+/** check if the sanitized path is a sub-path of or equal to the sanitized base path (can be /base or /base/...) */
 export function isSubPath(base: string, path: string): boolean {
 	if (base.length > path.length)
 		return false;
@@ -353,7 +353,7 @@ export function isSubPath(base: string, path: string): boolean {
 	return (path[base.length] == '/' || base.endsWith('/'));
 }
 
-/* check if the sanitized path is a true sub-path of the sanitized base path (must be truly inside: /base/...) */
+/** check if the sanitized path is a true sub-path of the sanitized base path (must be truly inside: /base/...) */
 export function isInside(base: string, path: string): boolean {
 	if (base.length >= path.length)
 		return false;
@@ -362,33 +362,33 @@ export function isInside(base: string, path: string): boolean {
 	return ((path[base.length] == '/' && base.length + 1 < path.length) || base.endsWith('/'));
 }
 
-/* return the remaining path for the sub directory path in base (must be a true sub-directory) */
+/** return the remaining path for the sub directory path in base (must be a true sub-directory) */
 export function childPath(base: string, path: string): string {
 	const out = path.substring(base.endsWith('/') ? base.length - 1 : base.length);
 	return (out == '' ? '/' : out);
 }
 
-/* rebase the path from the old base directory onto the new base (must be a true sub-directory) */
+/** rebase the path from the old base directory onto the new base (must be a true sub-directory) */
 export function rebasePath(oldBase: string, newBase: string, path: string): string {
 	return joinSanitized(newBase, childPath(oldBase, path));
 }
 
-/* create path-creator, which returns sanitized paths relative to [path] */
+/** create path-creator, which returns sanitized paths relative to [path] */
 export function createPathLocation(path: string): (path: string) => string {
 	return function (p) {
 		return libPath.join(path, sanitize(p, false));
 	};
 }
 
-/* create path-creator, which returns paths relative to the file url path (like the script itself using 'import.meta.url') and optionally the nested path [path] */
-export function createPathSelf(urlFilePath: string, path: string | null = null): (path: string) => string {
+/** create path-creator, which returns paths relative to the file url path (like the script itself using 'import.meta.url') and optionally changed by relative [path] */
+export function createPathSelf(urlFilePath: string, path?: string): (path: string) => string {
 	let dirName = libPath.dirname(libUrl.fileURLToPath(urlFilePath));
 	if (path != null)
 		dirName = libPath.join(dirName, sanitize(path, true));
 	return createPathLocation(dirName);
 }
 
-/* split the path in three components ['/base/', 'name', '.extension'] (extension will be empty if the path
+/** split the path in three components ['/base/', 'name', '.extension'] (extension will be empty if the path
 *	does not contain a distinct extension; path will be empty if the path does not contain a distinct path) */
 export function splitFilePath(path: string): [string, string, string] {
 	let dot: number | null = null;

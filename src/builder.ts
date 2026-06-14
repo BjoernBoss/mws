@@ -2,7 +2,7 @@
 /* Copyright (c) 2026 Bjoern Boss Henrichsen */
 import * as libHelper from "./helper.js";
 
-/* wrapper around a string that has been verified as safe for direct html insertion;
+/** wrapper around a string that has been verified as safe for direct html insertion;
 *	plain strings are treated as untrusted and will be html-escaped before wrapping */
 export type HtmlString = HtmlGuard | string;
 export class HtmlGuard {
@@ -11,29 +11,29 @@ export class HtmlGuard {
 		this.content = content;
 	}
 
-	/* ensure the value is safe for html insertion; escapes plain strings, passes through HtmlGuard as-is */
+	/** ensure the value is safe for html insertion; escapes plain strings, passes through HtmlGuard as-is */
 	public static get(str: HtmlString): HtmlGuard {
 		return (str instanceof HtmlGuard ? str : new HtmlGuard(libHelper.escapeHtml(str)));
 	}
 
-	/* wrap a string for html insertion; if safe is false, it will be html-escaped first */
+	/** wrap a string for html insertion; if safe is false, it will be html-escaped first */
 	public static make(str: string, safe: boolean): HtmlGuard {
 		return new HtmlGuard(safe ? str : libHelper.escapeHtml(str));
 	}
 }
 
-/* create a secure string [if safe is true, content is taken as-is; otherwise it is html escaped] */
+/** create a secure string [if safe is true, content is taken as-is; otherwise it is html escaped] */
 export function Safe(content: string, safe: boolean = true): HtmlGuard {
 	return HtmlGuard.make(content, safe);
 }
 
-/* html component building interface (simple should return true for small one liners) */
+/** html component building interface (simple should return true for small one liners) */
 export interface HtmlComponent {
 	finalize(indent: string): string;
 	simple(): boolean;
 }
 
-/* raw text content to be embedded into an html tree */
+/** raw text content to be embedded into an html tree */
 export class EmbeddedContent implements HtmlComponent {
 	private content: string;
 	public constructor(content: string, safe: boolean) {
@@ -47,7 +47,7 @@ export class EmbeddedContent implements HtmlComponent {
 	}
 }
 
-/* self-closing html tag (e.g. <meta/>, <link/>, <br/>) */
+/** self-closing html tag (e.g. <meta/>, <link/>, <br/>) */
 export class SingleTag implements HtmlComponent {
 	private content: string;
 	public constructor(name: string, properties: Record<string, HtmlString>) {
@@ -63,7 +63,7 @@ export class SingleTag implements HtmlComponent {
 	}
 }
 
-/* html tag with children (e.g. <div>...</div>, <p>text</p>) */
+/** html tag with children (e.g. <div>...</div>, <p>text</p>) */
 export class DualTag implements HtmlComponent {
 	private openTag: string;
 	private closeTag: string;
@@ -94,7 +94,7 @@ export class DualTag implements HtmlComponent {
 	}
 }
 
-/* full html page; automatically adds utf-8 charset and defaults language to 'en' */
+/** full html page; automatically adds utf-8 charset and defaults language to 'en' */
 export class HtmlPage {
 	private _head: HtmlComponent[];
 	private _body: HtmlComponent[];
@@ -136,7 +136,7 @@ export class HtmlPage {
 	}
 }
 
-/* embed raw content; if safe is true, the content is trusted and
+/** embed raw content; if safe is true, the content is trusted and
 *	inserted verbatim; otherwise it is html-escaped before insertion */
 export function Embed(content: string, safe: boolean): HtmlComponent {
 	return new EmbeddedContent(content, safe);
@@ -154,12 +154,12 @@ export function LoadScript(path: HtmlString, properties: Record<string, HtmlStri
 	return new DualTag('script', { ...properties, src: path }, []);
 }
 
-/* inline css; content is inserted verbatim as <style> is a raw text element */
+/** inline css; content is inserted verbatim as <style> is a raw text element */
 export function AddStyle(content: string, properties: Record<string, HtmlString> = {}): HtmlComponent {
 	return new DualTag('style', properties, [new EmbeddedContent(content, true)]);
 }
 
-/* inline javascript; content is inserted verbatim as <script> is a raw text element */
+/** inline javascript; content is inserted verbatim as <script> is a raw text element */
 export function AddScript(content: string, properties: Record<string, HtmlString> = {}): HtmlComponent {
 	return new DualTag('script', properties, new EmbeddedContent(content, true));
 }

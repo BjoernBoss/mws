@@ -679,50 +679,50 @@ function EncodedCache(cache: CacheManager, reader: Cached, entry: CacheEntry | n
 }
 
 export interface Cached {
-	/* check if this is an immutable file entry */
+	/** check if this is an immutable file entry */
 	isImmutable(): boolean;
 
-	/* path of the file */
+	/** path of the file */
 	filePath(): string;
 
-	/* size in bytes of the file */
+	/** size in bytes of the file */
 	fileSize(): number;
 
-	/* fetch the last modified time formatted for the network */
+	/** fetch the last modified time formatted for the network */
 	lastModified(): string;
 
-	/* fetch the unique-id to identify this version of the cached file (constructed,
-	*	just like the cache identifies them as equivalent: size+last-modified) */
+	/** fetch the unique-id to identify this version of the cached file (constructed,
+	 *	just like the cache identifies them as equivalent: size+last-modified) */
 	uniqueId(): string;
 
-	/* [no-throw but errors] object or encoded entry must not be used anymore after reading or streaming from it */
+	/** [no-throw but errors] object or encoded entry must not be used anymore after reading or streaming from it */
 	stream(options?: { start?: number, end?: number }): libStream.Readable;
 
-	/* [throws] object or encoded entry must not be used anymore after reading or streaming from it */
+	/** [throws] object or encoded entry must not be used anymore after reading or streaming from it */
 	read(): Promise<Buffer>;
 
-	/* [throws] object or encoded entry must not be used anymore after reading or streaming from it */
+	/** [throws] object or encoded entry must not be used anymore after reading or streaming from it */
 	readSync(): Buffer;
 
-	/* create an encoded version of this cached entry (no encoding is equivalent to identity) */
+	/** create an encoded version of this cached entry (no encoding is equivalent to identity) */
 	encoded(encoding?: libBase.EncodingType): EncodedCache;
 }
 
 export interface EncodedCache {
-	/* size in bytes of the encoding (null if not yet determined) */
+	/** size in bytes of the encoding (null if not yet determined) */
 	contentSize(): number | null;
 
-	/* [no-throw but errors] object or encoded entry must not be used anymore after reading or streaming from it */
+	/** [no-throw but errors] object or encoded entry must not be used anymore after reading or streaming from it */
 	stream(): libStream.Readable;
 
-	/* [throws] object or encoded entry must not be used anymore after reading or streaming from it */
+	/** [throws] object or encoded entry must not be used anymore after reading or streaming from it */
 	read(): Promise<Buffer>;
 
-	/* [throws] object or encoded entry must not be used anymore after reading or streaming from it */
+	/** [throws] object or encoded entry must not be used anymore after reading or streaming from it */
 	readSync(): Buffer;
 }
 
-/* all cache host operations which may throw errors and will not log them, and dont guarantee to contain the failing file path */
+/** all cache host operations which may throw errors and will not log them, and dont guarantee to contain the failing file path */
 export class CacheHost extends libLog.Logger {
 	private _cacheManager: CacheManager;
 	private _immutableManager: ImmutableManager;
@@ -766,40 +766,40 @@ export class CacheHost extends libLog.Logger {
 		return new NotCached(this._cacheManager, path, fileSize, mtime, this._cacheManager.allocAge(), isImmutable);
 	}
 
-	/* configuration used by this cache host */
+	/** configuration used by this cache host */
 	public get config(): BurntCacheConfig {
 		return this._config;
 	}
 
-	/* [throws] if [checkFreshness] is true, re-validate the file stats on disk before serving from cache (defaults
-	*	to false); resolve immutable ids automatically (Cached to interact with cache; null, if it does not exist,
-	*	string if the immutable path has been permanently moved to the new path in source space) */
+	/** [throws] if [checkFreshness] is true, re-validate the file stats on disk before serving from cache (defaults
+	 *	to false); resolve immutable ids automatically (Cached to interact with cache; null, if it does not exist,
+	 *	string if the immutable path has been permanently moved to the new path in source space) */
 	public fetchImmutable(path: string, options?: { checkFreshness?: boolean }): Cached | string | null {
 		return this.resolveCache(path, options?.checkFreshness ?? false, true);
 	}
 
-	/* [throws] if [checkFreshness] is true re-validate the file stats on disk before serving from cache (defaults
-	*	to false); no immutable ids are resolved (Cached to interact with cache; null, if it does not exist) */
+	/** [throws] if [checkFreshness] is true re-validate the file stats on disk before serving from cache (defaults
+	 *	to false); no immutable ids are resolved (Cached to interact with cache; null, if it does not exist) */
 	public fetchDirect(path: string, options?: { checkFreshness?: boolean }): Cached | null {
 		return this.resolveCache(path, options?.checkFreshness ?? false, false) as (Cached | null);
 	}
 
-	/* generate a unique tagged path for the given query path, which will change whenever the underlying file changes;
-	*	[checkFreshness]: if true, re-validate the file stats on disk to detect changes (defaults to false); creates
-	*	a path to a file, which looks similar to the source, except that the name includes a unique id, which will be used
-	*	to identity the given file state (will be removed from the final target path to be served, to identify the actual source) */
+	/** generate a unique tagged path for the given query path, which will change whenever the underlying file changes;
+	 *	[checkFreshness]: if true, re-validate the file stats on disk to detect changes (defaults to false); creates
+	 *	a path to a file, which looks similar to the source, except that the name includes a unique id, which will be used
+	 *	to identity the given file state (will be removed from the final target path to be served, to identify the actual source) */
 	public immutable(module: string, path: string, options?: { checkFreshness?: boolean }): string {
 		return this._immutableManager.make(module, path, options?.checkFreshness ?? false);
 	}
 
-	/* flush all cached data and invalidate immutable stats so they are re-checked on next access */
+	/** flush all cached data and invalidate immutable stats so they are re-checked on next access */
 	public flush(): void {
 		this.info('Flushing cache and invalidating immutable entries');
 		this._cacheManager.flush();
 		this._immutableManager.invalidate();
 	}
 
-	/* [throws] read the data directly into a buffer (designed for modules to interact with) */
+	/** [throws] read the data directly into a buffer (designed for modules to interact with) */
 	public async read(path: string, options?: { checkFreshness?: boolean }): Promise<Buffer | null> {
 		try {
 			const entry = this.resolveCache(path, options?.checkFreshness ?? false, false) as (Cached | null);
@@ -816,9 +816,9 @@ export class CacheHost extends libLog.Logger {
 		}
 	}
 
-	/* [throws] write data atomically to the disk and update the cache (designed for modules to interact with;
-	*	writes as utf-8; writes data first to temporary file and then replaces the file atomically; for create,
-	*	must not replace an existing file; returns false if the file already existed and could not be created) */
+	/** [throws] write data atomically to the disk and update the cache (designed for modules to interact with;
+	 *	writes as utf-8; writes data first to temporary file and then replaces the file atomically; for create,
+	 *	must not replace an existing file; returns false if the file already existed and could not be created) */
 	public async write(path: string, data: Buffer | string, options?: { what?: string, temporary?: string, create?: boolean }): Promise<boolean> {
 		if (typeof data == 'string')
 			data = Buffer.from(data, 'utf-8');
@@ -839,7 +839,7 @@ export class CacheHost extends libLog.Logger {
 		return true;
 	}
 
-	/* [throws] remove the data from the physical disk and from the cache (returns false if it did not exist) */
+	/** [throws] remove the data from the physical disk and from the cache (returns false if it did not exist) */
 	public async remove(path: string): Promise<boolean> {
 		let existed: boolean = true;
 
@@ -857,26 +857,26 @@ export class CacheHost extends libLog.Logger {
 	}
 }
 
-/* simple wrapper function to create a cache */
+/** simple wrapper function to create a cache */
 export function createCache(config?: CacheConfig | BurntCacheConfig): CacheHost {
 	return new CacheHost(config);
 }
 
 export interface CacheConfig {
-	/* immutable state path is used to ensure the immutable state uses persistent ids across
-	*	restarts (will be read upon loading; if not set, ids will be lost after a server restart) [Default: ''] */
+	/** immutable state path is used to ensure the immutable state uses persistent ids across
+	 *	restarts (will be read upon loading; if not set, ids will be lost after a server restart) [Default: ''] */
 	immutableStatePath?: string;
 
-	/* total cachable size [Default: 50_000_000] */
+	/** total cachable size [Default: 50_000_000] */
 	cacheSize?: number;
 
-	/* upper limit for files considered cachable, others will just be streamed through [Default: 10_000_000] */
+	/** upper limit for files considered cachable, others will just be streamed through [Default: 10_000_000] */
 	fileSizeLimit?: number;
 
-	/* always validate file freshness before providing them [Default: false] */
+	/** always validate file freshness before providing them [Default: false] */
 	alwaysValidate?: boolean;
 
-	/* tag served content with immutable ids to encode freshness into the path [Default: true] */
+	/** tag served content with immutable ids to encode freshness into the path [Default: true] */
 	immutableTagging?: boolean;
 }
 
