@@ -9,7 +9,7 @@ import * as libStream from "stream";
 import * as libCrypto from "crypto";
 
 const UNIQUE_ID_CHARS = '0123456789abcdefghijklmnopqrstuvwxyz'
-const UNIQUE_ID_LENGTH = 14;
+const UNIQUE_ID_LENGTH = 10;
 const ID_EXTENSION_REGEX = RegExp(`^\\.[${UNIQUE_ID_CHARS}]{${UNIQUE_ID_LENGTH}}$`, 'i');
 
 function readStats(path: string): null | [number, number] {
