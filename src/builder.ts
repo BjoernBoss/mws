@@ -94,7 +94,11 @@ export class DualTag implements HtmlComponent {
 	}
 }
 
-/** full html page; automatically adds utf-8 charset and defaults language to 'en' */
+/**
+ *	full html page; automatically adds utf-8 charset and defaults language to 'en'
+ *	page.body should not be seen as the actual HTML body, but rather as the content for a div in some
+ *	primary area of the web-page. It can always be wrapped by outer content by any parent html builders.
+ */
 export class HtmlPage {
 	private _head: HtmlComponent[];
 	private _body: HtmlComponent[];

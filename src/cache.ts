@@ -733,6 +733,8 @@ export class CacheHost extends libLog.Logger {
 
 		this.info('Cache created');
 		this._config = BurntCacheConfig.from(config);
+		libHelper.logConfiguration(this._config, this);
+
 		this._cacheManager = new CacheManager(this, this._config.cacheSize, this._config.fileSizeLimit);
 		this._immutableManager = new ImmutableManager(this._config.immutableStatePath, this, this._config.alwaysValidate, this._config.immutableTagging);
 	}

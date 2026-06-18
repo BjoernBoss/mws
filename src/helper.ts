@@ -4,7 +4,6 @@ import * as libBase from "./base.js";
 import * as libLog from "./log.js";
 import * as libUrl from "url";
 import * as libPath from "path";
-import * as libFs from "fs/promises";
 
 const helperLogger = libLog.createLogger('helper');
 
@@ -402,4 +401,22 @@ export function splitFilePath(path: string): [string, string, string] {
 	if (dot == null || dot == name + 1)
 		dot = path.length;
 	return [path.substring(0, name + 1), path.substring(name + 1, dot), path.substring(dot)];
+}
+
+/** trace log the configuration, and optionally the values, which differ from the reference */
+export function logConfiguration(config: Record<string, any>, logger: libLog.Logger, options?: { prefix?: string, ref?: Record<string, any> }): void {
+	const prefix = (options?.prefix ?? '');
+
+	for (const [key, value] of Object.entries(config)) {
+		const rValue = (options?.ref == undefined ? undefined : options.ref[key]);
+
+		if (typeof value == 'object')
+			logConfiguration(value, logger, { prefix: `${prefix}${key}.`, ref: rValue });
+		else if (value == rValue)
+			continue;
+		else if (typeof value == 'string')
+			logger.trace(`Config [${prefix}${key}]: '${value}'`);
+		else
+			logger.trace(`Config [${prefix}${key}]: ${value}`);
+	}
 }

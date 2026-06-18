@@ -292,14 +292,14 @@ export abstract class ModuleHandler extends libLog.Logger {
 
 					logged = !stopping;
 					if (logged)
-						this.info(`Attached to [${parent.identity}]${detail}`);
+						this.log(`Attached to [${parent.identity}]${detail}`);
 				}
 			},
 			cleanup: async (): Promise<void> => {
 				if (stopping) return unlinkPromise;
 				stopping = true, link.setup = null;
 				if (logged)
-					this.info(`Detached from [${parent.identity}]${detail}`);
+					this.log(`Detached from [${parent.identity}]${detail}`);
 
 				/* remove the link from the parent and add its cleanup to its task list (cleanup calls are only linked as task to the parent,
 				*	as the child does not care for them; this implies that the module's stop method itself does not await them either) */

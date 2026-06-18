@@ -4,6 +4,7 @@ import * as libLog from "./log.js";
 import * as libClient from "./client.js";
 import * as libHandler from "./handler.js";
 import * as libCache from "./cache.js";
+import * as libHelper from "./helper.js";
 import * as libHttps from "https";
 import * as libHttp from "http";
 import * as libNet from "net";
@@ -32,6 +33,8 @@ export class Server extends libLog.Logger {
 
 		this.info(`Server created`);
 		this._config = new BurntServerConfig(config);
+		libHelper.logConfiguration(this._config, this);
+
 		if (config?.cache instanceof libCache.CacheHost)
 			this._cache = config.cache;
 		else
@@ -145,8 +148,10 @@ export class Listener {
 		this._host = { self: server, stop: hostStop };
 		this._self = { endpoint: `endpoint!${id}`, listening: null, protocol: '' };
 		this._emitter = new libEvents.EventEmitter();
-		this._config = clientConfig;
 		this._handling = { count: 0, promise: null, resolver: () => { } };
+
+		this._config = clientConfig;
+		libHelper.logConfiguration(this._config, this._host.self, { prefix: `${this._self.endpoint}.`, ref: this._host.self.config.client });
 
 		let stoppedResolver = () => { };
 		this._stop = { stoppedPromise: new Promise<void>((res) => stoppedResolver = res), stoppedResolver: () => { }, stopping: false };

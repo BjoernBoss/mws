@@ -187,6 +187,24 @@ export type HtmlPatch = (page: libBuilder.HtmlPage, status: libBase.StatusType, 
  *	null will completely remove the tag; other values will update the tag) */
 export type SocketLogTag = (value?: string) => void;
 
+/** cache policy to be applied (Note: if Cache-Control is manually set, it will not be overwritten by the policy) */
+export enum CachePolicy {
+	/** immutable content that can be cached indefinitely */
+	immutable = 'immutable',
+
+	/** static content that may change but can be publically cached */
+	static = 'static',
+
+	/** generated content that is private and can change on every request */
+	private = 'private',
+
+	/** sensitive content that must not be cached at all */
+	sensitive = 'sensitive',
+
+	/** dont configure the cache in any way */
+	none = 'none'
+}
+
 /**
  *	Does not throw any exceptions, unless explicitly stated.
  *	Http HEAD aware (will silently drain any data sent from a HEAD request).
@@ -208,8 +226,7 @@ export type SocketLogTag = (value?: string) => void;
  *
  *	A response sent while another is being prepared (acknowledged) will override it and close the connection.
  *	A response sent while data is already being streamed (header sent) will break the connection.
- *	Normal responses automatically add ClientConfig.responseCacheControl, if no other cache control is specified.
- *	File responses will automatically add ClientConfig.fileCacheControl/ClientConfig.immutableCacheControl, if no other cache control is specified.
+ *	Responses automatically apply the CachePolicy default for the response type, if no other cache control is specified.
  *	Responses will either use the dedicated responder interface and its highWaterMark, or a responder interface, which caches up to socket.highWaterMark.
  *
  *	Upgrade requests, which were not accepted, will be closed after responding.
@@ -250,8 +267,8 @@ export class ClientRequest extends ClientBase {
 	private _request: libHttp.IncomingMessage;
 	private _server: libServer.Server;
 
-	private constructor(server: libServer.Server, config: BurntClientConfig, protocol: string, request: libHttp.IncomingMessage, response: libHttp.ServerResponse | { socket: libStream.Duplex, head: Buffer, wss: libWs.WebSocketServer }) {
-		super(new libUrl.URL(`${protocol}://${request.headers.host?.toLowerCase() ?? '_'}${request.url}`), 'request', config);
+	private constructor(server: libServer.Server, config: BurntClientConfig, protocol: string, kind: string, request: libHttp.IncomingMessage, response: libHttp.ServerResponse | { socket: libStream.Duplex, head: Buffer, wss: libWs.WebSocketServer }) {
+		super(new libUrl.URL(`${protocol}://${request.headers.host?.toLowerCase() ?? '_'}${request.url}`), kind, config);
 		this._headerPatcher = [];
 		this._htmlPatcher = [];
 
@@ -328,13 +345,10 @@ export class ClientRequest extends ClientBase {
 		this._request.socket.setTimeout((this.config.throughputWindow + this.config.throughputGrace) * 2);
 	}
 
-	private constructQuickResponse(status: libBase.StatusType, logReason: string | null, headers: Record<string, string> | undefined, content?: { media: libBase.MediaType, body?: Buffer } | null): void {
+	private constructQuickResponse(status: libBase.StatusType, logReason: string | null, headers: Record<string, string>, content?: { media: libBase.MediaType, body?: Buffer } | null): void {
 		if (headers == null)
 			headers = {};
 		const description = `${this.isHead ? 'HEAD:' : ''}[${status.msg}]${logReason == null ? '' : `: ${logReason}`}`;
-
-		if (!('Cache-Control' in headers) && this.config.responseCacheControl != '')
-			headers['Cache-Control'] = this.config.responseCacheControl;
 
 		/* check if the response can still be sent (acknowledged state can be overridden; the connection
 		*	will be closed afterwards to prevent the client from seeing inconsistent responses) */
@@ -558,6 +572,13 @@ export class ClientRequest extends ClientBase {
 	}
 	private badClientUsage(reason: string, close: boolean): void {
 		this.respondInternalError(`Bad Usage: ${reason}`, (close ? { headers: { 'Connection': 'close' } } : undefined));
+	}
+	private applyCachePolicy(headers: Record<string, string>, should: CachePolicy, override?: CachePolicy): void {
+		if ('Cache-Control' in headers)
+			return;
+		const policy = this.config.cache[override ?? should];
+		if (policy != '')
+			headers['Cache-Control'] = policy;
 	}
 
 	private closeHeader(status: libBase.StatusType, headers: Record<string, string>, content?: { media: libBase.MediaType, size?: number, encoding?: string }): void {
@@ -959,10 +980,10 @@ export class ClientRequest extends ClientBase {
 		this._htmlPatcher.splice(snapshot.htmlPatchCount);
 	}
 	public static _fromRequest(protocol: string, request: libHttp.IncomingMessage, response: libHttp.ServerResponse, config: BurntClientConfig, server: libServer.Server): ClientRequest {
-		return new ClientRequest(server, config, protocol, request, response);
+		return new ClientRequest(server, config, protocol, 'request', request, response);
 	}
 	public static _fromUpgrade(protocol: string, request: libHttp.IncomingMessage, socket: libStream.Duplex, head: Buffer, config: BurntClientConfig, server: libServer.Server, wss: libWs.WebSocketServer): ClientRequest {
-		return new ClientRequest(server, config, protocol, request, { socket, head, wss });
+		return new ClientRequest(server, config, protocol, 'upgrade', request, { socket, head, wss });
 	}
 	public async _finalizeConnection(): Promise<void> {
 		/* ensure the connection is default replied with not-found */
@@ -1159,27 +1180,35 @@ export class ClientRequest extends ClientBase {
 		this._htmlPatcher.push(cb);
 	}
 
-	/** respond with [internal-error] and a default text response (always considered an error; reason is logged server-side only) */
-	public respondInternalError(reason: string, options?: { headers?: Record<string, string> }): void {
-		this.constructQuickResponse(libBase.Status.InternalError, `Failure Reason (not sent): ${reason}`, options?.headers, {
+	/** respond with [internal-error] and a default text response (always considered an error; reason is logged server-side only); cache policy defaults to [sensitive] */
+	public respondInternalError(reason: string, options?: { headers?: Record<string, string>, cache?: CachePolicy }): void {
+		const header = (options?.headers ?? {});
+		this.applyCachePolicy(header, CachePolicy.sensitive, options?.cache);
+
+		this.constructQuickResponse(libBase.Status.InternalError, `Failure Reason (not sent): ${reason}`, header, {
 			media: libBase.Media.Text, body: Buffer.from(`An internal server error occurred while processing the request for [${this.url.pathname}].`, 'utf-8')
 		});
 	}
 
-	/** respond with [forbidden] and a default text response (reason is logged server-side only) */
-	public respondForbidden(reason: string, options?: { headers?: Record<string, string> }): void {
-		this.constructQuickResponse(libBase.Status.Forbidden, `Forbidden Reason (not sent): ${reason}`, options?.headers, {
+	/** respond with [forbidden] and a default text response (reason is logged server-side only); cache policy defaults to [sensitive] */
+	public respondForbidden(reason: string, options?: { headers?: Record<string, string>, cache?: CachePolicy }): void {
+		const header = (options?.headers ?? {});
+		this.applyCachePolicy(header, CachePolicy.sensitive, options?.cache);
+
+		this.constructQuickResponse(libBase.Status.Forbidden, `Forbidden Reason (not sent): ${reason}`, header, {
 			media: libBase.Media.Text, body: Buffer.from(`Access to [${this.url.pathname}] denied.`, 'utf-8')
 		});
 	}
 
-	/** respond with a any response of the given configuration (defaults to media-type: text/unknown/-, status: ok);
-	 *	if [lightResponse], the content length is suppressed for head responses (to accomodate short-circuiting responding) */
-	public respond(content: string | Buffer | null, options?: { media?: libBase.MediaType, status?: libBase.StatusType, headers?: Record<string, string>, lightResponse?: boolean }): void {
+	/** respond with a any response of the given configuration (defaults to media-type: text/unknown/-, status: ok); if [lightResponse], the
+	 *	content length is suppressed for head responses (to accomodate short-circuiting responding); cache policy defaults to [private] */
+	public respond(content: string | Buffer | null, options?: { media?: libBase.MediaType, status?: libBase.StatusType, headers?: Record<string, string>, lightResponse?: boolean, cache?: CachePolicy }): void {
 		const status = options?.status ?? libBase.Status.Ok;
+		const header = (options?.headers ?? {});
+		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
 		if (content == null)
-			return this.constructQuickResponse(status, 'no body', options?.headers, null);
+			return this.constructQuickResponse(status, 'no body', header, null);
 
 		let media = options?.media ?? libBase.Media.Text;
 		if (typeof content == 'string')
@@ -1187,171 +1216,200 @@ export class ClientRequest extends ClientBase {
 		else if (options?.media == null)
 			media = libBase.Media.Unknown;
 
-		this.constructQuickResponse(status, `[${media.mediaType}] and size [${content.byteLength}]`, options?.headers, {
+		this.constructQuickResponse(status, `[${media.mediaType}] and size [${content.byteLength}]`, header, {
 			media, body: (options?.lightResponse && this.isHead ? undefined : content)
 		});
 	}
 
-	/** respond with [ok] and either a message or a default response */
-	public respondOk(options?: { message?: string, headers?: Record<string, string> }): void {
-		this.constructQuickResponse(libBase.Status.Ok, options?.message ?? null, options?.headers, {
+	/** respond with [ok] and either a message or a default response; cache policy defaults to [private] */
+	public respondOk(options?: { message?: string, headers?: Record<string, string>, cache?: CachePolicy }): void {
+		const header = (options?.headers ?? {});
+		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
+
+		this.constructQuickResponse(libBase.Status.Ok, options?.message ?? null, header, {
 			media: libBase.Media.Text, body: Buffer.from(options?.message ?? `${this.method} was successful for [${this.url.pathname}].`, 'utf-8')
 		});
 	}
 
-	/** respond with [created] and either a message or a default response (ensure target is properly URI encoded) */
-	public respondCreated(target: string, options?: { headers?: Record<string, string> }): void {
+	/** respond with [created] and either a message or a default response (ensure target is properly URI encoded); cache policy defaults to [private] */
+	public respondCreated(target: string, options?: { headers?: Record<string, string>, cache?: CachePolicy }): void {
 		const header = (options?.headers ?? {});
 		header['Location'] = target;
+		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
 		this.constructQuickResponse(libBase.Status.Created, target, header, {
 			media: libBase.Media.Text, body: Buffer.from(`Resource [${this.url.pathname}] successfully created:\n${target}`, 'utf-8')
 		});
 	}
 
-	/** respond with [not-modified] and no body (ensure the etag and/or last-modified is set) */
-	public respondNotModified(options?: { etag?: string, lastModified?: string, headers?: Record<string, string> }): void {
+	/** respond with [not-modified] and no body (ensure the etag and/or last-modified is set); cache policy defaults to [private] */
+	public respondNotModified(options?: { etag?: string, lastModified?: string, headers?: Record<string, string>, cache?: CachePolicy }): void {
 		const header = (options?.headers ?? {});
 		if (options?.etag != null && !('ETag' in header))
 			header['ETag'] = options.etag;
 		if (options?.lastModified != null && !('Last-Modified' in header))
 			header['Last-Modified'] = options.lastModified;
+		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
 		this.constructQuickResponse(libBase.Status.NotModified, null, header, null);
 	}
 
-	/** respond with [precondition-failed] and a default text response (ensure the etag and/or last-modified is set) */
-	public respondPreconditionFailed(reason: string, options?: { etag?: string, lastModified?: string, headers?: Record<string, string> }): void {
+	/** respond with [precondition-failed] and a default text response (ensure the etag and/or last-modified is set); cache policy defaults to [private] */
+	public respondPreconditionFailed(reason: string, options?: { etag?: string, lastModified?: string, headers?: Record<string, string>, cache?: CachePolicy }): void {
 		const header = (options?.headers ?? {});
 		if (options?.etag != null && !('ETag' in header))
 			header['ETag'] = options.etag;
 		if (options?.lastModified != null && !('Last-Modified' in header))
 			header['Last-Modified'] = options.lastModified;
+		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
-		this.constructQuickResponse(libBase.Status.PreconditionFailed, reason, options?.headers, {
+		this.constructQuickResponse(libBase.Status.PreconditionFailed, reason, header, {
 			media: libBase.Media.Text, body: Buffer.from(`Precondition for resource [${this.url.pathname}] failed:\n${reason}`, 'utf-8')
 		});
 	}
 
-	/** respond with [bad-request] and a default text response */
-	public respondBadRequest(reason: string, options?: { headers?: Record<string, string> }): void {
-		this.constructQuickResponse(libBase.Status.BadRequest, reason, options?.headers, {
+	/** respond with [bad-request] and a default text response; cache policy defaults to [private] */
+	public respondBadRequest(reason: string, options?: { headers?: Record<string, string>, cache?: CachePolicy }): void {
+		const header = (options?.headers ?? {});
+		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
+
+		this.constructQuickResponse(libBase.Status.BadRequest, reason, header, {
 			media: libBase.Media.Text, body: Buffer.from(`Request for [${this.url.pathname}] is perceived as malformed:\n${reason}`, 'utf-8')
 		});
 	}
 
-	/** respond with [range-not-satisfiable] and a default text response */
-	public respondRangeIssue(range: string, size: number, options?: { headers?: Record<string, string> }): void {
+	/** respond with [range-not-satisfiable] and a default text response; cache policy defaults to [private] */
+	public respondRangeIssue(range: string, size: number, options?: { headers?: Record<string, string>, cache?: CachePolicy }): void {
 		const header = (options?.headers ?? {});
 		header['Content-Range'] = `bytes */${size}`;
+		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
 		this.constructQuickResponse(libBase.Status.RangeIssue, `[${range}] cannot be satisfied for size [${size}]`, header, {
 			media: libBase.Media.Text, body: Buffer.from(`Range [${range}] cannot be satisfied for [${this.url.pathname}] of size ${size}.`, 'utf-8')
 		});
 	}
 
-	/** respond with [conflict] and a default text response */
-	public respondConflict(conflict: string, options?: { headers?: Record<string, string> }): void {
-		this.constructQuickResponse(libBase.Status.Conflict, conflict, options?.headers, {
+	/** respond with [conflict] and a default text response; cache policy defaults to [private] */
+	public respondConflict(conflict: string, options?: { headers?: Record<string, string>, cache?: CachePolicy }): void {
+		const header = (options?.headers ?? {});
+		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
+
+		this.constructQuickResponse(libBase.Status.Conflict, conflict, header, {
 			media: libBase.Media.Text, body: Buffer.from(`Conflict for resource [${this.url.pathname}]:\n${conflict}`, 'utf-8')
 		});
 	}
 
-	/** respond with [not-found] and a default text response */
-	public respondNotFound(options?: { headers?: Record<string, string> }): void {
-		this.constructQuickResponse(libBase.Status.NotFound, null, options?.headers, {
+	/** respond with [not-found] and a default text response; cache policy defaults to [private] */
+	public respondNotFound(options?: { headers?: Record<string, string>, cache?: CachePolicy }): void {
+		const header = (options?.headers ?? {});
+		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
+
+		this.constructQuickResponse(libBase.Status.NotFound, null, header, {
 			media: libBase.Media.Text, body: Buffer.from(`Resource [${this.url.pathname}] could not be found.`, 'utf-8')
 		});
 	}
 
-	/** respond with [unsupported-media-type] and a default text response */
-	public respondUnsupported(used: string, allowed: string, options?: { headers?: Record<string, string> }): void {
-		this.constructQuickResponse(libBase.Status.UnsupportedMediaType, `Allowed was [${allowed}] but [${used}] was used`, options?.headers, {
+	/** respond with [unsupported-media-type] and a default text response; cache policy defaults to [private] */
+	public respondUnsupported(used: string, allowed: string, options?: { headers?: Record<string, string>, cache?: CachePolicy }): void {
+		const header = (options?.headers ?? {});
+		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
+
+		this.constructQuickResponse(libBase.Status.UnsupportedMediaType, `Allowed was [${allowed}] but [${used}] was used`, header, {
 			media: libBase.Media.Text, body: Buffer.from(`Media type [${used}] not supported for [${this.url.pathname}].\nAllowed: ${allowed}`, 'utf-8')
 		});
 	}
 
-	/** respond with [method-not-allowed] and a default text response */
-	public respondMethodNotAllowed(method: string, allowed: string, options?: { headers?: Record<string, string> }): void {
+	/** respond with [method-not-allowed] and a default text response; cache policy defaults to [private] */
+	public respondMethodNotAllowed(method: string, allowed: string, options?: { headers?: Record<string, string>, cache?: CachePolicy }): void {
 		const header = (options?.headers ?? {});
 		header['Allow'] = allowed;
+		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
 		this.constructQuickResponse(libBase.Status.MethodNotAllowed, `Allowed was [${allowed}] but [${method}] was used`, header, {
 			media: libBase.Media.Text, body: Buffer.from(`Method ${method} not allowed for [${this.url.pathname}].\nAllowed: ${allowed}.`, 'utf-8')
 		});
 	}
 
-	/** respond with [request-timeout] and a default text response */
-	public respondRequestTimeout(reason: string, options?: { headers?: Record<string, string> }): void {
+	/** respond with [request-timeout] and a default text response; cache policy defaults to [private] */
+	public respondRequestTimeout(reason: string, options?: { headers?: Record<string, string>, cache?: CachePolicy }): void {
 		const header = (options?.headers ?? {});
 		header['Connection'] = 'close';
+		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
 		this.constructQuickResponse(libBase.Status.RequestTimeout, reason, header, {
 			media: libBase.Media.Text, body: Buffer.from(`Request processing of [${this.url.pathname}] timed out:\n${reason}`, 'utf-8')
 		});
 	}
 
-	/** respond with [content-too-large] and a default text response */
-	public respondContentTooLarge(allowed: number, atLeastProvided: number, options?: { headers?: Record<string, string> }): void {
-		this.constructQuickResponse(libBase.Status.ContentTooLarge, `[${atLeastProvided}] > [${allowed}]`, options?.headers, {
+	/** respond with [content-too-large] and a default text response; cache policy defaults to [private] */
+	public respondContentTooLarge(allowed: number, atLeastProvided: number, options?: { headers?: Record<string, string>, cache?: CachePolicy }): void {
+		const header = (options?.headers ?? {});
+		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
+
+		this.constructQuickResponse(libBase.Status.ContentTooLarge, `[${atLeastProvided}] > [${allowed}]`, header, {
 			media: libBase.Media.Text, body: Buffer.from(`Content of at least size ${atLeastProvided} too large for [${this.url.pathname}].\nAt most ${allowed} bytes are allowed.`, 'utf-8')
 		});
 	}
 
-	/** respond with [update-required] and a default text response */
-	public respondUpdateRequired(upgrade: string, options?: { headers?: Record<string, string> }): void {
+	/** respond with [update-required] and a default text response; cache policy defaults to [private] */
+	public respondUpdateRequired(upgrade: string, options?: { headers?: Record<string, string>, cache?: CachePolicy }): void {
 		const header = (options?.headers ?? {});
 		if (!('Connection' in header))
 			header['Connection'] = 'upgrade';
 		header['Upgrade'] = upgrade;
+		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
 		this.constructQuickResponse(libBase.Status.UpgradeRequired, `Required: ${upgrade}`, header, {
 			media: libBase.Media.Text, body: Buffer.from(`Endpoint [${this.url.pathname}] requires an upgrade.\nRequired: ${upgrade}`, 'utf-8')
 		});
 	}
 
-	/** respond with [see-other] to the given target and a default text response (forces method GET; ensure target is properly URI encoded) */
-	public respondSeeOther(target: string, options?: { headers?: Record<string, string> }): void {
+	/** respond with [see-other] to the given target and a default text response (forces method
+	 *	GET; ensure target is properly URI encoded); cache policy defaults to [private] */
+	public respondSeeOther(target: string, options?: { headers?: Record<string, string>, cache?: CachePolicy }): void {
 		const header = (options?.headers ?? {});
 		header['Location'] = target;
+		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
 		this.constructQuickResponse(libBase.Status.SeeOther, target, header, {
 			media: libBase.Media.Text, body: Buffer.from(`Continue at: ${target}`, 'utf-8')
 		});
 	}
 
-	/** respond with [temporary-redirect] to the given target and a default text response (preserves method; ensure target is properly URI encoded) */
-	public respondTemporaryRedirect(target: string, options?: { headers?: Record<string, string> }): void {
+	/** respond with [temporary-redirect] to the given target and a default text response (preserves
+	 *	method; ensure target is properly URI encoded); cache policy defaults to [private] */
+	public respondTemporaryRedirect(target: string, options?: { headers?: Record<string, string>, cache?: CachePolicy }): void {
 		const header = (options?.headers ?? {});
 		header['Location'] = target;
+		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
 		this.constructQuickResponse(libBase.Status.TemporaryRedirect, target, header, {
 			media: libBase.Media.Text, body: Buffer.from(`Resource [${this.url.pathname}] temporarily redirects to:\n${target}`, 'utf-8')
 		});
 	}
 
-	/** respond with [permanent-redirect] to the given target and a default text response (preserves method; ensure target is properly URI encoded) */
-	public respondPermanentRedirect(target: string, options?: { headers?: Record<string, string> }): void {
+	/** respond with [permanent-redirect] to the given target and a default text response (preserves
+	 *	method; ensure target is properly URI encoded); cache policy defaults to [private] */
+	public respondPermanentRedirect(target: string, options?: { headers?: Record<string, string>, cache?: CachePolicy }): void {
 		const header = (options?.headers ?? {});
 		header['Location'] = target;
+		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
 		this.constructQuickResponse(libBase.Status.PermanentRedirect, target, header, {
 			media: libBase.Media.Text, body: Buffer.from(`Resource [${this.url.pathname}] permanently redirects to:\n${target}`, 'utf-8')
 		});
 	}
 
-	/** respond with html, can be built on by parent modules, sent once the request has been fully processed
-	 *	(default status is ok; for HEAD builds, no actual content will be constructed or estimated in size)
-	 *	automatically adds ClientConfig.responseCacheControl, if no other cache control is specified */
-	public async respondHtml(page: libBuilder.HtmlPage, options?: { status?: libBase.StatusType, headers?: Record<string, string> }): Promise<void> {
+	/** respond with html, can be built on by parent modules, sent once the request has been fully processed (default status is
+	 *	ok; for HEAD builds, no actual content will be constructed or estimated in size); cache policy defaults to [private] */
+	public async respondHtml(page: libBuilder.HtmlPage, options?: { status?: libBase.StatusType, headers?: Record<string, string>, cache?: CachePolicy }): Promise<void> {
 		if (this._state.response != ResponseState.none)
 			return this.badClientUsage('HTML response on already claimed connection', false);
 
 		this._state.response = ResponseState.acknowledged;
 		const status = (options?.status ?? libBase.Status.Ok);
 		const headers = (options?.headers ?? {});
-		if (!('Cache-Control' in headers) && this.config.responseCacheControl != '')
-			headers['Cache-Control'] = this.config.responseCacheControl;
+		this.applyCachePolicy(headers, CachePolicy.private, options?.cache);
 
 		/* invoke all registered html patcher to let them modify the content (in reverse order to ensure
 		*	first added is last executed, and check if one of them produced an alternate response) */
@@ -1372,26 +1430,25 @@ export class ClientRequest extends ClientBase {
 		this.sendFullResponse(status, headers, { media: libBase.Media.Html, body: content });
 	}
 
-	/** [no-throw but errors] send data with [media type] and [status] and return a writable stream (default: status is ok, media is unknown, dynamicEncode is true);
-	 *	if a content size is provided, stream expects exactly this amount of bytes; if [dynamicEncode], the encoder will be dynamically negotiated
-	 *	based on the content; for a HEAD request, no encoding will be negotiated, no lengths verified, and the written data will just be drained
-	 *	(can immediately be ended using '.end()'); automatically adds ClientConfig.responseCacheControl, if no other cache control is specified */
-	public respondData(options?: { status?: libBase.StatusType, media?: libBase.MediaType, contentSize?: number, dynamicEncode?: boolean, headers?: Record<string, string> }): libStream.Writable {
+	/** [no-throw but errors] send data with [media type] and [status] and return a writable stream (default: status is ok, media is unknown,
+	 *	dynamicEncode is true); if a content size is provided, stream expects exactly this amount of bytes; if [dynamicEncode], the encoder
+	 *	will be dynamically negotiated based on the content; for a HEAD request, no encoding will be negotiated, no lengths verified, and
+	 *	the written data will just be drained (can immediately be ended using '.end()'); cache policy defaults to [private] */
+	public respondData(options?: { status?: libBase.StatusType, media?: libBase.MediaType, contentSize?: number, dynamicEncode?: boolean, headers?: Record<string, string>, cache?: CachePolicy }): libStream.Writable {
 		const status: libBase.StatusType = options?.status ?? libBase.Status.Ok;
 		const headers = (options?.headers ?? {});
-		if (!('Cache-Control' in headers) && this.config.responseCacheControl != '')
-			headers['Cache-Control'] = this.config.responseCacheControl;
+		this.applyCachePolicy(headers, CachePolicy.private, options?.cache);
 
 		this.log(`Responding with data and status [${status.msg}]`);
 		return this.sendClientData(status, options?.media ?? libBase.Media.Unknown, headers, options?.dynamicEncode ?? true, options?.contentSize ?? null);
 	}
 
-	/** try to respond with the given file, return false, if the file does not exist (range aware, HEAD aware); specify [checkFreshness] to
-	 *	re-validate the file stats on disk before serving from cache; the media type can be overwritten (defaults to extracting media-type
-	 *	from the file-path); [encoding] describes the encoding of a pre-encoded file (warning: no checks against accepted encodings
-	 *	performed!); status will be [Ok], [partial-content], [not-modified] or according errors cache aware and etag/last-modified aware;
-	 *	automatically adds ClientConfig.fileCacheControl/ClientConfig.immutableCacheControl, if no other cache control is specified */
-	public async tryRespondFile(filePath: string, options?: { encoded?: string, media?: libBase.MediaType, headers?: Record<string, string>, checkFreshness?: boolean }): Promise<boolean> {
+	/** try to respond with the given file, return false, if the file does not exist (range aware, HEAD aware); specify [checkFreshness]
+	 *	to re-validate the file stats on disk before serving from cache; the media type can be overwritten (defaults to extracting
+	 *	media-type from the file-path); [encoding] describes the encoding of a pre-encoded file (warning: no checks against
+	 *	accepted encodings performed!); status will be [Ok], [partial-content], [not-modified] or according errors cache aware and
+	 *	etag/last-modified aware; cache policy defaults to [immutable] for versioned paths, or [static] otherwise */
+	public async tryRespondFile(filePath: string, options?: { encoded?: string, media?: libBase.MediaType, headers?: Record<string, string>, checkFreshness?: boolean, cache?: CachePolicy }): Promise<boolean> {
 		if (options == null)
 			options = {};
 		if (this._state.response != ResponseState.none) {
@@ -1444,12 +1501,7 @@ export class ClientRequest extends ClientBase {
 		headers['Accept-Ranges'] = (dynamicEncoder != null ? 'none' : 'bytes');
 		headers['Last-Modified'] = cached.lastModified();
 		headers['ETag'] = etag;
-		if (!('Cache-Control' in headers)) {
-			if (cached.isImmutable() && this.config.immutableCacheControl != '')
-				headers['Cache-Control'] = this.config.immutableCacheControl;
-			else if (this.config.fileCacheControl != '')
-				headers['Cache-Control'] = this.config.fileCacheControl;
-		}
+		this.applyCachePolicy(headers, (cached.isImmutable() ? CachePolicy.immutable : CachePolicy.static), options?.cache);
 
 		/* validate the conditions (e-tag more relevant than last-modified; invalid times are not
 		*	considered errors; no need to set etag/last-modified, as they are already set) */
@@ -1694,7 +1746,8 @@ export class ClientSocket extends ClientBase {
 	};
 	private _emitter: libEvents.EventEmitter;
 	private _log: {
-		identity: string;
+		self: string;
+		root: string;
 		tagList: { value: string }[];
 	}
 
@@ -1706,7 +1759,7 @@ export class ClientSocket extends ClientBase {
 		this._emitter = new libEvents.EventEmitter();
 
 		this._ws.on('pong', () => {
-			this.trace(`Alive check pong received`, { identity: this._log.identity });
+			this.trace(`Alive check pong received`, { identity: this._log.self });
 			this.selfIsAlive();
 		});
 		this._ws.on('message', (data) => {
@@ -1736,12 +1789,13 @@ export class ClientSocket extends ClientBase {
 			this.handleClosing(`WebSocket error: ${err.message}`);
 		});
 
-		/* perserve the log extension of the base and preserve it to be re-used for internal logs */
+		/* perserve the root identity for internal logs and the log extension of the base for open logs */
+		this._log = { self: this.identity, root: '', tagList: [] };
+		source.log(`WebSocket accepted: [${this.identity}]`);
 		const extIndex = source.identity.indexOf('.');
 		if (extIndex > 0)
 			this.logSetIdentity(`${this.identity}${source.identity.substring(extIndex)}`);
-		source.log(`WebSocket accepted: [${this.identity}]`);
-		this._log = { identity: this.identity, tagList: [] };
+		this._log.root = this.identity;
 
 		/* start the first alive check (no need to consider the socket timeout, as it will have been cleared already) */
 		this.selfIsAlive();
@@ -1762,7 +1816,7 @@ export class ClientSocket extends ClientBase {
 
 		/* try to ping the remote to check the liveliness */
 		try {
-			this.trace(`Sending ping to determine if connection is alive`, { identity: this._log.identity });
+			this.trace(`Sending ping to determine if connection is alive`, { identity: this._log.self });
 			this._ws.ping();
 		} catch (err: any) {
 			this.handleClosing(`WebSocket error while pinging: ${err.message}`);
@@ -1789,14 +1843,14 @@ export class ClientSocket extends ClientBase {
 
 			/* check if a termination should be triggered and otherwise start the grace termination timer */
 			if (terminate != null) {
-				this.error(terminate, { identity: this._log.identity });
+				this.error(terminate, { identity: this._log.self });
 				this._ws.terminate();
 			}
 			else {
 				this._alive.timer = setTimeout(() => {
 					this._alive.timer = null;
 					if (this._closing.closed != null) {
-						this.error('Closing connection', { identity: this._log.identity });
+						this.error('Closing connection', { identity: this._log.self });
 						this._ws.terminate();
 					}
 				}, this.config.killGraceTimeout);
@@ -1809,12 +1863,12 @@ export class ClientSocket extends ClientBase {
 		this._closing.closed = null;
 
 		this.emitEventSync('close');
-		this.trace('Socket connection closed', { identity: this._log.identity });
+		this.trace('Socket connection closed', { identity: this._log.self });
 
 		closed();
 	}
 	private updateLogIdentity(): void {
-		let identity = this._log.identity;
+		let identity = this._log.root;
 
 		for (const tag of this._log.tagList) {
 			if (tag.value != '')
@@ -1888,7 +1942,7 @@ export class ClientSocket extends ClientBase {
 			this._emitter.emit(event, ...args);
 		}
 		catch (err: any) {
-			this.error(`Unhandled exception in ${event} listener: ${err.message}`, { identity: this._log.identity });
+			this.error(`Unhandled exception in ${event} listener: ${err.message}`, { identity: this._log.self });
 		}
 	}
 }
@@ -1909,14 +1963,23 @@ export interface ClientConfig {
 	/** time for a broken connection or socket to receive the response before force-closing it [0 results in immediate close; in milliseconds; Default: 1_000] */
 	killGraceTimeout?: number;
 
-	/** default cache-control value for normal cache reads [empty string does not set any cache-control; Default: 'public, max-age=600, must-revalidate' (10 minutes)] */
-	fileCacheControl?: string;
+	/** cache-control values per cache policy */
+	cache?: {
+		/** default cache-control value for immutable content reads [empty string does not set any cache-control; Default: 'public, max-age=2592000, immutable' (30 days)] */
+		immutable?: string;
 
-	/** default cache-control value for immutable cache reads [empty string does not set any cache-control; Default: 'public, max-age=2592000, immutable' (30 days)] */
-	immutableCacheControl?: string;
+		/** default cache-control value for normal content reads [empty string does not set any cache-control; Default: 'public, no-cache'] */
+		static?: string;
 
-	/** default cache-control value for any basic responses [empty string does not set any cache-control; Default: 'private, no-cache'] */
-	responseCacheControl?: string;
+		/** default cache-control value for any basic responses [empty string does not set any cache-control; Default: 'private, no-cache'] */
+		private?: string;
+
+		/** default cache-control value for any sensitive responses [empty string does not set any cache-control; Default: 'no-cache, no-store, max-age=0, must-revalidate'] */
+		sensitive?: string;
+
+		/** default cache-control value for no cache policy [empty string does not set any cache-control; Default: ''] */
+		none?: string;
+	};
 
 	/** grace period before the throughput is started to be measured or for busy connections [in milliseconds; Default: 10_000] */
 	throughputGrace?: number;
@@ -1934,9 +1997,7 @@ export class BurntClientConfig {
 	public readonly webSocketTimeout: number;
 	public readonly webSocketAliveTimeout: number;
 	public readonly killGraceTimeout: number;
-	public readonly fileCacheControl: string;
-	public readonly immutableCacheControl: string;
-	public readonly responseCacheControl: string;
+	public readonly cache: Record<CachePolicy, string>;
 	public readonly throughputGrace: number;
 	public readonly throughputThreshold: number;
 	public readonly throughputWindow: number;
@@ -1947,9 +2008,13 @@ export class BurntClientConfig {
 		this.webSocketTimeout = config?.webSocketTimeout ?? 180_000;
 		this.webSocketAliveTimeout = config?.webSocketAliveTimeout ?? 2_000;
 		this.killGraceTimeout = config?.killGraceTimeout ?? 1_000;
-		this.fileCacheControl = config?.fileCacheControl ?? 'public, max-age=600, must-revalidate';
-		this.immutableCacheControl = config?.immutableCacheControl ?? 'public, max-age=2592000, immutable';
-		this.responseCacheControl = config?.responseCacheControl ?? 'private, no-cache';
+		this.cache = {
+			immutable: config?.cache?.immutable ?? 'public, max-age=2592000, immutable',
+			static: config?.cache?.static ?? 'public, no-cache',
+			private: config?.cache?.private ?? 'private, no-cache',
+			sensitive: config?.cache?.sensitive ?? 'no-cache, no-store, max-age=0, must-revalidate',
+			none: config?.cache?.none ?? ''
+		};
 		this.throughputGrace = config?.throughputGrace ?? 10_000;
 		this.throughputThreshold = config?.throughputThreshold ?? 1_000;
 		this.throughputWindow = config?.throughputWindow ?? 30_000;

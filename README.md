@@ -245,6 +245,34 @@ await client.respondHtml(page, { status: Status.Ok });
 
 Convenience methods: `respondOk`, `respondNotFound`, `respondBadRequest`, `respondForbidden`, `respondInternalError`, `respondConflict`, `respondSeeOther`, `respondTemporaryRedirect`, `respondPermanentRedirect`, `respondCreated`, and others.
 
+### Cache Control
+
+Every response method accepts an optional `cache` parameter of type `CachePolicy` to control the `Cache-Control` header. If `Cache-Control` is set manually in the headers, the policy is ignored.
+
+| Policy | Default Header | Used By Default In |
+|---|---|---|
+| `immutable` | `public, max-age=2592000, immutable` | `tryRespondFile` (versioned paths) |
+| `static` | `public, no-cache` | `tryRespondFile` (normal files) |
+| `private` | `private, no-cache` | `respond`, `respondData`, `respondHtml`, and all convenience methods |
+| `sensitive` | `no-cache, no-store, max-age=0, must-revalidate` | `respondInternalError`, `respondForbidden` |
+| `none` | *(no header set)* | *(only when explicitly chosen)* |
+
+The default header values for each policy can be customized via `ClientConfig.cache`:
+
+```typescript
+const server = new Server({
+	client: {
+		cache: {
+			immutable: 'public, max-age=604800, immutable',
+			static: 'public, max-age=60',
+			private: 'private, no-cache',
+			sensitive: 'no-store',
+			none: ''
+		}
+	}
+});
+```
+
 ## WebSocket
 
 ```typescript
