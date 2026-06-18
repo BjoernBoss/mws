@@ -24,34 +24,51 @@ function readStats(path: string): null | [number, number] {
 	}
 	return null;
 }
-async function atomicWrite(path: string, content: Buffer, logger: libLog.Logger, options?: { what?: string, temporary?: string, create?: boolean }): Promise<boolean> {
-	const tempPath = (options?.temporary ?? `${path}.temp`);
-	logger.trace(`Writing ${options?.what ?? 'data'} to [${path}]`);
-
-	if (options?.create === true) {
-		try { await libFsPromises.writeFile(path, content, { flag: 'wx' }); }
-		catch (err: any) {
-			if (err.code == 'EEXIST')
-				return false;
-			throw new Error(`Failed to create file: ${err.message}`);
-		}
-		return true;
-	}
+async function atomicWrite(path: string, content: Buffer | libStream.Readable, logger: libLog.Logger, options?: { what?: string, temporary?: string, create?: boolean }): Promise<boolean> {
+	const tempPath = (options?.temporary ?? `${path}.temp`), create = (options?.create === true);
+	if (options?.what != '')
+		logger.trace(`Writing ${options?.what ?? 'data'} to [${path}]`);
 
 	let written = false;
 	try {
-		await libFsPromises.writeFile(tempPath, content);
-		written = true;
-		await libFsPromises.rename(tempPath, path);
-	} catch (err: any) {
-		try {
-			await libFsPromises.unlink(tempPath);
-		} catch (err: any) {
-			if (err.code != 'ENOENT')
-				logger.warning(`Failed to remove temporary file [${tempPath}]: ${err.message}`);
+		/* check if a stream or buffer is being written */
+		if (content instanceof libStream.Readable) {
+			await new Promise<void>((resolve, reject) => {
+				let stream: libStream.Writable | null = null;
+				try { stream = libFs.createWriteStream((create ? path : tempPath), { flags: (create ? 'wx' : 'w') }); }
+				catch (err: any) { return reject(err); }
+
+				libStream.pipeline(content, stream, (err: any) => {
+					if (err == null)
+						resolve();
+					else
+						reject(err);
+				});
+			});
 		}
+		else
+			await libFsPromises.writeFile((create ? path : tempPath), content, { flag: (create ? 'wx' : 'w') });
+		written = true;
+
+		/* move the file into place */
+		if (!create)
+			await libFsPromises.rename(tempPath, path);
+	} catch (err: any) {
+		/* check if the file already existed */
+		if (create && err.code == 'EEXIST')
+			return false;
+
+		/* try to remove the partial/temporary file */
+		try { await libFsPromises.unlink(create ? path : tempPath); }
+		catch (err: any) {
+			if (err.code != 'ENOENT')
+				logger.warning(`Failed to remove temporary file [${create ? path : tempPath}]: ${err.message}`);
+		}
+
 		if (written)
 			throw new Error(`Failed to replace the original file: ${err.message}`);
+		else if (create)
+			throw new Error(`Failed to create file: ${err.message}`);
 		throw new Error(`Failed to write to temporary file [${tempPath}]: ${err.message}`);
 	}
 	return true;
@@ -722,7 +739,10 @@ export interface EncodedCache {
 	readSync(): Buffer;
 }
 
-/** all cache host operations which may throw errors and will not log them, and dont guarantee to contain the failing file path */
+/** 
+ *	all cache host operations which may throw errors and will not log them, and dont guarantee to contain the failing file path
+ *	file operations with the cache ignore symlinks and will follow them at all times.
+ */
 export class CacheHost extends libLog.Logger {
 	private _cacheManager: CacheManager;
 	private _immutableManager: ImmutableManager;
@@ -818,17 +838,20 @@ export class CacheHost extends libLog.Logger {
 		}
 	}
 
-	/** [throws] write data atomically to the disk and update the cache (designed for modules to interact with;
-	 *	writes as utf-8; writes data first to temporary file and then replaces the file atomically; for create,
-	 *	must not replace an existing file; returns false if the file already existed and could not be created) */
-	public async write(path: string, data: Buffer | string, options?: { what?: string, temporary?: string, create?: boolean }): Promise<boolean> {
+	/** [throws] write data atomically to the disk and conditionally update the cache (designed for modules to
+	 *	interact with; writes as utf-8; writes data first to temporary file and then replaces the file atomically;
+	 *	for create: must not replace an existing file; for create: returns false if the file already existed and
+	 *	could not be created, otherwise, returns always true; empty what string will not log anything) */
+	public async write(path: string, data: Buffer | string | libStream.Readable, options?: { what?: string, temporary?: string, create?: boolean }): Promise<boolean> {
 		if (typeof data == 'string')
 			data = Buffer.from(data, 'utf-8');
 
 		/* write the data atomically to the destination (let errors propagate out) */
 		if (!await atomicWrite(path, data, this, { what: (options?.what ?? 'via cache'), temporary: options?.temporary, create: options?.create }))
 			return false;
-		if (!this._cacheManager.cacheable(data.byteLength))
+
+		/* check if the file is a stream (will not be streamed into the cache, as size is unknown) or does not fit into the cache */
+		if (data instanceof libStream.Readable || !this._cacheManager.cacheable(data.byteLength))
 			return true;
 		const age = this._cacheManager.allocAge();
 

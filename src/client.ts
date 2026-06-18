@@ -7,7 +7,6 @@ import * as libHelper from "./helper.js";
 import * as libBase from "./base.js";
 import * as libServer from "./server.js";
 import * as libEvents from "events";
-import * as libFs from "fs";
 import * as libStream from "stream";
 import * as libUrl from "url";
 import * as libWs from "ws";
@@ -1564,73 +1563,37 @@ export class ClientRequest extends ClientBase {
 		}
 
 		/* create the source stream of the file to read from (will not throw any exceptions) */
-		let source: libStream.Readable = (reader != null ? reader.stream() : cached.stream({ start: range.first, end: range.last }));
-
-		/* pipe the components together and await completion */
-		let settled = false;
-		return new Promise((resolve) => {
-			source.pipe(stream);
-			source.once('error', (err: any) => {
-				if (settled) return; settled = true;
+		const source: libStream.Readable = (reader != null ? reader.stream() : cached.stream({ start: range.first, end: range.last }));
+		return new Promise<boolean>((resolve) => libStream.pipeline(source, stream, (err: any) => {
+			if (err != null)
 				this.respondInternalError(`Failed to stream file [${filePath}]: ${err.message}`);
-				stream.destroy(err);
-			});
-			stream.once('error', (err: any) => {
-				if (settled) return; settled = true;
-				source.destroy(err);
-			});
-			stream.once('close', () => {
-				settled = true;
-				resolve(true);
-			});
-		});
+			resolve(true);
+		}));
 	}
 
-	/** [throws] receive the payload of given max length and write it directly to a file; will fail
-	 *	if the file already exists and delete the file if it could not be received in full
-	 *	automatically responds with given exceptions if the payload cannot be received properly or file operations fail */
-	public async receiveToFile(path: string, maxLength: number | null): Promise<void> {
-		this.trace(`Collecting data from [${this.url.pathname}] to: [${path}]`);
-		return new Promise((resolve, reject) => {
-			let source: libStream.Readable = this.receiveClientData(maxLength);
+	/** [throws] receive the payload of given max length and write it directly to a file; automatically responds to all errors;
+	 *	writes the file atomically via the cache by either writing it to a temporary file, and then swapping it, or creating it
+	 *	in-place but fail, if the file already exists; for create, returns false if the file already existed, otherwise, returns
+	 *	always true; conditionally; use [existsNoResponse] to not auto-respond in the event that the file already existed */
+	public async receiveToFile(path: string, maxLength: number | null, options?: { temporary?: string, create?: boolean, existsNoResponse?: boolean }): Promise<boolean> {
+		this.trace(`Collecting data to: [${path}]`);
 
-			/* create the stream to the file to be written and setup the plumbing */
-			const destination = libFs.createWriteStream(path, { flags: 'wx' });
-			let fileFailed = false, sourceFailed = false, opened = false;
-			source.once('error', (err: any) => {
-				sourceFailed = true;
-				destination.destroy(err);
-			});
-			destination.once('open', () => {
-				opened = true;
-				if (!sourceFailed)
-					source.pipe(destination);
-				else
-					destination.destroy();
-			});
-			destination.once('error', (err: any) => {
-				if (!sourceFailed)
-					this.respondInternalError(`Failed to write uploaded file: ${err.message}`);
-				fileFailed = true;
+		try {
+			/* just let errors close the reader, as it will not close the underlying request, just the pass-through reader */
+			const stream: libStream.Readable = this.receiveClientData(maxLength);
+			if (await this.cache.write(path, stream, { what: '', temporary: options?.temporary, create: options?.create }))
+				return true;
 
-				/* destroy the source to clean up the receiving pipeline (will
-				*	not close the underlying request, just the pass-through reader) */
-				source.destroy();
-
-				/* check if the file was opened and remove it */
-				if (!opened)
-					return reject(err);
-				libFs.unlink(path, (err2: any) => {
-					if (err2 != null)
-						this.error(`Failed to remove temporary file [${path}]: ${err2.message}`);
-					reject(err);
-				});
-			});
-			destination.once('close', () => {
-				if (!sourceFailed && !fileFailed)
-					resolve();
-			});
-		});
+			/* check if the already-existed should be reported */
+			if (options?.existsNoResponse !== true)
+				this.respondConflict('File already existed');
+			return false;
+		} catch (err: any) {
+			/* no need to respond on broken connections, as this will already have been logged */
+			if (this._state.response != ResponseState.broken)
+				this.respondInternalError(`Failed to write uploaded file: ${err.message}`);
+			throw err;
+		}
 	}
 
 	/** [no-throw but errors] receive the payload of given max length as a readable stream

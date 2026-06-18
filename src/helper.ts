@@ -372,14 +372,14 @@ export function rebasePath(oldBase: string, newBase: string, path: string): stri
 	return joinSanitized(newBase, childPath(oldBase, path));
 }
 
-/** create path-creator, which returns sanitized paths relative to [path] */
+/** create path-creator, which returns sanitized paths inside of [path] */
 export function createPathLocation(path: string): (path: string) => string {
 	return function (p) {
 		return libPath.join(path, sanitize(p, false));
 	};
 }
 
-/** create path-creator, which returns paths relative to the file url path (like the script itself using 'import.meta.url') and optionally changed by relative [path] */
+/** create path-creator, which returns paths inside of the file url path (like the script itself using 'import.meta.url') and optionally changed by relative [path] */
 export function createPathSelf(urlFilePath: string, path?: string): (path: string) => string {
 	let dirName = libPath.dirname(libUrl.fileURLToPath(urlFilePath));
 	if (path != null)

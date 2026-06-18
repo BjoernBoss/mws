@@ -219,8 +219,11 @@ const text = await client.receiveAllText('utf-8', 1_000_000);
 /* as a readable stream */
 const stream = client.receiveData(1_000_000);
 
-/* directly to a file (fails if the file already exists) */
+/* directly to a file (atomic: writes to temp file, then renames) */
 await client.receiveToFile('/uploads/file.bin', 10_000_000);
+
+/* directly to a file (create-only: fails if the file already exists) */
+const created = await client.receiveToFile('/uploads/file.bin', 10_000_000, { create: true });
 ```
 
 ### Responding
@@ -321,6 +324,7 @@ These methods are designed for modules to be used, and allows directly to write 
 ```typescript
 const buffer = await server.cache.read('/path/to/data.json');
 await server.cache.write('/path/to/output.json', JSON.stringify(data));
+await server.cache.write('/path/to/output.bin', readableStream);
 await server.cache.remove('/path/to/old.json');
 server.cache.flush();
 ```
