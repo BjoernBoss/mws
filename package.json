@@ -1,6 +1,6 @@
 {
 	"name": "@bjoernboss/mws",
-	"version": "1.1.0",
+	"version": "1.2.0",
 	"type": "module",
 	"description": "Modular Web Server — a TypeScript framework for hosting isolated modules behind HTTP/HTTPS+WebSocket endpoints",
 	"license": "BSD-3-Clause",
