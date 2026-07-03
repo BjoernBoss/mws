@@ -944,6 +944,32 @@ export class ClientRequest extends ClientBase {
 		/* create the plumbing between stream and output (errors are already handled) */
 		return stream.pipe(output);
 	}
+	private hasDataQueued(): boolean {
+		const request = this._request;
+
+		/* check if data remain in the pipeline, or any data should be uploaded */
+		if (request.readableEnded || request.destroyed)
+			return false;
+		const length = parseInt(this.headers['content-length'] ?? '0');
+		const chunked = (this.headers['transfer-encoding'] != null);
+		return (length > 0 || chunked);
+	}
+	private drainQueuedData(): Promise<void> {
+		return new Promise<void>((resolve) => {
+			this.trace('Draining uploaded data');
+
+			/* await the receiving of all data or the connection breaking */
+			const cb = () => {
+				this._request.removeListener('end', cb);
+				resolve();
+			};
+			this._request.once('end', cb);
+			this._state.breakPromise.then(cb);
+
+			/* start consuming the data blindly */
+			this._request.resume();
+		});
+	}
 
 	public _pushTranslation(map: Record<string, string | null> | null, identity: string): ClientContext | null {
 		let sanitized: Record<string, string | null> | null = null;
@@ -1007,14 +1033,13 @@ export class ClientRequest extends ClientBase {
 			this.badClientUsage('Receive stream not consumed', false);
 		}
 
-		/* check if data remain in the pipeline, in which case the connection needs
-		*	to be closed to ensure the sender does not pipe more data over */
-		const request = this._request;
-		if (!request.readableEnded && !request.destroyed && this._state.response != ResponseState.broken) {
-			const length = parseInt(this.headers['content-length'] ?? '0');
-			const chunked = (this.headers['transfer-encoding'] != null);
-			if (length != 0 || chunked)
-				this.markAsBroken((request.readableLength > 0 ? 'Uploaded data not consumed' : 'Potential uploaded data not consumed'), true);
+		/* check if data remain in the pipeline, in which case they either need to be consumed,
+		*	or the connection needs to be closed to ensure the sender does not pipe more data over */
+		if (this.hasDataQueued() && this._state.response != ResponseState.broken) {
+			if (this.config.drainUpload)
+				await this.drainQueuedData();
+			else
+				this.markAsBroken((this._request.readableLength > 0 ? 'Uploaded data not consumed' : 'Potential uploaded data not consumed'), true);
 		}
 
 		/* check if the upgrade was not fully awaited */
@@ -1048,14 +1073,14 @@ export class ClientRequest extends ClientBase {
 		this._state.completedResolve();
 	}
 
-	/** respond with an internal error and kill the connection */
-	public killConnection(reason: string): void {
+	/** respond with an internal error and kill the connection (if [gracefully], give previous responses time to be received) */
+	public killConnection(reason: string, options?: { graceful?: boolean }): void {
 		const description = `Connection killed: ${reason}`;
 		const closing = (this._state.response == ResponseState.none || this._state.response == ResponseState.acknowledged);
 
 		if (closing)
 			this.respondInternalError(description, { headers: { 'Connection': 'close' } });
-		this.markAsBroken((closing ? '' : description), closing);
+		this.markAsBroken((closing ? '' : description), (closing || (options?.graceful ?? false)));
 	}
 
 	/** server the client originates from */
@@ -1635,6 +1660,21 @@ export class ClientRequest extends ClientBase {
 		}
 	}
 
+	/** drain any remaining data being uploaded (must not be called while a request is currently being received) */
+	public async drainUpload(): Promise<void> {
+		if (this._state.response == ResponseState.broken)
+			return;
+
+		/* check if the data are currently being received and otherwise mark them as being received */
+		if (this._state.receive == ReceiveState.receiving)
+			return this.badClientUsage('Raining received data', false);
+		this._state.receive = ReceiveState.completed;
+
+		/* check if any data remain in the queue to be received */
+		if (this.hasDataQueued())
+			return this.drainQueuedData();
+	}
+
 	/** marks the object as having been handled and returns a web socket or automatically responds
 	 *	with a corresponding error and returns null (automatically validates method and headers) */
 	public async acceptWebSocket(): Promise<ClientSocket | null> {
@@ -1931,6 +1971,9 @@ export interface ClientConfig {
 	/** time for a broken connection or socket to receive the response before force-closing it [0 results in immediate close; in milliseconds; Default: 1_000] */
 	killGraceTimeout?: number;
 
+	/** drain any uploaded data remaining in the pipeline, instead of closing the connection [Default: false] */
+	drainUpload?: boolean;
+
 	/** cache-control values per cache policy */
 	cache?: {
 		/** default cache-control value for immutable content reads [empty string does not set any cache-control; Default: 'public, max-age=2592000, immutable' (30 days)] */
@@ -1965,6 +2008,7 @@ export class BurntClientConfig {
 	public readonly webSocketTimeout: number;
 	public readonly webSocketAliveTimeout: number;
 	public readonly killGraceTimeout: number;
+	public readonly drainUpload: boolean;
 	public readonly cache: Record<CachePolicy, string>;
 	public readonly throughputGrace: number;
 	public readonly throughputThreshold: number;
@@ -1976,6 +2020,7 @@ export class BurntClientConfig {
 		this.webSocketTimeout = config?.webSocketTimeout ?? 180_000;
 		this.webSocketAliveTimeout = config?.webSocketAliveTimeout ?? 2_000;
 		this.killGraceTimeout = config?.killGraceTimeout ?? 1_000;
+		this.drainUpload = config?.drainUpload ?? false;
 		this.cache = {
 			immutable: config?.cache?.immutable ?? 'public, max-age=2592000, immutable',
 			static: config?.cache?.static ?? 'public, no-cache',
