@@ -57,10 +57,10 @@ class ClientBase extends libLog.Logger {
 		this._config = config;
 	}
 
-	/** raw request origin (no host will result in '_'; host will be lower-case) */
+	/** raw request origin (no host will result in '_'; host will be lower-case; NOT sanitized) */
 	readonly url: libUrl.URL;
 
-	/** path relative to current module */
+	/** path relative to current module (fully sanitized and clean path, does not end in a slash, unless its root) */
 	public get path(): string {
 		return this._path;
 	}
@@ -68,16 +68,6 @@ class ClientBase extends libLog.Logger {
 	/** configuration used by this client */
 	public get config(): BurntClientConfig {
 		return this._config
-	}
-
-	/** check if the path relative to the current module is a sub path or the same of the given test base path (can be /base or /base/...) */
-	public isSubPathOf(base: string): boolean {
-		return libHelper.isSubPath(base, this._path);
-	}
-
-	/** check if the path relative to the current module is inside of the given test base path (must be truly inside; /base/...) */
-	public isInsideOf(base: string): boolean {
-		return libHelper.isInside(base, this._path);
 	}
 
 	/** create a path relative from the current module into the clients traversed server space */
@@ -115,6 +105,26 @@ class ClientBase extends libLog.Logger {
 			}
 		}
 		return output;
+	}
+
+	/** check if the path relative to the current module is a sub path or the same of the given test base path (can be /base or /base/...) */
+	public isSubPathOf(base: string): boolean {
+		return libHelper.isSubPath(base, this._path);
+	}
+
+	/** check if the path relative to the current module is inside of the given test base path (must be truly inside; /base/...) */
+	public isInsideOf(base: string): boolean {
+		return libHelper.isInside(base, this._path);
+	}
+
+	/** return the remaining path for the sub directory path relative to the current module in base (must be a true sub-directory) */
+	public getChildPath(base: string): string {
+		return libHelper.childPath(base, this._path);
+	}
+
+	/** rebase the path relative to the current module from the old base directory onto the new base (must be a true sub-directory) */
+	public getRebased(oldBase: string, newBase: string): string {
+		return libHelper.rebasePath(oldBase, newBase, this._path);
 	}
 }
 
@@ -898,7 +908,7 @@ export class ClientRequest extends ClientBase {
 
 				if (encoding == null) {
 					output.destroy();
-					this.respondUnsupported(encodings[i], libHelper.supportedEncodingNames().join(','));
+					this.respondUnsupportedMediaType(encodings[i], libHelper.supportedEncodingNames().join(','));
 					return makeErrorStream('Unsupported content encoding');
 				}
 
@@ -907,7 +917,7 @@ export class ClientRequest extends ClientBase {
 				stream = stream.pipe(decoder);
 				decoder.once('error', (err: any) => {
 					if (!output.destroyed)
-						this.respondBadRequest('Invalid data encoding');
+						this.respondBadRequest({ reason: 'Invalid data encoding' });
 					output.destroy(err);
 				});
 
@@ -1138,7 +1148,7 @@ export class ClientRequest extends ClientBase {
 			if (type === types[i].mediaType)
 				return types[i];
 		}
-		this.respondUnsupported(type, types.map(t => t.mediaType).join(','), options);
+		this.respondUnsupportedMediaType(type, types.map(t => t.mediaType).join(','), options);
 		return null;
 	}
 
@@ -1179,24 +1189,24 @@ export class ClientRequest extends ClientBase {
 		this._htmlPatcher.push(cb);
 	}
 
-	/** respond with [internal-error] and a default text response (always considered an error; reason is logged server-side only); cache policy defaults to [sensitive] */
+	/** respond with [internal-error] and a default text response (reason is logged server-side only); cache policy defaults to [sensitive] */
 	public respondInternalError(reason: string, options?: { headers?: Record<string, string>, cache?: CachePolicy }): void {
 		const header = (options?.headers ?? {});
 		this.applyCachePolicy(header, CachePolicy.sensitive, options?.cache);
 
-		this.constructQuickResponse(libBase.Status.InternalError, `Failure Reason (not sent): ${reason}`, header, {
+		this.constructQuickResponse(libBase.Status.InternalError, `Reason (not sent): ${reason}`, header, {
 			media: libBase.Media.Text, body: Buffer.from(`An internal server error occurred while processing the request for [${this.url.pathname}].`, 'utf-8')
 		});
 	}
 
-	/** respond with [forbidden] and a default text response (reason is logged server-side only); cache policy defaults to [sensitive] */
-	public respondForbidden(reason: string, options?: { headers?: Record<string, string>, cache?: CachePolicy }): void {
+	/** respond with [forbidden] and a default text response (reason will be logged server-side only) or a custom text response; cache policy defaults to [sensitive] */
+	public respondForbidden(options?: { reason?: string, message?: string, headers?: Record<string, string>, cache?: CachePolicy }): void {
 		const header = (options?.headers ?? {});
 		this.applyCachePolicy(header, CachePolicy.sensitive, options?.cache);
 
-		this.constructQuickResponse(libBase.Status.Forbidden, `Forbidden Reason (not sent): ${reason}`, header, {
-			media: libBase.Media.Text, body: Buffer.from(`Access to [${this.url.pathname}] denied.`, 'utf-8')
-		});
+		const logReason = (options?.reason != null ? `Reason (not sent): ${options.reason}` : options?.message ?? null);
+		const content = (options?.message ?? `Access to [${this.url.pathname}] denied.`);
+		this.constructQuickResponse(libBase.Status.Forbidden, logReason, header, { media: libBase.Media.Text, body: Buffer.from(content, 'utf-8') });
 	}
 
 	/** respond with a any response of the given configuration (defaults to media-type: text/unknown/-, status: ok); if [lightResponse], the
@@ -1220,17 +1230,50 @@ export class ClientRequest extends ClientBase {
 		});
 	}
 
-	/** respond with [ok] and either a message or a default response; cache policy defaults to [private] */
-	public respondOk(options?: { message?: string, headers?: Record<string, string>, cache?: CachePolicy }): void {
+	/** respond with [bad-request] and a default response (with embedded reason) or a custom text response; cache policy defaults to [private] */
+	public respondBadRequest(options?: { reason?: string, message?: string, headers?: Record<string, string>, cache?: CachePolicy }): void {
 		const header = (options?.headers ?? {});
 		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
-		this.constructQuickResponse(libBase.Status.Ok, options?.message ?? null, header, {
-			media: libBase.Media.Text, body: Buffer.from(options?.message ?? `${this.method} was successful for [${this.url.pathname}].`, 'utf-8')
+		const body: string = options?.message ?? `Request for [${this.url.pathname}] is perceived as malformed${options?.reason == null ? '.' : `:\n${options.reason}`}`;
+		this.constructQuickResponse(libBase.Status.BadRequest, (options?.reason ?? options?.message ?? null), header, {
+			media: libBase.Media.Text, body: Buffer.from(body, 'utf-8')
 		});
 	}
 
-	/** respond with [created] and either a message or a default response (ensure target is properly URI encoded); cache policy defaults to [private] */
+	/** respond with [conflict] and a default response (with embedded reason) or a custom text response; cache policy defaults to [private] */
+	public respondConflict(options?: { reason?: string, message?: string, headers?: Record<string, string>, cache?: CachePolicy }): void {
+		const header = (options?.headers ?? {});
+		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
+
+		const body: string = options?.message ?? `Conflict for resource [${this.url.pathname}]${options?.reason == null ? '.' : `:\n${options.reason}`}`;
+		this.constructQuickResponse(libBase.Status.Conflict, (options?.reason ?? options?.message ?? null), header, {
+			media: libBase.Media.Text, body: Buffer.from(body, 'utf-8')
+		});
+	}
+
+	/** respond with [ok] a default response (with embedded reason) or a custom text response; cache policy defaults to [private] */
+	public respondOk(options?: { reason?: string, message?: string, headers?: Record<string, string>, cache?: CachePolicy }): void {
+		const header = (options?.headers ?? {});
+		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
+
+		const body: string = options?.message ?? `${this.method} was successful for [${this.url.pathname}]${options?.reason == null ? '.' : `:\n${options.reason}`}`;
+		this.constructQuickResponse(libBase.Status.Ok, (options?.reason ?? options?.message ?? null), header, {
+			media: libBase.Media.Text, body: Buffer.from(body, 'utf-8')
+		});
+	}
+
+	/** respond with [not-found] and a default text response; cache policy defaults to [private] */
+	public respondNotFound(options?: { headers?: Record<string, string>, cache?: CachePolicy }): void {
+		const header = (options?.headers ?? {});
+		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
+
+		this.constructQuickResponse(libBase.Status.NotFound, null, header, {
+			media: libBase.Media.Text, body: Buffer.from(`Resource [${this.url.pathname}] could not be found.`, 'utf-8')
+		});
+	}
+
+	/** respond with [created] and a default text response; cache policy defaults to [private] */
 	public respondCreated(target: string, options?: { headers?: Record<string, string>, cache?: CachePolicy }): void {
 		const header = (options?.headers ?? {});
 		header['Location'] = target;
@@ -1267,16 +1310,6 @@ export class ClientRequest extends ClientBase {
 		});
 	}
 
-	/** respond with [bad-request] and a default text response; cache policy defaults to [private] */
-	public respondBadRequest(reason: string, options?: { headers?: Record<string, string>, cache?: CachePolicy }): void {
-		const header = (options?.headers ?? {});
-		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
-
-		this.constructQuickResponse(libBase.Status.BadRequest, reason, header, {
-			media: libBase.Media.Text, body: Buffer.from(`Request for [${this.url.pathname}] is perceived as malformed:\n${reason}`, 'utf-8')
-		});
-	}
-
 	/** respond with [range-not-satisfiable] and a default text response; cache policy defaults to [private] */
 	public respondRangeIssue(range: string, size: number, options?: { headers?: Record<string, string>, cache?: CachePolicy }): void {
 		const header = (options?.headers ?? {});
@@ -1288,28 +1321,8 @@ export class ClientRequest extends ClientBase {
 		});
 	}
 
-	/** respond with [conflict] and a default text response; cache policy defaults to [private] */
-	public respondConflict(conflict: string, options?: { headers?: Record<string, string>, cache?: CachePolicy }): void {
-		const header = (options?.headers ?? {});
-		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
-
-		this.constructQuickResponse(libBase.Status.Conflict, conflict, header, {
-			media: libBase.Media.Text, body: Buffer.from(`Conflict for resource [${this.url.pathname}]:\n${conflict}`, 'utf-8')
-		});
-	}
-
-	/** respond with [not-found] and a default text response; cache policy defaults to [private] */
-	public respondNotFound(options?: { headers?: Record<string, string>, cache?: CachePolicy }): void {
-		const header = (options?.headers ?? {});
-		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
-
-		this.constructQuickResponse(libBase.Status.NotFound, null, header, {
-			media: libBase.Media.Text, body: Buffer.from(`Resource [${this.url.pathname}] could not be found.`, 'utf-8')
-		});
-	}
-
 	/** respond with [unsupported-media-type] and a default text response; cache policy defaults to [private] */
-	public respondUnsupported(used: string, allowed: string, options?: { headers?: Record<string, string>, cache?: CachePolicy }): void {
+	public respondUnsupportedMediaType(used: string, allowed: string, options?: { headers?: Record<string, string>, cache?: CachePolicy }): void {
 		const header = (options?.headers ?? {});
 		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
@@ -1363,8 +1376,7 @@ export class ClientRequest extends ClientBase {
 		});
 	}
 
-	/** respond with [see-other] to the given target and a default text response (forces method
-	 *	GET; ensure target is properly URI encoded); cache policy defaults to [private] */
+	/** respond with [see-other] to the given target and a default text response (forces method GET); cache policy defaults to [private] */
 	public respondSeeOther(target: string, options?: { headers?: Record<string, string>, cache?: CachePolicy }): void {
 		const header = (options?.headers ?? {});
 		header['Location'] = target;
@@ -1375,8 +1387,7 @@ export class ClientRequest extends ClientBase {
 		});
 	}
 
-	/** respond with [temporary-redirect] to the given target and a default text response (preserves
-	 *	method; ensure target is properly URI encoded); cache policy defaults to [private] */
+	/** respond with [temporary-redirect] to the given target and a default text response (preserves method); cache policy defaults to [private] */
 	public respondTemporaryRedirect(target: string, options?: { headers?: Record<string, string>, cache?: CachePolicy }): void {
 		const header = (options?.headers ?? {});
 		header['Location'] = target;
@@ -1387,8 +1398,7 @@ export class ClientRequest extends ClientBase {
 		});
 	}
 
-	/** respond with [permanent-redirect] to the given target and a default text response (preserves
-	 *	method; ensure target is properly URI encoded); cache policy defaults to [private] */
+	/** respond with [permanent-redirect] to the given target and a default text response (preserves method); cache policy defaults to [private] */
 	public respondPermanentRedirect(target: string, options?: { headers?: Record<string, string>, cache?: CachePolicy }): void {
 		const header = (options?.headers ?? {});
 		header['Location'] = target;
@@ -1474,7 +1484,7 @@ export class ClientRequest extends ClientBase {
 		/* parse the range and ensure that its well formed */
 		const range = libHelper.parseRangeHeader(this.headers.range ?? null, cached.fileSize());
 		if (range.state == libHelper.RangeState.malformed) {
-			this.respondBadRequest(`Issues while parsing http-header range: [${this.headers.range}]`);
+			this.respondBadRequest({ reason: `Issues while parsing http-header range: [${this.headers.range}]` });
 			return true;
 		}
 		else if (range.state == libHelper.RangeState.issue) {
@@ -1571,23 +1581,18 @@ export class ClientRequest extends ClientBase {
 		}));
 	}
 
-	/** [throws] receive the payload of given max length and write it directly to a file; automatically responds to all errors;
-	 *	writes the file atomically via the cache by either writing it to a temporary file, and then swapping it, or creating it
-	 *	in-place but fail, if the file already exists; for create, returns false if the file already existed, otherwise, returns
-	 *	always true; conditionally; use [existsNoResponse] to not auto-respond in the event that the file already existed */
-	public async receiveToFile(path: string, maxLength: number | null, options?: { temporary?: string, create?: boolean, existsNoResponse?: boolean }): Promise<boolean> {
+	/** [throws] receive the payload of given max length and write it directly to a file; automatically responds to all errors; writes the file atomically
+	 *	via the cache by either writing it to a temporary file, and then swapping it, or creating it in-place but fail, if the file already exists */
+	public async receiveToFile(path: string, maxLength: number | null, options?: { temporary?: string, create?: boolean }): Promise<void> {
 		this.trace(`Collecting data to: [${path}]`);
 
 		try {
 			/* just let errors close the reader, as it will not close the underlying request, just the pass-through reader */
 			const stream: libStream.Readable = this.receiveClientData(maxLength);
 			if (await this.cache.write(path, stream, { what: '', temporary: options?.temporary, create: options?.create }))
-				return true;
-
-			/* check if the already-existed should be reported */
-			if (options?.existsNoResponse !== true)
-				this.respondConflict('File already existed');
-			return false;
+				return;
+			this.respondConflict({ reason: 'Path already exists' });
+			throw new Error('Path already exists');
 		} catch (err: any) {
 			/* no need to respond on broken connections, as this will already have been logged */
 			if (this._state.response != ResponseState.broken)
@@ -1625,13 +1630,13 @@ export class ClientRequest extends ClientBase {
 		try {
 			return buffer.toString(encoding as BufferEncoding);
 		} catch (err: any) {
-			this.respondBadRequest('Unable to decode content');
+			this.respondBadRequest({ reason: 'Unable to decode content' });
 			throw err;
 		}
 	}
 
-	/** marks the object as having been handled and returns a web socket or
-	 *	automatically responds with a corresponding error and returns null */
+	/** marks the object as having been handled and returns a web socket or automatically responds
+	 *	with a corresponding error and returns null (automatically validates method and headers) */
 	public async acceptWebSocket(): Promise<ClientSocket | null> {
 		if (this._state.response != ResponseState.none) {
 			this.badClientUsage('WebSocket upgrade on already claimed connection', false);
