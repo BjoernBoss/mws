@@ -58,6 +58,9 @@ async function atomicWrite(path: string, content: Buffer | libStream.Readable, l
 		if (create && err.code == 'EEXIST')
 			return false;
 
+		if (options?.what != '')
+			logger.trace(`Removing partially written [${create ? path : tempPath}]`);
+
 		/* try to remove the partial/temporary file */
 		try { await libFsPromises.unlink(create ? path : tempPath); }
 		catch (err: any) {
@@ -66,10 +69,10 @@ async function atomicWrite(path: string, content: Buffer | libStream.Readable, l
 		}
 
 		if (written)
-			throw new Error(`Failed to replace the original file: ${err.message}`);
+			throw new Error(`Replace the original file: ${err.message}`);
 		else if (create)
-			throw new Error(`Failed to create file: ${err.message}`);
-		throw new Error(`Failed to write to temporary file [${tempPath}]: ${err.message}`);
+			throw new Error(`Create file: ${err.message}`);
+		throw new Error(`Write to temporary file [${tempPath}]: ${err.message}`);
 	}
 	return true;
 }
@@ -510,7 +513,7 @@ class NotCached implements Cached {
 		try {
 			stream = libFs.createReadStream(this.path, { flags: 'r', start: options?.start, end: options?.end });
 		} catch (err: any) {
-			return new libStream.Readable({ read() { this.destroy(new Error(`Error reading file: ${err.message}`)) } });
+			return new libStream.Readable({ read() { this.destroy(new Error(`Reading file: ${err.message}`)) } });
 		}
 
 		/* check if only a partial file is being read, or it is too large, in which case it will not be added to the cache */
