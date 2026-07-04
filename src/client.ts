@@ -895,7 +895,6 @@ export class ClientRequest extends ClientBase {
 				}
 				cb();
 			},
-
 		});
 
 		/* check if the content is encoded and create the chain of decoders (in reverse to ensure the nesting is correct) */
@@ -1464,10 +1463,10 @@ export class ClientRequest extends ClientBase {
 		this.sendFullResponse(status, headers, { media: libBase.Media.Html, body: content });
 	}
 
-	/** [no-throw but errors] send data with [media type] and [status] and return a writable stream (default: status is ok, media is unknown,
-	 *	dynamicEncode is true); if a content size is provided, stream expects exactly this amount of bytes; if [dynamicEncode], the encoder
-	 *	will be dynamically negotiated based on the content; for a HEAD request, no encoding will be negotiated, no lengths verified, and
-	 *	the written data will just be drained (can immediately be ended using '.end()'); cache policy defaults to [private] */
+	/** [no-throw but errors] send data with [media type] and [status] and return a writable stream (default: status is ok, media is unknown, dynamicEncode
+	 *	is true); if a content size is provided, stream expects exactly this amount of bytes; if [dynamicEncode], the encoder will be dynamically negotiated
+	 *	based on the content; for a HEAD request, no encoding will be negotiated, no lengths verified, and the written data will just be drained (can
+	 *	immediately be ended using '.end()'); cache policy defaults to [private]; errors will automatically close the client connection properly */
 	public respondData(options?: { status?: libBase.StatusType, media?: libBase.MediaType, contentSize?: number, dynamicEncode?: boolean, headers?: Record<string, string>, cache?: CachePolicy }): libStream.Writable {
 		const status: libBase.StatusType = options?.status ?? libBase.Status.Ok;
 		const headers = (options?.headers ?? {});
@@ -1597,17 +1596,23 @@ export class ClientRequest extends ClientBase {
 			return new Promise((resolve) => stream.end(() => resolve(true)));
 		}
 
-		/* create the source stream of the file to read from (will not throw any exceptions) */
+		/* create the source stream of the file to read from (will not throw any exceptions; no need to respond with internal errors, as the stream will already do so) */
 		const source: libStream.Readable = (reader != null ? reader.stream() : cached.stream({ start: range.first, end: range.last }));
 		return new Promise<boolean>((resolve) => libStream.pipeline(source, stream, (err: any) => {
 			if (err != null)
-				this.respondInternalError(`Failed to stream file [${filePath}]: ${err.message}`);
+				this.error(`Failed to stream file [${filePath}]: ${err.message}`);
 			resolve(true);
 		}));
 	}
 
+	/** [no-throw but errors] receive the payload of given max length as a readable stream; automatically responds with given exceptions if the payload
+	 *	cannot be received properly; automatically drained if the readable stream is destroyed before reading all data (does not result in an error or logs) */
+	public receiveData(maxLength: number | null): libStream.Readable {
+		return this.receiveClientData(maxLength);
+	}
+
 	/** [throws] receive the payload of given max length and write it directly to a file; automatically responds to all errors; writes the file atomically
-	 *	via the cache by either writing it to a temporary file, and then swapping it, or creating it in-place but fail, if the file already exists */
+ *	via the cache by either writing it to a temporary file, and then swapping it, or creating it in-place but fail, if the file already exists */
 	public async receiveToFile(path: string, maxLength: number | null, options?: { temporary?: string, create?: boolean }): Promise<void> {
 		this.trace(`Collecting data to: [${path}]`);
 
@@ -1624,13 +1629,6 @@ export class ClientRequest extends ClientBase {
 				this.respondInternalError(`Failed to write uploaded file: ${err.message}`);
 			throw err;
 		}
-	}
-
-	/** [no-throw but errors] receive the payload of given max length as a readable stream
-	 *	automatically responds with given exceptions if the payload cannot be received properly
-	 *	automatically drained if the readable stream is destroyed before reading all data */
-	public receiveData(maxLength: number | null): libStream.Readable {
-		return this.receiveClientData(maxLength);
 	}
 
 	/** [throws] receive the payload of given max length as a single complete buffer
