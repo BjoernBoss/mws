@@ -38,7 +38,8 @@ export interface MediaType {
 export const Media = {
 	Html: { fileEnding: ['html'], mediaType: 'text/html', encoding: 'charset=utf-8', compressible: true },
 	Css: { fileEnding: ['css'], mediaType: 'text/css', encoding: 'charset=utf-8', compressible: true },
-	JavaScript: { fileEnding: ['js'], mediaType: 'text/javascript', encoding: 'charset=utf-8', compressible: true },
+	JavaScript: { fileEnding: ['js', 'mjs', 'cjs'], mediaType: 'text/javascript', encoding: 'charset=utf-8', compressible: true },
+	TypeScript: { fileEnding: ['ts', 'tsx', 'mts', 'cts'], mediaType: 'text/typescript', encoding: 'charset=utf-8', compressible: true },
 	Text: { fileEnding: ['txt', 'text'], mediaType: 'text/plain', encoding: 'charset=utf-8', compressible: true },
 	Json: { fileEnding: ['json'], mediaType: 'application/json', encoding: 'charset=utf-8', compressible: true },
 	Mp4: { fileEnding: ['mp4'], mediaType: 'video/mp4', encoding: '', compressible: false },
@@ -46,6 +47,11 @@ export const Media = {
 	Gif: { fileEnding: ['gif'], mediaType: 'image/gif', encoding: '', compressible: false },
 	Jpg: { fileEnding: ['jpg', 'jpeg'], mediaType: 'image/jpeg', encoding: '', compressible: false },
 	Svg: { fileEnding: ['svg'], mediaType: 'image/svg+xml', encoding: 'charset=utf-8', compressible: true },
+	Zip: { fileEnding: ['zip'], mediaType: 'application/zip', encoding: '', compressible: false },
+	Archive7z: { fileEnding: ['7z'], mediaType: 'application/x-7z-compressed', encoding: '', compressible: false },
+	Rar: { fileEnding: ['rar'], mediaType: 'application/vnd.rar', encoding: '', compressible: false },
+	Tar: { fileEnding: ['tar'], mediaType: 'application/x-tar', encoding: '', compressible: false },
+	Gzip: { fileEnding: ['gz'], mediaType: 'application/gzip', encoding: '', compressible: false },
 	Unknown: { fileEnding: [], mediaType: 'application/octet-stream', encoding: '', compressible: false }
 } as const satisfies Record<string, MediaType>
 

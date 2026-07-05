@@ -830,7 +830,9 @@ export class CacheHost extends libLog.Logger {
 			const entry = this.resolveCache(path, options?.checkFreshness ?? false, false) as (Cached | null);
 			if (entry == null)
 				return null;
-			return entry.read();
+
+			/* await in-place to ensure errors are caught and pre-processed */
+			return await entry.read();
 		}
 
 		/* special abstraction to ensure check-before-use does not result in not-found */
@@ -839,6 +841,15 @@ export class CacheHost extends libLog.Logger {
 				return null;
 			throw err;
 		}
+	}
+
+	/** [no-throw but errors] create a read stream of the data (designed for modules to interact with) */
+	public stream(path: string, options?: { checkFreshness?: boolean }): libStream.Readable | null {
+		/* let errors just propagate out (unable to catch ENOENT errors as they are embedded into the stream errors) */
+		const entry = this.resolveCache(path, options?.checkFreshness ?? false, false) as (Cached | null);
+		if (entry == null)
+			return null;
+		return entry.stream();
 	}
 
 	/** [throws] write data atomically to the disk and conditionally update the cache (designed for modules to
@@ -867,7 +878,8 @@ export class CacheHost extends libLog.Logger {
 		return true;
 	}
 
-	/** [throws] remove the data from the physical disk and from the cache (returns false if it did not exist) */
+	/** [throws] remove the data from the physical disk and from the cache (designed
+	 *	for modules to interact with; returns false if it did not exist) */
 	public async remove(path: string): Promise<boolean> {
 		let existed: boolean = true;
 
