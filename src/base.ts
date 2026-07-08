@@ -53,7 +53,9 @@ export const Media = {
 	Rar: { fileEnding: ['rar'], mediaType: 'application/vnd.rar', encoding: '', compressible: false },
 	Tar: { fileEnding: ['tar'], mediaType: 'application/x-tar', encoding: '', compressible: false },
 	Gzip: { fileEnding: ['gz'], mediaType: 'application/gzip', encoding: '', compressible: false },
-	Unknown: { fileEnding: [], mediaType: 'application/octet-stream', encoding: '', compressible: false }
+	Unknown: { fileEnding: [], mediaType: 'application/octet-stream', encoding: '', compressible: false },
+	TypeScriptMap: { fileEnding: ['ts.map'], mediaType: 'application/json', encoding: 'charset=utf-8', compressible: true },
+	JavaScriptMap: { fileEnding: ['js.map'], mediaType: 'application/json', encoding: 'charset=utf-8', compressible: true }
 } as const satisfies Record<string, MediaType>
 
 export interface EncodingType {

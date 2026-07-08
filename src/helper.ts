@@ -29,13 +29,19 @@ export function supportedEncodingNames(): string[] {
 
 /** map extension of file-path/file-name to media type (null if no match was found) */
 export function lookupMediaTypeFromFile(filePath: string): libBase.MediaType | null {
-	const fileExtension = splitFilePath(filePath)[2];
-	if (fileExtension != '') {
-		const type = FileEndingToMediaTypeMapping[fileExtension.substring(1).toLowerCase()] ?? null;
+	let extension = '';
+
+	/* loop, as file may have multiple extensions, such as ('.ab.cd') */
+	while (true) {
+		const [_, name, ext] = splitFilePath(filePath);
+		if (ext == '')
+			return null;
+		extension = ext + extension, filePath = name;
+
+		const type = FileEndingToMediaTypeMapping[extension.substring(1).toLowerCase()] ?? null;
 		if (type != null)
 			return type;
 	}
-	return null;
 }
 
 /** format the media type to the proper http header identifier */
