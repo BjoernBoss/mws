@@ -228,10 +228,12 @@ export enum CachePolicy {
  *		=> Will terminate a connection, if the upload is not consumed or the client errors.
  *		=> Premature destroying of receive reader will result in the connection being gracefully terminated.
  *		=> All data must have been received before the response is completed.
+ *		=> An 'error' handler must be attached to the returned stream, as the framework will destroy it with an error on broken connections (unhandled stream errors crash the process).
  *	Responding data: Will automatically encode the stream and send the header accordingly
  *		=> Will automatically determine if encoding is to be used
  *		=> Checks if promised number of bytes is provided
  *		=> Will automatically error, if the broken state is detected, and will auto-respond or send the connection into the broken state (stream user does not need to respond).
+ *		=> An 'error' handler must be attached to the returned stream, as the framework will destroy it with an error on broken connections (unhandled stream errors crash the process).
  *
  *	A response sent while data is already being streamed (header sent) will break the connection.
  *	Responses automatically apply the CachePolicy default for the response type, if no other cache control is specified.
@@ -310,15 +312,15 @@ export class ClientRequest extends ClientBase {
 		/* register the necessary network error handlers */
 		const lostHandler = () => {
 			if (this._state.response != ResponseState.completed && this._state.response != ResponseState.broken)
-				this.markAsBroken('Connection lost', false);
+				this.markAsBroken('Connection lost', false, true);
 		};
 		const closedHandler = () => {
 			if (this._state.response != ResponseState.completed && this._state.response != ResponseState.broken)
-				this.markAsBroken('Connection closed by remote', false);
+				this.markAsBroken('Connection closed by remote', false, true);
 		};
 		const timeoutHandler = () => {
 			if (this._state.response != ResponseState.completed && this._state.response != ResponseState.broken)
-				this.markAsBroken('Connection timed out', false);
+				this.markAsBroken('Connection timed out', false, true);
 		};
 		request.once('error', lostHandler);
 		request.once('aborted', closedHandler);
@@ -367,7 +369,7 @@ export class ClientRequest extends ClientBase {
 			this.sendFullResponse(status, headers, content ?? undefined);
 		}
 		else if (this._state.response == ResponseState.headerSent)
-			this.markAsBroken(`Overlap with committed response ${description}`, false);
+			this.markAsBroken(`Overlap with committed response ${description}`, false, false);
 		else if (this._state.response == ResponseState.completed)
 			this.warning(`Request already completed, discarding response ${description}`);
 		else
@@ -396,7 +398,7 @@ export class ClientRequest extends ClientBase {
 
 		if (closing)
 			this.respondRequestTimeout(description, { headers: { 'Connection': 'close' } });
-		this.markAsBroken((closing ? '' : description), closing);
+		this.markAsBroken((closing ? '' : description), closing, true);
 	}
 	private updateThroughput(delta: number): void {
 		if (this._throughput.timer != null)
@@ -532,9 +534,15 @@ export class ClientRequest extends ClientBase {
 			writer.once('close', () => handler());
 		});
 	}
-	private markAsBroken(reason: string, graceful: boolean): void {
-		if (reason != '')
-			this.error(`Connection broken: [${reason}]`);
+	private markAsBroken(reason: string, graceful: boolean, expected: boolean): void {
+		/* expected breaks (remote-caused or documented cleanup) are logged as ordinary
+		*	logs, only breaks caused by server-side misbehavior are logged as errors */
+		if (reason != '') {
+			if (expected)
+				this.log(`Connection broken: [${reason}]`);
+			else
+				this.error(`Connection broken: [${reason}]`);
+		}
 		this._state.response = ResponseState.broken;
 		if (this._state.breaking != null) {
 			if (!graceful)
@@ -625,7 +633,7 @@ export class ClientRequest extends ClientBase {
 
 		/* setup the response status and headers (guard against invalid header values) */
 		try { this._native.response.setStatus(status.code, status.msg); } catch (_) {
-			return this.markAsBroken(`Failed to finalize response: Bad status message`, false);
+			return this.markAsBroken(`Failed to finalize response: Bad status message`, false, false);
 		}
 		for (const [key, value] of Object.entries(headers)) {
 			try { this._native.response.setHeader(key, value); } catch (_) {
@@ -660,7 +668,7 @@ export class ClientRequest extends ClientBase {
 			else
 				this._native.writer.end();
 		} catch (err: any) {
-			this.markAsBroken(`Failed to finalize response: ${err.message}`, false);
+			this.markAsBroken(`Failed to finalize response: ${err.message}`, false, false);
 		}
 	}
 	private sendClientSetupHeader(resp: HttpRequestResponse, chunk: Buffer | null, cb: (err: any) => void): void {
@@ -809,7 +817,7 @@ export class ClientRequest extends ClientBase {
 					this.sendClientSetupHeader(output, chunk, cb);
 				}
 				catch (err: any) {
-					this.markAsBroken(`Failed to process response: ${err.message}`, false);
+					this.markAsBroken(`Failed to process response: ${err.message}`, false, false);
 					return cb(new Error('Connection broken'));
 				}
 			},
@@ -830,17 +838,17 @@ export class ClientRequest extends ClientBase {
 
 				/* check if its an encoding failure (header must already have been sent) */
 				if (output.encodingFailed)
-					this.markAsBroken(`Encoding failure: ${err.message}`, false);
+					this.markAsBroken(`Encoding failure: ${err.message}`, false, false);
 
 				/* forward the module-supplied error and ensure the connection is closed */
 				else {
 					const description = `Response closed prematurely: ${err.message}`;
 					if (this._state.response == ResponseState.none) {
 						this.badClientUsage(description, true);
-						this.markAsBroken('', true);
+						this.markAsBroken('', true, false);
 					}
 					else
-						this.markAsBroken(description, false);
+						this.markAsBroken(description, false, false);
 				}
 				return cb(err);
 			}
@@ -968,7 +976,8 @@ export class ClientRequest extends ClientBase {
 			this._request.once('end', cb);
 			this._state.breakPromise.then(cb);
 
-			/* start consuming the data blindly */
+			/* ensure the throughput is still updated and ensure the reuqest is in flow state */
+			this._request.on('data', (chunk: Buffer) => this.updateThroughput(chunk.byteLength));
 			this._request.resume();
 		});
 	}
@@ -1029,15 +1038,15 @@ export class ClientRequest extends ClientBase {
 
 		/* ensure that the data have been fully received */
 		if (this._state.receive == ReceiveState.receiving && this._state.response != ResponseState.broken)
-			this.markAsBroken('Receive stream not consumed', false);
+			this.markAsBroken('Receive stream not consumed', false, false);
 
 		/* check if the upgrade was not fully awaited */
 		if (this._state.upgrade == UpgradeState.upgrading && this._state.response != ResponseState.broken)
-			this.markAsBroken('Upgrade not fully awaited', false);
+			this.markAsBroken('Upgrade not fully awaited', false, false);
 
 		/* ensure that the response was properly sent */
 		if (this._state.response != ResponseState.completed && this._state.response != ResponseState.broken)
-			this.markAsBroken('Response not completed', false);
+			this.markAsBroken('Response not completed', false, false);
 
 		/* check if data remain in the pipeline, in which case they either need to be consumed,
 		*	or the connection needs to be closed to ensure the sender does not pipe more data over */
@@ -1045,13 +1054,13 @@ export class ClientRequest extends ClientBase {
 			if (this.config.drainUpload)
 				await this.drainQueuedData();
 			else
-				this.markAsBroken((this._request.readableLength > 0 ? 'Uploaded data not consumed' : 'Potential uploaded data not consumed'), true);
+				this.markAsBroken((this._request.readableLength > 0 ? 'Uploaded data not consumed' : 'Potential uploaded data not consumed'), true, false);
 		}
 
 		/* check if the connection was an upgrade but was not was accepted, which needs to be
 		*	killed, as the underlying web-server will not clean this connection up anymore */
 		if (this._native.socket != null && this._state.upgrade != UpgradeState.upgraded && this._state.response != ResponseState.broken)
-			this.markAsBroken('Upgrade was not accepted', true);
+			this.markAsBroken('Upgrade was not accepted', true, true);
 
 		/* kill the throughput timer, as it either does not need to be checked anymore, or it
 		*	will have left the connection as broken, and will automatically be closed now */
@@ -1078,7 +1087,7 @@ export class ClientRequest extends ClientBase {
 
 		if (closing)
 			this.respondInternalError(description, { headers: { 'Connection': 'close' } });
-		this.markAsBroken((closing ? '' : description), (closing || (options?.graceful ?? false)));
+		this.markAsBroken((closing ? '' : description), (closing || (options?.graceful ?? false)), false);
 	}
 
 	/** server the client originates from */
@@ -1476,10 +1485,10 @@ export class ClientRequest extends ClientBase {
 		this.sendFullResponse(status, headers, { media: libBase.Media.Html, body: content });
 	}
 
-	/** [no-throw but errors] send data with [media type] and [status] and return a writable stream (default: status is ok, media is unknown, dynamicEncode
-	 *	is true); if a content size is provided, stream expects exactly this amount of bytes; if [dynamicEncode], the encoder will be dynamically negotiated
-	 *	based on the content; for a HEAD request, no encoding will be negotiated, no lengths verified, and the written data will just be drained (can
-	 *	immediately be ended using '.end()'); cache policy defaults to [private]; errors will automatically close the client connection properly */
+	/** [no-throw but errors, register 'error' handler] send data with [media type] and [status] and return a writable stream (default: status is ok, media is
+	 *	unknown, dynamicEncode is true); if a content size is provided, stream expects exactly this amount of bytes; if [dynamicEncode], the encoder will be
+	 *	dynamically negotiated based on the content; for a HEAD request, no encoding will be negotiated, no lengths verified, and the written data will just be
+	 *	drained (can immediately be ended using '.end()'); cache policy defaults to [private]; errors will automatically close the client connection properly */
 	public respondData(options?: { status?: libBase.StatusType, media?: libBase.MediaType, contentSize?: number, dynamicEncode?: boolean, headers?: Record<string, string>, cache?: CachePolicy }): libStream.Writable {
 		const status: libBase.StatusType = options?.status ?? libBase.Status.Ok;
 		const headers = (options?.headers ?? {});
@@ -1618,8 +1627,9 @@ export class ClientRequest extends ClientBase {
 		}));
 	}
 
-	/** [no-throw but errors] receive the payload of given max length as a readable stream; automatically responds with given exceptions if the payload
-	 *	cannot be received properly; automatically drained if the readable stream is destroyed before reading all data (does not result in an error or logs) */
+	/** [no-throw but errors, register 'error' handler] receive the payload of given max length as a readable stream; automatically responds with given exceptions
+	 *	if the payload cannot be received properly; automatically drained if the readable stream is destroyed before reading all data (does not result in an
+	 *	error or logs); an 'error' handler must be attached to the returned stream, as the framework will destroy it with an error on broken connections */
 	public receiveData(maxLength: number | null): libStream.Readable {
 		return this.receiveClientData(maxLength);
 	}
@@ -1738,7 +1748,7 @@ export class ClientRequest extends ClientBase {
 					return resolve(ClientSocket._fromRequest(ws, this));
 				}
 				settled = true;
-				this.markAsBroken('Broken connection upgraded', false);
+				this.markAsBroken('Broken connection upgraded', false, false);
 				resolve(null);
 			});
 		});
@@ -1804,9 +1814,7 @@ export class ClientSocket extends ClientBase {
 				clearTimeout(this._alive.timer);
 			this._alive.timer = null;
 		});
-		this._ws.once('error', (err: any) => {
-			this.handleClosing(`WebSocket error: ${err.message}`);
-		});
+		this._ws.once('error', (err: any) => this.handleClosing(`WebSocket error: ${err.message}`));
 
 		/* perserve the root identity for internal logs and the log extension of the base for open logs */
 		this._log = { self: this.identity, root: '', tagList: [] };
@@ -1860,7 +1868,9 @@ export class ClientSocket extends ClientBase {
 				clearTimeout(this._alive.timer);
 			this._alive.timer = null;
 
-			/* check if a termination should be triggered and otherwise start the grace termination timer */
+			/* check if a termination should be triggered and otherwise start the grace termination timer
+			*	(the timer is cleared by the 'close' event handler; if it fires, the close handshake has
+			*	not completed within the grace period and the connection is forcefully terminated) */
 			if (terminate != null) {
 				this.error(terminate, { identity: this._log.self });
 				this._ws.terminate();
@@ -1868,10 +1878,8 @@ export class ClientSocket extends ClientBase {
 			else {
 				this._alive.timer = setTimeout(() => {
 					this._alive.timer = null;
-					if (this._closing.closed != null) {
-						this.error('Closing connection', { identity: this._log.self });
-						this._ws.terminate();
-					}
+					this.warning('Terminating connection', { identity: this._log.self });
+					this._ws.terminate();
 				}, this.config.killGraceTimeout);
 			}
 		}
@@ -1982,7 +1990,7 @@ export interface ClientConfig {
 	/** time for a broken connection or socket to receive the response before force-closing it [0 results in immediate close; in milliseconds; Default: 1_000] */
 	killGraceTimeout?: number;
 
-	/** drain any uploaded data remaining in the pipeline, instead of closing the connection [Default: false] */
+	/** drain any uploaded data remaining in the pipeline, instead of closing the connection, but will even run and remain active on error responses [Default: false] */
 	drainUpload?: boolean;
 
 	/** cache-control values per cache policy */

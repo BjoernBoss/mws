@@ -715,7 +715,7 @@ export interface Cached {
 	 *	just like the cache identifies them as equivalent: size+last-modified) */
 	uniqueId(): string;
 
-	/** [no-throw but errors] object or encoded entry must not be used anymore after reading or streaming from it */
+	/** [no-throw but errors, register 'error' handler] object or encoded entry must not be used anymore after reading or streaming from it */
 	stream(options?: { start?: number, end?: number }): libStream.Readable;
 
 	/** [throws] object or encoded entry must not be used anymore after reading or streaming from it */
@@ -732,7 +732,7 @@ export interface EncodedCache {
 	/** size in bytes of the encoding (null if not yet determined) */
 	contentSize(): number | null;
 
-	/** [no-throw but errors] object or encoded entry must not be used anymore after reading or streaming from it */
+	/** [no-throw but errors, register 'error' handler] object or encoded entry must not be used anymore after reading or streaming from it */
 	stream(): libStream.Readable;
 
 	/** [throws] object or encoded entry must not be used anymore after reading or streaming from it */
@@ -843,7 +843,7 @@ export class CacheHost extends libLog.Logger {
 		}
 	}
 
-	/** [no-throw but errors] create a read stream of the data (designed for modules to interact with) */
+	/** [no-throw but errors, register 'error' handler] create a read stream of the data (designed for modules to interact with) */
 	public stream(path: string, options?: { checkFreshness?: boolean }): libStream.Readable | null {
 		/* let errors just propagate out (unable to catch ENOENT errors as they are embedded into the stream errors) */
 		const entry = this.resolveCache(path, options?.checkFreshness ?? false, false) as (Cached | null);
