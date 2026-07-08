@@ -26,7 +26,8 @@ export const Status = {
 	UnsupportedMediaType: { code: 415, msg: 'Unsupported Media Type' },
 	RangeIssue: { code: 416, msg: 'Range Not Satisfiable' },
 	UpgradeRequired: { code: 426, msg: 'Upgrade Required' },
-	InternalError: { code: 500, msg: 'Internal Server Error' }
+	InternalError: { code: 500, msg: 'Internal Server Error' },
+	HttpVersionNotSupported: { code: 505, msg: 'HTTP Version Not Supported' }
 } as const satisfies Record<string, StatusType>
 
 export interface MediaType {

@@ -193,7 +193,10 @@ export class Listener {
 		client.completed.then(() => client.log(`Completed on [${endpoint}]`));
 
 		try {
-			await this._native.attached.handle(client);
+			if (request.httpVersion == '1.0')
+				client.respondHttpVersionNotSupported('1.1');
+			else
+				await this._native.attached.handle(client);
 		} catch (err: any) {
 			client.respondInternalError(`Uncaught exception: ${err.message}`);
 		}

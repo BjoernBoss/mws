@@ -1297,6 +1297,16 @@ export class ClientRequest extends ClientBase {
 		});
 	}
 
+	/** respond with [http-version not supported] and a default text response; cache policy defaults to [private] */
+	public respondHttpVersionNotSupported(minVersion: string, options?: { headers?: Record<string, string>, cache?: CachePolicy }): void {
+		const header = (options?.headers ?? {});
+		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
+
+		this.constructQuickResponse(libBase.Status.HttpVersionNotSupported, minVersion, header, {
+			media: libBase.Media.Text, body: Buffer.from(`Resource [${this.url.pathname}] requires at least [${minVersion}].`, 'utf-8')
+		});
+	}
+
 	/** respond with [created] and a default text response; cache policy defaults to [private] */
 	public respondCreated(target: string, options?: { headers?: Record<string, string>, cache?: CachePolicy }): void {
 		const header = (options?.headers ?? {});
