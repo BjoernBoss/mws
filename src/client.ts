@@ -1127,6 +1127,11 @@ export class ClientRequest extends ClientBase {
 		return (this._request.method == 'HEAD');
 	}
 
+	/** address of connection remote */
+	public get remote(): { address?: string, family?: string, port?: number } {
+		return { address: this._request.socket.remoteAddress, port: this._request.socket.remotePort, family: this._request.socket.remoteFamily };
+	}
+
 	/** return the string formatted media-type (or empty string for no media type) */
 	public getMediaType(): string {
 		const type = libHelper.splitAndTrimList(this.headers['content-type'] ?? null, ';', true)[0] ?? '';
