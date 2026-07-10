@@ -135,7 +135,7 @@ export abstract class ModuleHandler extends libLog.Logger {
 
 		/* setup the new mapping and path translation and check if the translation can be applied */
 		const logTag = (this._config.tagClients ? (this._config.tagString == '' ? this.identity : this._config.tagString) : '');
-		const snapshot = client._pushTranslation(translate ?? null, logTag);
+		const snapshot = client._pushContext(translate ?? null, logTag);
 		if (snapshot == null)
 			return client.claimed;
 
@@ -154,7 +154,7 @@ export abstract class ModuleHandler extends libLog.Logger {
 
 		/* restore the context, clear the handling promise and remove the client from actively handled clients */
 		this._handling.active.delete(client);
-		client._restoreSnapshot(snapshot);
+		client._popContext(snapshot);
 		if (this._handling.active.size == 0) {
 			this._handling.promise = null;
 			this._handling.resolver();
@@ -353,8 +353,9 @@ export abstract class ModuleHandler extends libLog.Logger {
 	/** module is attached directly or indirectly to the server (will be the first call being performed before any other calls; will only be called once) */
 	protected async handleInitialize(server: libServer.Server): Promise<void> { }
 
-	/** handle the client request (guaranteed to not have been claimed yet; if the promise resolves, client must either have been handled or must
-	 *	not be handled anymore; long-running handlers must check 'client.claimed' or await 'client.responded' to allow timely server shutdown) */
+	/** handle the client request (guaranteed to not have been claimed yet; receiving or responding claims the client, which must
+	 *	then be fully completed - response completed, receive consumed - before this promise resolves, as leftover streams will be
+	 *	aborted; long-running handlers must check 'client.claimed' or await 'client.responded' to allow timely server shutdown) */
 	protected abstract handleRequest(client: libClient.ClientRequest, params?: Params): Promise<void>;
 
 	/** module has been stopped (all clients are guaranteed to have left, but accepted WebSockets will be left intact and

@@ -20,16 +20,14 @@ class ClientContext {
 	public identity: string;
 	public translationCount: number;
 	public busyCount: number;
-	public headerPatchCount: number;
-	public htmlPatchCount: number;
+	public patchCount: number;
 
-	constructor(path: string, identity: string, translationCount: number, busyCount: number, headerPatchCount: number, htmlPatchCount: number) {
+	constructor(path: string, identity: string, translationCount: number, busyCount: number, patchCount: number) {
 		this.identity = identity;
 		this.path = path;
 		this.translationCount = translationCount;
 		this.busyCount = busyCount;
-		this.headerPatchCount = headerPatchCount;
-		this.htmlPatchCount = htmlPatchCount;
+		this.patchCount = patchCount;
 	}
 }
 
@@ -140,6 +138,7 @@ enum UpgradeState {
 }
 enum ResponseState {
 	none,
+	preparing,
 	headerSent,
 	completed,
 	broken
@@ -187,11 +186,14 @@ class HttpRequestResponse extends libStream.Writable {
 
 type ClientSocketEvents = { 'data': (data: Buffer) => void, 'close': () => void };
 
-/** look at the state and modify the headers accordingly (only add or remove headers, must not try to alter the response) */
-export type HeaderPatch = (status: libBase.StatusType, headers: Record<string, string>) => void;
+/** look at a response and optionally update or change it (must not perform any asynchronous operations) */
+export interface Patcher {
+	/** inspect and patch/update actual responses */
+	response?: (status: libBase.StatusType, headers: Record<string, string>) => void;
 
-/** look at the page and modify it or the headers accordingly (can be interrupted by returning an alternate response) */
-export type HtmlPatch = (page: libBuilder.HtmlPage, status: libBase.StatusType, headers: Record<string, string>) => Promise<void>;
+	/** inspect and patch/update html responses (headers might not yet be finalized) */
+	html?: (page: libBuilder.HtmlPage, status: libBase.StatusType, headers: Record<string, string>) => void;
+}
 
 /** type to invoke to update the logging tag (empty string will hide the tag entry;
  *	null will completely remove the tag; other values will update the tag) */
@@ -223,19 +225,28 @@ export enum CachePolicy {
  *	Repeated request responding may override any ongoing responses and may terminate the connection; depending on the prior state.
  *	Not responded to requests will result in [not-found].
  *
+ *	Receiving and responding can be started in any order and may overlap (e.g. streaming the upload back out).
+ *	As soon as either is started, the request counts as [claimed] and will not be dispatched to any further
+ *	modules. A claimed request must be fully completed (response completed, receive consumed, upgrade awaited)
+ *	before the module handler returns. Violations abort the pending streams and are answered with an internal
+ *	error. Requests that were never engaged with pass through unhandled.
+ *
  *	Receiving data: Will automatically decode the stream and ensure a given maximum is not passed
  *		=> Any errors while receiving will either auto-respond or send the connection into the broken state, and fail the receive reader (stream user does not need to respond).
  *		=> Will terminate a connection, if the upload is not consumed or the client errors.
  *		=> Premature destroying of receive reader will result in the connection being gracefully terminated.
- *		=> All data must have been received before the response is completed.
+ *		=> All data must have been received before the module handler returns.
  *		=> An 'error' handler must be attached to the returned stream, as the framework will destroy it with an error on broken connections (unhandled stream errors crash the process).
  *	Responding data: Will automatically encode the stream and send the header accordingly
  *		=> Will automatically determine if encoding is to be used
  *		=> Checks if promised number of bytes is provided
+ *		=> Only one streamed response can be registered - further attempts fail and abort the first.
  *		=> Will automatically error, if the broken state is detected, and will auto-respond or send the connection into the broken state (stream user does not need to respond).
  *		=> An 'error' handler must be attached to the returned stream, as the framework will destroy it with an error on broken connections (unhandled stream errors crash the process).
+ *		=> The stream must be fully processed before the module handler returns, as unfinished responses will otherwise be aborted and answered with an internal error.
  *
  *	A response sent while data is already being streamed (header sent) will break the connection.
+ *	A quick response sent while a streamed response has not yet committed its header will cleanly override and abort the stream.
  *	Responses automatically apply the CachePolicy default for the response type, if no other cache control is specified.
  *	Responses will either use the dedicated responder interface and its highWaterMark, or a responder interface, which caches up to socket.highWaterMark.
  *
@@ -247,13 +258,14 @@ export enum CachePolicy {
  *	Defaults [Connection] to 'close' for upgrade requests and for some error responses.
  */
 export class ClientRequest extends ClientBase {
-	private _headerPatcher: HeaderPatch[];
-	private _htmlPatcher: HtmlPatch[];
+	private _patcher: { list: Patcher[], index: number | null };
 	private _state: {
 		respondedPromise: Promise<void>;
 		respondedResolve: () => void;
 		completedPromise: Promise<void>;
 		completedResolve: () => void;
+		closedPromise: Promise<void>;
+		closedResolve: () => void;
 		breakPromise: Promise<void>;
 		breakResolve: () => void;
 		receive: ReceiveState;
@@ -279,15 +291,16 @@ export class ClientRequest extends ClientBase {
 
 	private constructor(server: libServer.Server, config: BurntClientConfig, protocol: string, kind: string, request: libHttp.IncomingMessage, response: libHttp.ServerResponse | { socket: libStream.Duplex, head: Buffer, wss: libWs.WebSocketServer }) {
 		super(new libUrl.URL(`${protocol}://${request.headers.host?.toLowerCase() ?? '_'}${request.url}`), kind, config);
-		this._headerPatcher = [];
-		this._htmlPatcher = [];
+		this._patcher = { list: [], index: null };
 
-		let respondedResolve: any = null, completedResolve: any = null, breakResolve: any = null;
+		let respondedResolve: any = null, completedResolve: any = null, closedResolve: any = null, breakResolve: any = null;
 		this._state = {
 			respondedPromise: new Promise<void>((resolve) => respondedResolve = resolve),
 			respondedResolve: () => { },
 			completedPromise: new Promise<void>((resolve) => completedResolve = resolve),
 			completedResolve: () => { },
+			closedPromise: new Promise<void>((resolve) => closedResolve = resolve),
+			closedResolve: () => { },
 			breakPromise: new Promise<void>((resolve) => breakResolve = resolve),
 			breakResolve: () => { },
 			receive: ReceiveState.none,
@@ -297,6 +310,7 @@ export class ClientRequest extends ClientBase {
 		};
 		this._state.respondedResolve = respondedResolve;
 		this._state.completedResolve = completedResolve;
+		this._state.closedResolve = closedResolve;
 		this._state.breakResolve = breakResolve;
 
 		this._request = request;
@@ -309,19 +323,17 @@ export class ClientRequest extends ClientBase {
 			this.updateThroughput(0);
 		}
 
-		/* register the necessary network error handlers */
-		const lostHandler = () => {
-			if (this._state.response != ResponseState.completed && this._state.response != ResponseState.broken)
-				this.markAsBroken('Connection lost', false, true);
+		/* register the necessary network error handlers (mark as closed after breaking to ensure breaking is delivered first) */
+		const handleNetworkEvent = (desc: string) => {
+			if (this._state.response == ResponseState.broken)
+				return;
+			if (this._state.response != ResponseState.completed)
+				this.markAsBroken(desc, false, true);
+			this._state.closedResolve();
 		};
-		const closedHandler = () => {
-			if (this._state.response != ResponseState.completed && this._state.response != ResponseState.broken)
-				this.markAsBroken('Connection closed by remote', false, true);
-		};
-		const timeoutHandler = () => {
-			if (this._state.response != ResponseState.completed && this._state.response != ResponseState.broken)
-				this.markAsBroken('Connection timed out', false, true);
-		};
+		const lostHandler = () => handleNetworkEvent('Connection lost');
+		const closedHandler = () => handleNetworkEvent('Connection closed by remote');
+		const timeoutHandler = () => handleNetworkEvent('Connection timed out');
 		request.once('error', lostHandler);
 		request.once('aborted', closedHandler);
 		request.socket.once('timeout', timeoutHandler);
@@ -361,7 +373,7 @@ export class ClientRequest extends ClientBase {
 		const description = `${this.isHead ? 'HEAD:' : ''}[${status.msg}]${logReason == null ? '' : `: ${logReason}`}`;
 
 		/* check if the response can still be sent */
-		if (this._state.response == ResponseState.none) {
+		if (this._state.response == ResponseState.none || this._state.response == ResponseState.preparing) {
 			if (status.code >= 500)
 				this.error(`Responding with ${description}`);
 			else
@@ -393,12 +405,7 @@ export class ClientRequest extends ClientBase {
 			return;
 		}
 
-		const description = `Throughput below [${this.config.throughputThreshold}] bytes/sec`;
-		const closing = (this._state.response == ResponseState.none);
-
-		if (closing)
-			this.respondRequestTimeout(description, { headers: { 'Connection': 'close' } });
-		this.markAsBroken((closing ? '' : description), closing, true);
+		this.breakWithResponse(`Throughput below [${this.config.throughputThreshold}] bytes/sec`, false, true, (desc, headers) => this.respondRequestTimeout(desc, { headers }));
 	}
 	private updateThroughput(delta: number): void {
 		if (this._throughput.timer != null)
@@ -543,12 +550,15 @@ export class ClientRequest extends ClientBase {
 			else
 				this.error(`Connection broken: [${reason}]`);
 		}
-		this._state.response = ResponseState.broken;
 		if (this._state.breaking != null) {
 			if (!graceful)
 				this.killNativeConnection(false);
 			return;
 		}
+
+		/* resolve breaking before responded to ensure it is delivered first */
+		this._state.response = ResponseState.broken;
+		this._state.breakResolve();
 		this._state.respondedResolve();
 
 		/* setup the promise beforehand to ensure the promise body does not recursively
@@ -572,11 +582,17 @@ export class ClientRequest extends ClientBase {
 			if (settled) return; settled = true;
 			resolver();
 		})();
-
-		this._state.breakResolve();
 	}
 	private badClientUsage(reason: string, close: boolean): void {
 		this.respondInternalError(`Bad Usage: ${reason}`, (close ? { headers: { 'Connection': 'close' } } : undefined));
+	}
+	private breakWithResponse(description: string, graceful: boolean, expected: boolean, respond: (description: string, headers: Record<string, string>) => void): void {
+		if (this._state.response == ResponseState.none || this._state.response == ResponseState.preparing) {
+			respond(description, { 'Connection': 'close' });
+			this.markAsBroken('', true, expected);
+		}
+		else
+			this.markAsBroken(description, graceful, expected);
 	}
 	private applyCachePolicy(headers: Record<string, string>, should: CachePolicy, override?: CachePolicy): void {
 		if ('Cache-Control' in headers)
@@ -585,8 +601,24 @@ export class ClientRequest extends ClientBase {
 		if (policy != '')
 			headers['Cache-Control'] = policy;
 	}
+	private invokePatcher(cb: (patcher: Patcher) => void): void {
+		const index = this._patcher.index;
 
-	private closeHeader(status: libBase.StatusType, headers: Record<string, string>, content?: { media: libBase.MediaType, size?: number, encoding?: string }): void {
+		/* invoke all registered patcher to let them modify the content (in reverse order to ensure
+		*	first added is last executed, and check if one of them produced an alternate response) */
+		for (this._patcher.index = (index == null ? this._patcher.list.length : index) - 1; this._patcher.index >= 0; --this._patcher.index) {
+			try {
+				cb(this._patcher.list[this._patcher.index]);
+			} catch (err: any) {
+				this.badClientUsage(`Unhandled exception in patcher: ${err.message}`, false);
+			}
+			if (this._state.response != ResponseState.none && this._state.response != ResponseState.preparing)
+				break;
+		}
+		this._patcher.index = index;
+	}
+
+	private closeHeader(status: libBase.StatusType, headers: Record<string, string>, content?: { media: libBase.MediaType, size?: number, encoding?: string }): boolean {
 		let logMsg = `Sending [${status.msg}] ${this.isHead ? 'HEAD ' : ''}`;
 		if (content?.media == null)
 			logMsg += `for no content`;
@@ -596,10 +628,6 @@ export class ClientRequest extends ClientBase {
 				logMsg += ` dynamically encoded using [${content.encoding}]`;
 		}
 		this.trace(logMsg);
-
-		/* mark the response as determined as it will now be sent this way */
-		this._state.response = ResponseState.headerSent;
-		this._state.respondedResolve();
 
 		/* configure the default header values */
 		if (!('Accept-Ranges' in headers))
@@ -625,21 +653,26 @@ export class ClientRequest extends ClientBase {
 		if (this._native.socket != null)
 			headers['Connection'] = 'close';
 
-		/* perform the header post processing (in reverse order to ensure first added is last executed) */
-		for (let i = this._headerPatcher.length - 1; i >= 0; --i) {
-			try { this._headerPatcher[i](status, headers); }
-			catch (err: any) { this.error(`Unhandled exception in header patcher: ${err.message}`); }
-		}
+		/* invoke all registered patchers to let them update the content */
+		this.invokePatcher((patcher) => patcher.response?.(status, headers));
+		if (this._state.response != ResponseState.none && this._state.response != ResponseState.preparing)
+			return false;
+
+		/* mark the response as determined as it will now be sent this way */
+		this._state.response = ResponseState.headerSent;
+		this._state.respondedResolve();
 
 		/* setup the response status and headers (guard against invalid header values) */
 		try { this._native.response.setStatus(status.code, status.msg); } catch (_) {
-			return this.markAsBroken(`Failed to finalize response: Bad status message`, false, false);
+			this.markAsBroken(`Failed to finalize response: Bad status message`, false, false);
+			return false;
 		}
 		for (const [key, value] of Object.entries(headers)) {
 			try { this._native.response.setHeader(key, value); } catch (_) {
 				this.error(`Failed to set header [${key}]: Bad header value`);
 			}
 		}
+		return true;
 	}
 	private sendFullResponse(status: libBase.StatusType, headers: Record<string, string>, content?: { media: libBase.MediaType, body?: Buffer }): void {
 		let encoding: libBase.EncodingType | null = null;
@@ -655,9 +688,9 @@ export class ClientRequest extends ClientBase {
 			}
 		}
 
-		this.closeHeader(status, headers, (content == null ? undefined : { media: content.media, size: content.body?.byteLength, encoding: encoding?.name }));
-		if (this._state.response == ResponseState.headerSent)
-			this._state.response = ResponseState.completed;
+		if (!this.closeHeader(status, headers, (content == null ? undefined : { media: content.media, size: content.body?.byteLength, encoding: encoding?.name })))
+			return;
+		this._state.response = ResponseState.completed;
 
 		/* try to finalize the response (can throw an exception for invalid status or header content) */
 		try {
@@ -693,12 +726,10 @@ export class ClientRequest extends ClientBase {
 		if (fullContentSize == null && last && !this.isHead)
 			fullContentSize = (chunk?.byteLength ?? 0);
 
-		/* mark the headers as sent as this point forces the header to be sent */
-		resp.headerSent = true;
-
 		/* check if the content should be dynamically encoded */
 		if (!resp.dynamicEncode) {
-			this.closeHeader(resp.status, resp.headers, { media: resp.contentType, size: fullContentSize ?? undefined });
+			if (!this.closeHeader(resp.status, resp.headers, { media: resp.contentType, size: fullContentSize ?? undefined }))
+				return cb(null);
 			return this.sendClientWrite(resp, chunk, last, cb);
 		}
 		resp.headers['Vary'] = 'Accept-Encoding';
@@ -707,7 +738,8 @@ export class ClientRequest extends ClientBase {
 		*	assume an encoding - can always be disabled in the real run, should the data be too short) */
 		let encoding = libHelper.negotiateEncoding(this.headers['accept-encoding'] ?? null, fullContentSize ?? chunk?.byteLength ?? null, resp.contentType);
 		if (encoding == null) {
-			this.closeHeader(resp.status, resp.headers, { media: resp.contentType, size: fullContentSize ?? undefined });
+			if (!this.closeHeader(resp.status, resp.headers, { media: resp.contentType, size: fullContentSize ?? undefined }))
+				return cb(null);
 			return this.sendClientWrite(resp, chunk, last, cb);
 		}
 		resp.headers['Content-Encoding'] = encoding.name;
@@ -734,13 +766,13 @@ export class ClientRequest extends ClientBase {
 			});
 		}
 
-		this.closeHeader(resp.status, resp.headers, { media: resp.contentType, size: fullContentSize ?? undefined, encoding: encoding.name });
+		if (!this.closeHeader(resp.status, resp.headers, { media: resp.contentType, size: fullContentSize ?? undefined, encoding: encoding.name }))
+			return cb(null);
 		return this.sendClientWrite(resp, chunk, last, cb);
 	}
 	private sendClientWrite(resp: HttpRequestResponse, chunk: Buffer | null, last: boolean, cb: (err: any) => void): void {
-		/* check if the state is still valid (can happen if the close-header redirected the result or failed) */
-		if (this._state.response != ResponseState.headerSent)
-			return cb(new Error('Response no longer writable'));
+		/* this point is only reached once the header has been sent */
+		resp.headerSent = true;
 
 		/* check if this is a head write, in which case the response can
 		*	just be marked as completed, and all other data can be drained */
@@ -791,10 +823,11 @@ export class ClientRequest extends ClientBase {
 			this.badClientUsage('Response on already claimed connection', false);
 			return makeErrorStream('Connection already responded');
 		}
+		this._state.response = ResponseState.preparing;
 
 		/* construct the actual response wrapper, which takes care of dynamic encoding and error handling */
 		const output = new HttpRequestResponse(this._native.writer, status, headers, contentSize, media, dynamicEncode,
-			(chunk: Buffer | null, cb: (err: any) => void) => {
+			async (chunk: Buffer | null, cb: (err: any) => void) => {
 				if (output.destroyed)
 					return cb(new Error('Already failed'));
 
@@ -814,7 +847,7 @@ export class ClientRequest extends ClientBase {
 				try {
 					if (output.headerSent)
 						return this.sendClientWrite(output, chunk, chunk == null, cb);
-					this.sendClientSetupHeader(output, chunk, cb);
+					await this.sendClientSetupHeader(output, chunk, cb);
 				}
 				catch (err: any) {
 					this.markAsBroken(`Failed to process response: ${err.message}`, false, false);
@@ -833,7 +866,7 @@ export class ClientRequest extends ClientBase {
 					output.writer.destroy();
 
 				/* check if the client was consumed by another response and should not be closed/responded to anymore */
-				if (this._state.response == ResponseState.broken || (!output.headerSent && this._state.response != ResponseState.none))
+				if (this._state.response == ResponseState.broken || (!output.headerSent && this._state.response != ResponseState.preparing))
 					return cb(err);
 
 				/* check if its an encoding failure (header must already have been sent) */
@@ -841,22 +874,21 @@ export class ClientRequest extends ClientBase {
 					this.markAsBroken(`Encoding failure: ${err.message}`, false, false);
 
 				/* forward the module-supplied error and ensure the connection is closed */
-				else {
-					const description = `Response closed prematurely: ${err.message}`;
-					if (this._state.response == ResponseState.none) {
-						this.badClientUsage(description, true);
-						this.markAsBroken('', true, false);
-					}
-					else
-						this.markAsBroken(description, false, false);
-				}
+				else
+					this.breakWithResponse(`Response closed prematurely: ${err.message}`, false, false, (desc, _) => this.badClientUsage(desc, true));
 				return cb(err);
 			}
 		);
 
-		/* register the broken handler to detect closed or failed connections */
+		/* register the handler to detect closed or failed connections */
 		this._state.breakPromise.then(() => output.destroy(new Error('Connection broken')));
+		this._state.closedPromise.then(() => output.destroy(new Error('Response no longer writable')));
 
+		/* register the handler to determine if the response has been overshadowed (responded without this headerSent being set) */
+		this._state.respondedPromise.then(() => {
+			if (!output.headerSent)
+				output.destroy(new Error('Response already claimed'));
+		});
 		return output;
 	}
 	private receiveClientData(maxLength: number | null): libStream.Readable {
@@ -876,11 +908,8 @@ export class ClientRequest extends ClientBase {
 		let accumulated = 0;
 		const output = new libStream.Transform({
 			transform: (chunk, _, cb) => {
-				if (output.destroyed) return cb(new Error('Already failed'));
-
-				/* check if the connection has been processed or marked as failed */
-				if (this._state.response == ResponseState.completed)
-					this.badClientUsage('Response completed during active receive', false);
+				if (output.destroyed)
+					return cb(new Error('Already failed'));
 				if (this._state.response == ResponseState.broken)
 					return cb(new Error('Connection broken'));
 
@@ -948,8 +977,9 @@ export class ClientRequest extends ClientBase {
 			}
 		}
 
-		/* register the broken handler to detect closed or failed connections */
+		/* register the handler to detect closed or failed connections */
 		this._state.breakPromise.then(() => output.destroy(new Error('Connection broken')));
+		this._state.closedPromise.then(() => output.destroy(new Error('Receive no longer available')));
 
 		/* create the plumbing between stream and output (errors are already handled) */
 		return stream.pipe(output);
@@ -965,24 +995,49 @@ export class ClientRequest extends ClientBase {
 		return (length > 0 || chunked);
 	}
 	private drainQueuedData(): Promise<void> {
+		let settled = false;
 		return new Promise<void>((resolve) => {
 			this.trace('Draining uploaded data');
 
 			/* await the receiving of all data or the connection breaking */
 			const cb = () => {
+				if (settled) return; settled = true;
 				this._request.removeListener('end', cb);
 				resolve();
 			};
 			this._request.once('end', cb);
 			this._state.breakPromise.then(cb);
+			this._state.closedPromise.then(cb);
 
 			/* ensure the throughput is still updated and ensure the reuqest is in flow state */
 			this._request.on('data', (chunk: Buffer) => this.updateThroughput(chunk.byteLength));
 			this._request.resume();
 		});
 	}
+	private cleanupContext(finalize: boolean): void {
+		const handleFailure = (reason: string) => {
+			/* close after breaking to ensure breaking is delivered first */
+			if (finalize)
+				this.markAsBroken(reason, false, false);
+			else
+				this.badClientUsage(reason, true);
+			this._state.closedResolve();
+		};
 
-	public _pushTranslation(map: Record<string, string | null> | null, identity: string): ClientContext | null {
+		/* ensure that the data have been fully received */
+		if (this._state.receive == ReceiveState.receiving && this._state.response != ResponseState.broken)
+			handleFailure('Receive stream not consumed');
+
+		/* check if the upgrade was not fully awaited */
+		if (this._state.upgrade == UpgradeState.upgrading && this._state.response != ResponseState.broken)
+			handleFailure('Upgrade not fully awaited');
+
+		/* ensure that the response was properly sent */
+		if (this._state.response != ResponseState.completed && this._state.response != ResponseState.broken)
+			handleFailure('Response not completed');
+	}
+
+	public _pushContext(map: Record<string, string | null> | null, identity: string): ClientContext | null {
 		let sanitized: Record<string, string | null> | null = null;
 		let match: [string, string | null] | null = null;
 
@@ -1007,7 +1062,7 @@ export class ClientRequest extends ClientBase {
 		}
 
 		const current = new ClientContext(this._path, this.identity, this._translation.length,
-			this._throughput.busyCheck.length, this._headerPatcher.length, this._htmlPatcher.length);
+			this._throughput.busyCheck.length, this._patcher.list.length);
 
 		/* setup the new path, all path translations, and the tagged logging identity */
 		this._path = libHelper.rebasePath(match[0], match[1]!, this._path);
@@ -1017,13 +1072,17 @@ export class ClientRequest extends ClientBase {
 			this.logSetIdentity(`${this.identity}.${identity}`);
 		return current;
 	}
-	public _restoreSnapshot(snapshot: ClientContext): void {
+	public _popContext(snapshot: ClientContext): void {
+		/* check if the request has been claimed and cleanup the context */
+		if (this.claimed)
+			this.cleanupContext(false);
+
+		/* restore the context */
 		this._path = snapshot.path;
 		this.logSetIdentity(snapshot.identity);
 		this._translation.splice(snapshot.translationCount);
 		this._throughput.busyCheck.splice(snapshot.busyCount);
-		this._headerPatcher.splice(snapshot.headerPatchCount);
-		this._htmlPatcher.splice(snapshot.htmlPatchCount);
+		this._patcher.list.splice(snapshot.patchCount);
 	}
 	public static _fromRequest(protocol: string, request: libHttp.IncomingMessage, response: libHttp.ServerResponse, config: BurntClientConfig, server: libServer.Server): ClientRequest {
 		return new ClientRequest(server, config, protocol, 'request', request, response);
@@ -1036,17 +1095,8 @@ export class ClientRequest extends ClientBase {
 		if (this._state.response == ResponseState.none)
 			this.respondNotFound();
 
-		/* ensure that the data have been fully received */
-		if (this._state.receive == ReceiveState.receiving && this._state.response != ResponseState.broken)
-			this.markAsBroken('Receive stream not consumed', false, false);
-
-		/* check if the upgrade was not fully awaited */
-		if (this._state.upgrade == UpgradeState.upgrading && this._state.response != ResponseState.broken)
-			this.markAsBroken('Upgrade not fully awaited', false, false);
-
-		/* ensure that the response was properly sent */
-		if (this._state.response != ResponseState.completed && this._state.response != ResponseState.broken)
-			this.markAsBroken('Response not completed', false, false);
+		/* validate the final state */
+		this.cleanupContext(true);
 
 		/* check if data remain in the pipeline, in which case they either need to be consumed,
 		*	or the connection needs to be closed to ensure the sender does not pipe more data over */
@@ -1082,12 +1132,10 @@ export class ClientRequest extends ClientBase {
 
 	/** respond with an internal error and kill the connection (if [gracefully], give previous responses time to be received) */
 	public killConnection(reason: string, options?: { graceful?: boolean }): void {
-		const description = `Connection killed: ${reason}`;
-		const closing = (this._state.response == ResponseState.none);
-
-		if (closing)
-			this.respondInternalError(description, { headers: { 'Connection': 'close' } });
-		this.markAsBroken((closing ? '' : description), (closing || (options?.graceful ?? false)), false);
+		/* if the response is already completed, treat is as a friendly closing */
+		if (this._state.response == ResponseState.completed)
+			return this.markAsBroken(`Connection killed: ${reason}`, true, true);
+		this.breakWithResponse(`Connection killed: ${reason}`, (options?.graceful ?? false), false, (desc, headers) => this.respondInternalError(desc, { headers }));
 	}
 
 	/** server the client originates from */
@@ -1100,14 +1148,9 @@ export class ClientRequest extends ClientBase {
 		return this._server.cache;
 	}
 
-	/** request has not yet been engaged with */
-	public get unhandled(): boolean {
-		return (this._state.response == ResponseState.none);
-	}
-
-	/** request has already been processed */
+	/** request has been engaged with (receiving or responding was started) and must be completed by the current handler */
 	public get claimed(): boolean {
-		return (this._state.response != ResponseState.none);
+		return (this._state.response != ResponseState.none || this._state.receive != ReceiveState.none);
 	}
 
 	/** resolves whenever the response has been determined (is broken or a response header has been sent) */
@@ -1214,16 +1257,10 @@ export class ClientRequest extends ClientBase {
 		this._throughput.busyCheck.push(cb);
 	}
 
-	/** register a callback to be invoked once the response is sent, to adjust the
-	 *	headers to be sent (will only be considered within this handler context) */
-	public patchHeaders(cb: HeaderPatch): void {
-		this._headerPatcher.push(cb);
-	}
-
-	/** register a callback to be invoked if html is built, to adjust the headers or
-	 *	the content to be sent (will only be considered within this handler context) */
-	public patchHtmlPage(cb: HtmlPatch): void {
-		this._htmlPatcher.push(cb);
+	/** register a callback to be invoked once the response is concrete, to adjust the headers to be
+	 *	sent, or change/add to the response (will only be considered within this handler context) */
+	public patch(patcher: Patcher): void {
+		this._patcher.list.push(patcher);
 	}
 
 	/** respond with [internal-error] and a default text response (reason is logged server-side only); cache policy defaults to [sensitive] */
@@ -1458,29 +1495,21 @@ export class ClientRequest extends ClientBase {
 
 	/** respond with html, can be built on by parent modules, sent once the request has been fully processed (default status is
 	 *	ok; for HEAD builds, no actual content will be constructed or estimated in size); cache policy defaults to [private] */
-	public async respondHtml(page: libBuilder.HtmlPage, options?: { status?: libBase.StatusType, headers?: Record<string, string>, cache?: CachePolicy }): Promise<void> {
-		if (this._state.response != ResponseState.none)
+	public respondHtml(page: libBuilder.HtmlPage, options?: { status?: libBase.StatusType, headers?: Record<string, string>, cache?: CachePolicy }): void {
+		if (this._state.response != ResponseState.none && this._state.response != ResponseState.preparing)
 			return this.badClientUsage('HTML response on already claimed connection', false);
 
 		const status = (options?.status ?? libBase.Status.Ok);
 		const headers = (options?.headers ?? {});
 		this.applyCachePolicy(headers, CachePolicy.private, options?.cache);
 
-		/* invoke all registered html patcher to let them modify the content (in reverse order to ensure
-		*	first added is last executed, and check if one of them produced an alternate response) */
-		for (let i = this._htmlPatcher.length - 1; i >= 0; --i) {
-			try {
-				await this._htmlPatcher[i](page, status, headers);
-				if (this._state.response != ResponseState.none)
-					return;
-			} catch (err: any) {
-				this.badClientUsage(`Unhandled exception in HTML patcher: ${err.message}`, false);
-				return;
-			}
-		}
-		const content = (this.isHead ? undefined : Buffer.from(page.finalize(), 'utf-8'));
+		/* invoke all registered html patchers to let them update the content */
+		this.invokePatcher((patcher) => patcher.html?.(page, status, headers));
+		if (this._state.response != ResponseState.none && this._state.response != ResponseState.preparing)
+			return;
 
 		/* mark first as completed now */
+		const content = (this.isHead ? undefined : Buffer.from(page.finalize(), 'utf-8'));
 		this.log(`Responding with HTML content and status [${status.msg}]${this.isHead ? ' as light-build' : ''}`);
 		this.sendFullResponse(status, headers, { media: libBase.Media.Html, body: content });
 	}
@@ -1506,10 +1535,6 @@ export class ClientRequest extends ClientBase {
 	public async tryRespondFile(filePath: string, options?: { encoded?: string, media?: libBase.MediaType, headers?: Record<string, string>, checkFreshness?: boolean, cache?: CachePolicy }): Promise<boolean> {
 		if (options == null)
 			options = {};
-		if (this._state.response != ResponseState.none) {
-			this.badClientUsage('File response on already claimed connection', false);
-			return true;
-		}
 
 		/* read the entry from the cache and check if it has been permanently moved and apply the move */
 		let cached: libCache.Cached | string | null = null;
@@ -1614,17 +1639,22 @@ export class ClientRequest extends ClientBase {
 		/* check if this is a head request, in which case the stream can just immediately be closed again, to prevent
 		*	the file from consuming resources (null-catch any errors to ensure they are not propagated out of the connection) */
 		if (this.isHead) {
-			stream.once('error', () => { });
-			return new Promise((resolve) => stream.end(() => resolve(true)));
+			stream.once('error', (err: any) => {
+				if (err != null)
+					this.error(`Failed to stream file [${filePath}]: ${err.message}`);
+			});
+			await new Promise<void>((resolve) => stream.end(() => resolve()));
+			return true;
 		}
 
 		/* create the source stream of the file to read from (will not throw any exceptions; no need to respond with internal errors, as the stream will already do so) */
 		const source: libStream.Readable = (reader != null ? reader.stream() : cached.stream({ start: range.first, end: range.last }));
-		return new Promise<boolean>((resolve) => libStream.pipeline(source, stream, (err: any) => {
+		await new Promise<void>((resolve) => libStream.pipeline(source, stream, (err: any) => {
 			if (err != null)
 				this.error(`Failed to stream file [${filePath}]: ${err.message}`);
-			resolve(true);
+			resolve();
 		}));
+		return true;
 	}
 
 	/** [no-throw but errors, register 'error' handler] receive the payload of given max length as a readable stream; automatically responds with given exceptions
@@ -1635,7 +1665,7 @@ export class ClientRequest extends ClientBase {
 	}
 
 	/** [throws] receive the payload of given max length and write it directly to a file; automatically responds to all errors; writes the file atomically
- *	via the cache by either writing it to a temporary file, and then swapping it, or creating it in-place but fail, if the file already exists */
+	 *	via the cache by either writing it to a temporary file, and then swapping it, or creating it in-place but fail, if the file already exists */
 	public async receiveToFile(path: string, maxLength: number | null, options?: { temporary?: string, create?: boolean }): Promise<void> {
 		this.trace(`Collecting data to: [${path}]`);
 
@@ -1656,7 +1686,7 @@ export class ClientRequest extends ClientBase {
 
 	/** [throws] receive the payload of given max length as a single complete buffer
 	 *	automatically responds with given exceptions if the payload cannot be received properly */
-	public async receiveAllBuffer(maxLength: number | null): Promise<Buffer> {
+	public receiveAllBuffer(maxLength: number | null): Promise<Buffer> {
 		return new Promise((resolve, reject) => {
 			let stream: libStream.Readable = this.receiveClientData(maxLength);
 
@@ -1689,17 +1719,18 @@ export class ClientRequest extends ClientBase {
 		/* check if the data are currently being received and otherwise mark them as being received */
 		if (this._state.receive == ReceiveState.receiving)
 			return this.badClientUsage('Draining received data', false);
-		this._state.receive = ReceiveState.completed;
+		this._state.receive = ReceiveState.receiving;
 
-		/* check if any data remain in the queue to be received */
+		/* check if any data remain in the queue to be received and drain them */
 		if (this.hasDataQueued())
-			return this.drainQueuedData();
+			await this.drainQueuedData();
+		this._state.receive = ReceiveState.completed;
 	}
 
 	/** marks the object as having been handled and returns a web socket or automatically responds
 	 *	with a corresponding error and returns null (automatically validates method and headers) */
 	public async acceptWebSocket(): Promise<ClientSocket | null> {
-		if (this._state.response != ResponseState.none) {
+		if (this._state.response != ResponseState.none && this._state.response != ResponseState.preparing) {
 			this.badClientUsage('WebSocket upgrade on already claimed connection', false);
 			return null;
 		}
@@ -1726,12 +1757,14 @@ export class ClientRequest extends ClientBase {
 		const ws = await new Promise<ClientSocket | null>((resolve) => {
 			let settled = false;
 
-			/* register the broken listener (to detect failures of the upgrading or network errors) */
-			this._state.breakPromise.then(() => {
+			/* register the broken listener and abort listeners (to detect failures of the upgrading or network errors) */
+			const handleFailure = () => {
 				if (settled) return; settled = true;
 				this.error('Failed to upgrade to WebSocket');
 				resolve(null);
-			});
+			};
+			this._state.breakPromise.then(() => handleFailure());
+			this._state.closedPromise.then(() => handleFailure());
 
 			/* start the upgrade process (web-socket upgrade handler will automatically send error messages) */
 			native.wss.handleUpgrade(this._request, native.socket, native.head, (ws, _) => {

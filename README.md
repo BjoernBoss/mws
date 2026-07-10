@@ -99,23 +99,29 @@ Only `handleRequest` is required. Unhandled requests can be handled by parent mo
 
 Modules form a tree via `linkModule()`. They only ever see requests relative to their `root`. Path translation happens automatically when dispatching to children — client paths are rebased relative to each child module's position in the tree. A module can be linked to multiple parents and will only be initialized once, on first attachment to a server.
 
-### Header and HTML Patching
+### Response Patching
 
-Parent modules can register patches that modify outgoing headers or HTML pages before they are sent to the client:
+Parent modules can register a `Patcher` to inspect and modify — or entirely replace — responses produced further down the module tree:
 
 ```typescript
-/* called just before headers are sent (in reverse registration order) */
-client.patchHeaders((status, headers) => {
-	headers['X-Custom'] = 'value';
-});
+client.patch({
+	/* called just before a response header is committed (in reverse registration order) */
+	response: (status, headers) => {
+		headers['X-Custom'] = 'value';
 
-/* called just before an HTML page is finalized (in reverse registration order) */
-client.patchHtmlPage(async (page, status, headers) => {
-	page.head.push(build.LoadScript('/analytics.js'));
+		/* catch and replace any response, e.g. for custom error pages */
+		if (status.code == 404)
+			client.respondHtml(makeErrorPage(), { status: Status.NotFound });
+	},
+
+	/* called just before an HTML page is finalized (in reverse registration order) */
+	html: (page, status, headers) => {
+		page.head.push(build.LoadScript('/analytics.js'));
+	}
 });
 ```
 
-Patches are scoped to the current handler context and automatically removed when the handler returns.
+A patcher that responds itself replaces the original response. Patchers registered earlier (i.e. by parent modules) still see the replacement, while the replacing patcher is not re-invoked for its own response. Patcher hooks must be synchronous. Patches are scoped to the current handler context and automatically removed when the handler returns.
 
 ### Shutdown
 
@@ -207,6 +213,8 @@ const handler = lambda({
 
 `ClientRequest` automatically manages requests to handle errors, prevent double-responses, and ensure expected HTTP behavior.
 
+Receiving and responding can be started in any order and may overlap (e.g. streaming an upload back out as the response). As soon as a module starts receiving or responding, the request counts as *claimed*: it will not be dispatched to any further modules, and it must be fully completed — response completed, receive consumed — before the handler returns. Leaving a claimed request incomplete aborts its streams and answers the request with an internal error. Requests that were never engaged with pass through unhandled.
+
 ### Receiving Data
 
 ```typescript
@@ -241,7 +249,7 @@ if (!await client.tryRespondFile('/var/www/index.html'))
 	client.respondNotFound();
 
 /* HTML page */
-await client.respondHtml(page, { status: Status.Ok });
+client.respondHtml(page, { status: Status.Ok });
 ```
 
 **Important:** Streams returned by `receiveData()` and `respondData()` can emit `'error'` events. Always register an `'error'` handler on these streams to prevent unhandled errors from crashing the process. Generally: correspondingly tagged functions may throw or error and must handle errors accordingly, to prevent crashing the process.
@@ -331,7 +339,7 @@ server.cache.flush();
 
 ## HTML Building
 
-The `build` namespace provides programmatic HTML construction with automatic escaping. It allows parent modules to use the `patchHtmlPage` function, to build around the HTML, before serving it:
+The `build` namespace provides programmatic HTML construction with automatic escaping. It allows parent modules to use the `html` hook of `patch`, to build around the HTML, before serving it:
 
 ```typescript
 import { build } from "@bjoernboss/mws";
@@ -355,4 +363,4 @@ Plain strings passed as `HtmlString` values are automatically HTML-escaped. Use 
 
 ## Internal Methods
 
-Methods prefixed with `_` (e.g. `_rootAttachToServer`, `_pushTranslation`, `_restoreSnapshot`) are framework-internal and **must not** be called by module implementations. They are `public` for cross-class access within the framework, but are not part of the public API and may change without notice.
+Methods prefixed with `_` (e.g. `_rootAttachToServer`, `_pushContext`, `_popContext`) are framework-internal and **must not** be called by module implementations. They are `public` for cross-class access within the framework, but are not part of the public API and may change without notice.
