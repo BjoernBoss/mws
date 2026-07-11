@@ -144,14 +144,16 @@ export class Listener {
 	private _emitter: libEvents.EventEmitter;
 	private _config: libClient.BurntClientConfig;
 
-	private constructor(server: Server, id: number, hostStop: { stopping: boolean, list: (() => Promise<void>)[] }, clientConfig: libClient.BurntClientConfig, handler: libHandler.ModuleHandler) {
+	private constructor(server: Server, id: number, hostStop: { stopping: boolean, list: (() => Promise<void>)[] }, clientConfig: libClient.BurntClientConfig, handler: libHandler.ModuleHandler, protocol: string, who: string) {
 		this._host = { self: server, stop: hostStop };
-		this._self = { endpoint: `endpoint!${id}`, listening: null, protocol: '' };
+		this._self = { endpoint: `endpoint!${id}`, listening: null, protocol };
 		this._emitter = new libEvents.EventEmitter();
 		this._handling = { count: 0, promise: null, resolver: () => { } };
 
+		this._host.self.trace(`Setting up [${this._self.endpoint}] listening to [${who}] and handler [${handler.identity}]`);
+
 		this._config = clientConfig;
-		libHelper.logConfiguration(this._config, this._host.self, { prefix: `${this._self.endpoint}.`, ref: this._host.self.config.client });
+		libHelper.logConfiguration(this._config, this._host.self, { identity: `${this._host.self.identity}.${this._self.endpoint}`, ref: this._host.self.config.client });
 
 		let stoppedResolver = () => { };
 		this._stop = { stoppedPromise: new Promise<void>((res) => stoppedResolver = res), stoppedResolver: () => { }, stopping: false };
@@ -180,7 +182,7 @@ export class Listener {
 		else
 			this._self.listening = `[${address.address}]:${address.port} [family: ${address.family}]`;
 
-		this._host.self.info(`Successfully started ${this._self.endpoint} on ${this._self.listening} with handler [${this._native.attached.module.identity}]`);
+		this._host.self.info(`Successfully started [${this._self.endpoint}] on ${this._self.listening} with handler [${this._native.attached.module.identity}]`);
 		this.emitEventSync('listening', address);
 	}
 	private async handleClient(request: libHttp.IncomingMessage, client: libClient.ClientRequest): Promise<void> {
@@ -189,7 +191,7 @@ export class Listener {
 		const endpoint = `${this._host.self.identity}.${this._self.endpoint}`;
 
 		/* register the completed log immediately to ensure it is logged as the first thing before the other completed awaits execute */
-		client.log(`Connected to [${endpoint}] using [method: ${request.method ?? '_'}] from [${request.socket.remoteAddress}]:${request.socket.remotePort} to [${client.url.hostname}]:[${request.url}] (user-agent: [${request.headers['user-agent'] ?? ''}])`);
+		client.log(`Connected to [${endpoint}] using [method: ${request.method ?? '_'}] from [${request.socket.remoteAddress}]:${request.socket.remotePort} to [${client.url.href}] (user-agent: [${request.headers['user-agent'] ?? ''}])`);
 		client.completed.then(() => client.log(`Completed on [${endpoint}]`));
 
 		try {
@@ -214,10 +216,7 @@ export class Listener {
 			this._handling.resolver();
 		}
 	}
-	private configure(options: ListenOptions): void {
-		this._self.protocol = ((options.tls != null || options.server?.secure === true || (options.server == null && options.serverless?.secure === true)) ? 'https' : 'http');
-		const who = (options.tls == null && options.server == null && options.serverless != null ? 'serverless' : `${this._self.protocol}|${options.hostname ?? ''}:${options.port ?? 0}`);
-
+	private configure(who: string, options: ListenOptions): void {
 		/* defer the failure to allow the caller to attach listeners */
 		const performFailure = (err: Error): void => {
 			process.nextTick(() => {
@@ -226,7 +225,6 @@ export class Listener {
 				this.stop();
 			});
 		};
-		this._host.self.trace(`Setting up listening to [${who}] and handler [${this._native.attached.module.identity}]`);
 
 		/* check if the server is being stopped, in which case nothing will be listened to */
 		if (this._host.stop.stopping) {
@@ -292,8 +290,11 @@ export class Listener {
 
 	public static _fromParams(server: Server, handler: libHandler.ModuleHandler, id: number, hostStop: { stopping: boolean, list: (() => Promise<void>)[] }, options: ListenOptions): Listener {
 		const clientConfig = (options.client != null ? libClient.BurntClientConfig.from(options.client) : server.config.client);
-		const listener = new Listener(server, id, hostStop, clientConfig, handler);
-		listener.configure(options);
+		const protocol = ((options.tls != null || options.server?.secure === true || (options.server == null && options.serverless?.secure === true)) ? 'https' : 'http');
+		const who = (options.tls == null && options.server == null && options.serverless != null ? 'serverless' : `${protocol}|${options.hostname ?? ''}:${options.port ?? 0}`);
+
+		const listener = new Listener(server, id, hostStop, clientConfig, handler, protocol, who);
+		listener.configure(who, options);
 		return listener;
 	}
 
@@ -364,7 +365,7 @@ export class Listener {
 			await serverStopped;
 
 			if (this._self.listening != null)
-				this._host.self.info(`Stopped ${this._self.endpoint} on ${this._self.listening} with handler [${this._native.attached.module.identity}]`);
+				this._host.self.info(`Stopped [${this._self.endpoint}] on ${this._self.listening} with handler [${this._native.attached.module.identity}]`);
 
 			/* check if the cleanup can be removed from the stop list (only if stopping is not already in progress) */
 			if (!this._host.stop.stopping)

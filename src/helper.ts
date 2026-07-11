@@ -410,7 +410,7 @@ export function splitFilePath(path: string): [string, string, string] {
 }
 
 /** trace log the configuration, and optionally the values, which differ from the reference */
-export function logConfiguration(config: Record<string, any>, logger: libLog.Logger, options?: { prefix?: string, ref?: Record<string, any> }): void {
+export function logConfiguration(config: Record<string, any>, logger: libLog.Logger, options?: { identity?: string, prefix?: string, ref?: Record<string, any> }): void {
 	const prefix = (options?.prefix ?? '');
 
 	for (const [key, value] of Object.entries(config)) {
@@ -421,8 +421,8 @@ export function logConfiguration(config: Record<string, any>, logger: libLog.Log
 		else if (value == rValue)
 			continue;
 		else if (typeof value == 'string')
-			logger.trace(`Config [${prefix}${key}]: '${value}'`);
+			logger.trace(`Config [${prefix}${key}]: '${value}'`, { identity: options?.identity });
 		else
-			logger.trace(`Config [${prefix}${key}]: ${value}`);
+			logger.trace(`Config [${prefix}${key}]: ${value}`, { identity: options?.identity });
 	}
 }
