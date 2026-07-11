@@ -241,7 +241,7 @@ class ImmutableManager {
 			entry.unique += UNIQUE_ID_CHARS[libCrypto.randomInt(UNIQUE_ID_CHARS.length)];
 
 		/* patch the state up to contain the new id */
-		const [base, name, extension] = libHelper.splitFilePath(entry.path);
+		const [base, name, extension] = libHelper.splitFileExtension(entry.path);
 		entry.immutable = `${base}${name}.${entry.unique}${extension}`;
 		this.reverse[entry.unique] = entry.identifier;
 
@@ -362,7 +362,7 @@ class ImmutableManager {
 				continue;
 			this.logger.trace(`Recovering immutable unique id [${state.unique}] for [${state.identifier}]`);
 
-			const [base, name, extension] = libHelper.splitFilePath(state.path);
+			const [base, name, extension] = libHelper.splitFileExtension(state.path);
 			this.map[state.identifier] = {
 				immutable: `${base}${name}.${state.unique}${extension}`,
 				identifier: state.identifier,
@@ -414,8 +414,8 @@ class ImmutableManager {
 			return [null, false];
 
 		/* check if it might be an immutable-tagged path */
-		const [base, temp, extension] = libHelper.splitFilePath(path);
-		const [_, name, tempId] = libHelper.splitFilePath(temp);
+		const [base, temp, extension] = libHelper.splitFileExtension(path);
+		const [_, name, tempId] = libHelper.splitFileExtension(temp);
 		if (!tempId.match(ID_EXTENSION_REGEX))
 			return [null, false];
 		const unique = tempId.substring(1);

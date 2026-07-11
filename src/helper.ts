@@ -33,7 +33,7 @@ export function lookupMediaTypeFromFile(filePath: string): libBase.MediaType | n
 
 	/* loop, as file may have multiple extensions, such as ('.ab.cd') */
 	while (true) {
-		const [_, name, ext] = splitFilePath(filePath);
+		const [_, name, ext] = splitFileExtension(filePath);
 		if (ext == '')
 			return null;
 		extension = ext + extension, filePath = name;
@@ -347,6 +347,11 @@ export function joinSanitized(a: string, b: string): string {
 	return sanitize(bSlash ? a + b : `${a}/${b}`, false);
 }
 
+/** join two paths normalized as native paths */
+export function joinNative(a: string, b: string): string {
+	return libPath.join(a, b);
+}
+
 /** check if the sanitized path is a sub-path of or equal to the sanitized base path (can be /base or /base/...) */
 export function isSubPath(base: string, path: string): boolean {
 	if (base.length > path.length)
@@ -378,24 +383,25 @@ export function rebasePath(oldBase: string, newBase: string, path: string): stri
 	return joinSanitized(newBase, childPath(oldBase, path));
 }
 
-/** create path-creator, which returns sanitized paths inside of [path] */
+/** create path-creator, which returns sanitized paths inside of [path] (normalized to native path) */
 export function createPathLocation(path: string): (path: string) => string {
 	return function (p) {
-		return libPath.join(path, sanitize(p, false));
+		return joinNative(path, sanitize(p, false));
 	};
 }
 
-/** create path-creator, which returns paths inside of the file url path (like the script itself using 'import.meta.url') and optionally changed by relative [path] */
+/** create path-creator, which returns paths inside of the file url path (like the script itself
+ *	using 'import.meta.url') and optionally changed by relative [path] (normalized to native path) */
 export function createPathSelf(urlFilePath: string, path?: string): (path: string) => string {
 	let dirName = libPath.dirname(libUrl.fileURLToPath(urlFilePath));
 	if (path != null)
-		dirName = libPath.join(dirName, sanitize(path, true));
+		dirName = joinNative(dirName, sanitize(path, true));
 	return createPathLocation(dirName);
 }
 
 /** split the path in three components ['/base/', 'name', '.extension'] (extension will be empty if the path
-*	does not contain a distinct extension; path will be empty if the path does not contain a distinct path) */
-export function splitFilePath(path: string): [string, string, string] {
+*	does not contain a distinct extension; base will be empty if the path does not contain a distinct path) */
+export function splitFileExtension(path: string): [string, string, string] {
 	let dot: number | null = null;
 	let name = path.length - 1;
 
@@ -407,6 +413,13 @@ export function splitFilePath(path: string): [string, string, string] {
 	if (dot == null || dot == name + 1)
 		dot = path.length;
 	return [path.substring(0, name + 1), path.substring(name + 1, dot), path.substring(dot)];
+}
+
+/** split the path in two components ['/base/', 'name.extension'] (base will be empty if the path does not contain a distinct path) */
+export function splitFileName(path: string): [string, string] {
+	let name = path.length - 1;
+	for (; name >= 0 && (path[name] != '/' && path[name] != '\\'); --name);
+	return [path.substring(0, name + 1), path.substring(name + 1)];
 }
 
 /** trace log the configuration, and optionally the values, which differ from the reference */
