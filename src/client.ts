@@ -140,7 +140,11 @@ enum ResponseState {
 	none,
 	preparing,
 	headerSent,
-	completed,
+	completed
+}
+enum ConnectionState {
+	healthy,
+	disconnected,
 	broken
 }
 
@@ -266,11 +270,12 @@ export class ClientRequest extends ClientBase {
 		completedResolve: () => void;
 		closedPromise: Promise<void>;
 		closedResolve: () => void;
-		breakPromise: Promise<void>;
-		breakResolve: () => void;
+		droppedPromise: Promise<void>;
+		droppedResolve: () => void;
 		receive: ReceiveState;
 		response: ResponseState;
 		upgrade: UpgradeState;
+		connection: ConnectionState;
 		breaking: Promise<void> | null;
 	};
 	private _throughput: {
@@ -293,7 +298,7 @@ export class ClientRequest extends ClientBase {
 		super(new libUrl.URL(`${protocol}://${request.headers.host?.toLowerCase() ?? '_'}${request.url}`), kind, config);
 		this._patcher = { list: [], index: null };
 
-		let respondedResolve: any = null, completedResolve: any = null, closedResolve: any = null, breakResolve: any = null;
+		let respondedResolve: any = null, completedResolve: any = null, closedResolve: any = null, droppedResolve: any = null;
 		this._state = {
 			respondedPromise: new Promise<void>((resolve) => respondedResolve = resolve),
 			respondedResolve: () => { },
@@ -301,17 +306,18 @@ export class ClientRequest extends ClientBase {
 			completedResolve: () => { },
 			closedPromise: new Promise<void>((resolve) => closedResolve = resolve),
 			closedResolve: () => { },
-			breakPromise: new Promise<void>((resolve) => breakResolve = resolve),
-			breakResolve: () => { },
+			droppedPromise: new Promise<void>((resolve) => droppedResolve = resolve),
+			droppedResolve: () => { },
 			receive: ReceiveState.none,
 			response: ResponseState.none,
 			upgrade: UpgradeState.none,
+			connection: ConnectionState.healthy,
 			breaking: null
 		};
 		this._state.respondedResolve = respondedResolve;
 		this._state.completedResolve = completedResolve;
 		this._state.closedResolve = closedResolve;
-		this._state.breakResolve = breakResolve;
+		this._state.droppedResolve = droppedResolve;
 
 		this._request = request;
 		this._server = server;
@@ -323,13 +329,10 @@ export class ClientRequest extends ClientBase {
 			this.updateThroughput(0);
 		}
 
-		/* register the necessary network error handlers (mark as closed after breaking to ensure breaking is delivered first) */
+		/* register the necessary network error handlers (only relevant if not already dropped) */
 		const handleNetworkEvent = (desc: string) => {
-			if (this._state.response == ResponseState.broken)
-				return;
-			if (this._state.response != ResponseState.completed)
-				this.markAsBroken(desc, false, true);
-			this._state.closedResolve();
+			if (!this._dropped)
+				this.dropConnection(ConnectionState.disconnected, (this._state.response == ResponseState.completed ? '' : desc), false, true);
 		};
 		const lostHandler = () => handleNetworkEvent('Connection lost');
 		const closedHandler = () => handleNetworkEvent('Connection closed by remote');
@@ -373,22 +376,22 @@ export class ClientRequest extends ClientBase {
 		const description = `${this.isHead ? 'HEAD:' : ''}[${status.msg}]${logReason == null ? '' : `: ${logReason}`}`;
 
 		/* check if the response can still be sent */
-		if (this._state.response == ResponseState.none || this._state.response == ResponseState.preparing) {
+		if (this._state.response == ResponseState.completed)
+			this.warning(`Request already completed, discarding response ${description}`);
+		else if (this._dropped)
+			this.trace(`Request broken, discarding response ${description}`);
+		else if (this._state.response == ResponseState.headerSent)
+			this.dropConnection(ConnectionState.broken, `Overlap with committed response ${description}`, false, false);
+		else {
 			if (status.code >= 500)
 				this.error(`Responding with ${description}`);
 			else
 				this.log(`Responding with ${description}`);
 			this.sendFullResponse(status, headers, content ?? undefined);
 		}
-		else if (this._state.response == ResponseState.headerSent)
-			this.markAsBroken(`Overlap with committed response ${description}`, false, false);
-		else if (this._state.response == ResponseState.completed)
-			this.warning(`Request already completed, discarding response ${description}`);
-		else
-			this.trace(`Request broken, discarding response ${description}`);
 	}
 	private failThroughput(): void {
-		if (this.config.throughputThreshold <= 0 || !this._throughput.active || this._state.response == ResponseState.broken)
+		if (this.config.throughputThreshold <= 0 || !this._throughput.active || this._dropped)
 			return;
 
 		/* check if the connection is still considered busy and should receive a grace delay */
@@ -541,25 +544,33 @@ export class ClientRequest extends ClientBase {
 			writer.once('close', () => handler());
 		});
 	}
-	private markAsBroken(reason: string, graceful: boolean, expected: boolean): void {
-		/* expected breaks (remote-caused or documented cleanup) are logged as ordinary
-		*	logs, only breaks caused by server-side misbehavior are logged as errors */
+	private get _dropped(): boolean {
+		return (this._state.connection != ConnectionState.healthy);
+	}
+	private dropConnection(state: ConnectionState, reason: string, graceful: boolean, expected: boolean): void {
+		/* disconnects and expected breaks (remote-caused or documented cleanup) are logged as
+		*	normal logs, only breaks caused by server-side misbehavior are logged as errors */
 		if (reason != '') {
+			const description = `Connection ${state == ConnectionState.disconnected ? 'disconnected' : 'broken'}: [${reason}]`;
 			if (expected)
-				this.log(`Connection broken: [${reason}]`);
+				this.log(description);
 			else
-				this.error(`Connection broken: [${reason}]`);
+				this.error(description);
 		}
-		if (this._state.breaking != null) {
+
+		/* check if the connection has already been dropped, in which
+		*	case at most the forceful destruction needs to be applied */
+		if (this._dropped) {
 			if (!graceful)
 				this.killNativeConnection(false);
 			return;
 		}
 
-		/* resolve breaking before responded to ensure it is delivered first */
-		this._state.response = ResponseState.broken;
-		this._state.breakResolve();
+		/* resolve breaking before responded/closed to ensure it is delivered first */
+		this._state.connection = state;
+		this._state.droppedResolve();
 		this._state.respondedResolve();
+		this._state.closedResolve();
 
 		/* setup the promise beforehand to ensure the promise body does not recursively
 		*	enter this handler again, and sees the completed object still being unset */
@@ -587,12 +598,12 @@ export class ClientRequest extends ClientBase {
 		this.respondInternalError(`Bad Usage: ${reason}`, (close ? { headers: { 'Connection': 'close' } } : undefined));
 	}
 	private breakWithResponse(description: string, graceful: boolean, expected: boolean, respond: (description: string, headers: Record<string, string>) => void): void {
-		if (this._state.response == ResponseState.none || this._state.response == ResponseState.preparing) {
+		if (!this._dropped && (this._state.response == ResponseState.none || this._state.response == ResponseState.preparing)) {
 			respond(description, { 'Connection': 'close' });
-			this.markAsBroken('', true, expected);
+			this.dropConnection(ConnectionState.broken, '', true, expected);
 		}
 		else
-			this.markAsBroken(description, graceful, expected);
+			this.dropConnection(ConnectionState.broken, description, graceful, expected);
 	}
 	private applyCachePolicy(headers: Record<string, string>, should: CachePolicy, override?: CachePolicy): void {
 		if ('Cache-Control' in headers)
@@ -655,7 +666,7 @@ export class ClientRequest extends ClientBase {
 
 		/* invoke all registered patchers to let them update the content */
 		this.invokePatcher((patcher) => patcher.response?.(status, headers));
-		if (this._state.response != ResponseState.none && this._state.response != ResponseState.preparing)
+		if (this._dropped || (this._state.response != ResponseState.none && this._state.response != ResponseState.preparing))
 			return false;
 
 		/* mark the response as determined as it will now be sent this way */
@@ -664,7 +675,7 @@ export class ClientRequest extends ClientBase {
 
 		/* setup the response status and headers (guard against invalid header values) */
 		try { this._native.response.setStatus(status.code, status.msg); } catch (_) {
-			this.markAsBroken(`Failed to finalize response: Bad status message`, false, false);
+			this.dropConnection(ConnectionState.broken, `Failed to finalize response: Bad status message`, false, false);
 			return false;
 		}
 		for (const [key, value] of Object.entries(headers)) {
@@ -701,7 +712,7 @@ export class ClientRequest extends ClientBase {
 			else
 				this._native.writer.end();
 		} catch (err: any) {
-			this.markAsBroken(`Failed to finalize response: ${err.message}`, false, false);
+			this.dropConnection(ConnectionState.broken, `Failed to finalize response: ${err.message}`, false, false);
 		}
 	}
 	private sendClientSetupHeader(resp: HttpRequestResponse, chunk: Buffer | null, cb: (err: any) => void): void {
@@ -817,7 +828,7 @@ export class ClientRequest extends ClientBase {
 		const makeErrorStream = (msg: string) => new libStream.Writable({ write(_0, _1, cb) { cb(new Error(msg)) }, final(cb) { cb(new Error(msg)) } });
 
 		/* check if the object is already responded */
-		if (this._state.response == ResponseState.broken)
+		if (this._dropped)
 			return makeErrorStream('Connection broken');
 		if (this._state.response != ResponseState.none) {
 			this.badClientUsage('Response on already claimed connection', false);
@@ -827,7 +838,7 @@ export class ClientRequest extends ClientBase {
 
 		/* construct the actual response wrapper, which takes care of dynamic encoding and error handling */
 		const output = new HttpRequestResponse(this._native.writer, status, headers, contentSize, media, dynamicEncode,
-			async (chunk: Buffer | null, cb: (err: any) => void) => {
+			(chunk: Buffer | null, cb: (err: any) => void) => {
 				if (output.destroyed)
 					return cb(new Error('Already failed'));
 
@@ -836,10 +847,10 @@ export class ClientRequest extends ClientBase {
 					return cb(null);
 
 				/* check if the connection has been marked as failed or completed */
+				if (this._dropped)
+					return cb(new Error('Connection broken'));
 				if (this._state.response == ResponseState.completed)
 					return cb(new Error('Responding to completed response'));
-				if (this._state.response == ResponseState.broken)
-					return cb(new Error('Connection broken'));
 				if (this._state.response == ResponseState.headerSent && !output.headerSent)
 					return cb(new Error('Responding to claimed connection'));
 
@@ -847,10 +858,10 @@ export class ClientRequest extends ClientBase {
 				try {
 					if (output.headerSent)
 						return this.sendClientWrite(output, chunk, chunk == null, cb);
-					await this.sendClientSetupHeader(output, chunk, cb);
+					this.sendClientSetupHeader(output, chunk, cb);
 				}
 				catch (err: any) {
-					this.markAsBroken(`Failed to process response: ${err.message}`, false, false);
+					this.dropConnection(ConnectionState.broken, `Failed to process response: ${err.message}`, false, false);
 					return cb(new Error('Connection broken'));
 				}
 			},
@@ -866,12 +877,12 @@ export class ClientRequest extends ClientBase {
 					output.writer.destroy();
 
 				/* check if the client was consumed by another response and should not be closed/responded to anymore */
-				if (this._state.response == ResponseState.broken || (!output.headerSent && this._state.response != ResponseState.preparing))
+				if (this._dropped || (!output.headerSent && this._state.response != ResponseState.preparing))
 					return cb(err);
 
 				/* check if its an encoding failure (header must already have been sent) */
 				if (output.encodingFailed)
-					this.markAsBroken(`Encoding failure: ${err.message}`, false, false);
+					this.dropConnection(ConnectionState.broken, `Encoding failure: ${err.message}`, false, false);
 
 				/* forward the module-supplied error and ensure the connection is closed */
 				else
@@ -881,7 +892,7 @@ export class ClientRequest extends ClientBase {
 		);
 
 		/* register the handler to detect closed or failed connections */
-		this._state.breakPromise.then(() => output.destroy(new Error('Connection broken')));
+		this._state.droppedPromise.then(() => output.destroy(new Error('Connection broken')));
 		this._state.closedPromise.then(() => output.destroy(new Error('Response no longer writable')));
 
 		/* register the handler to determine if the response has been overshadowed (responded without this headerSent being set) */
@@ -899,7 +910,7 @@ export class ClientRequest extends ClientBase {
 			this.badClientUsage('Already receiving data', false);
 			return makeErrorStream('Connection is already being received');
 		}
-		if (this._state.response == ResponseState.broken)
+		if (this._dropped)
 			return makeErrorStream('Connection broken');
 		this._state.receive = ReceiveState.receiving;
 
@@ -910,7 +921,7 @@ export class ClientRequest extends ClientBase {
 			transform: (chunk, _, cb) => {
 				if (output.destroyed)
 					return cb(new Error('Already failed'));
-				if (this._state.response == ResponseState.broken)
+				if (this._dropped)
 					return cb(new Error('Connection broken'));
 
 				/* check the maximum count (is violated) */
@@ -978,7 +989,7 @@ export class ClientRequest extends ClientBase {
 		}
 
 		/* register the handler to detect closed or failed connections */
-		this._state.breakPromise.then(() => output.destroy(new Error('Connection broken')));
+		this._state.droppedPromise.then(() => output.destroy(new Error('Connection broken')));
 		this._state.closedPromise.then(() => output.destroy(new Error('Receive no longer available')));
 
 		/* create the plumbing between stream and output (errors are already handled) */
@@ -1006,7 +1017,7 @@ export class ClientRequest extends ClientBase {
 				resolve();
 			};
 			this._request.once('end', cb);
-			this._state.breakPromise.then(cb);
+			this._state.droppedPromise.then(cb);
 			this._state.closedPromise.then(cb);
 
 			/* ensure the throughput is still updated and ensure the reuqest is in flow state */
@@ -1018,22 +1029,22 @@ export class ClientRequest extends ClientBase {
 		const handleFailure = (reason: string) => {
 			/* close after breaking to ensure breaking is delivered first */
 			if (finalize)
-				this.markAsBroken(reason, false, false);
+				this.dropConnection(ConnectionState.broken, reason, false, false);
 			else
 				this.badClientUsage(reason, true);
 			this._state.closedResolve();
 		};
 
 		/* ensure that the data have been fully received */
-		if (this._state.receive == ReceiveState.receiving && this._state.response != ResponseState.broken)
+		if (!this._dropped && this._state.receive == ReceiveState.receiving)
 			handleFailure('Receive stream not consumed');
 
 		/* check if the upgrade was not fully awaited */
-		if (this._state.upgrade == UpgradeState.upgrading && this._state.response != ResponseState.broken)
+		if (!this._dropped && this._state.upgrade == UpgradeState.upgrading)
 			handleFailure('Upgrade not fully awaited');
 
 		/* ensure that the response was properly sent */
-		if (this._state.response != ResponseState.completed && this._state.response != ResponseState.broken)
+		if (!this._dropped && this._state.response != ResponseState.completed)
 			handleFailure('Response not completed');
 	}
 
@@ -1092,25 +1103,26 @@ export class ClientRequest extends ClientBase {
 	}
 	public async _finalizeConnection(): Promise<void> {
 		/* ensure the connection is default replied with not-found */
-		if (this._state.response == ResponseState.none)
+		if (this._state.response == ResponseState.none && !this._dropped)
 			this.respondNotFound();
 
 		/* validate the final state */
 		this.cleanupContext(true);
 
-		/* check if data remain in the pipeline, in which case they either need to be consumed,
-		*	or the connection needs to be closed to ensure the sender does not pipe more data over */
-		if (this.hasDataQueued() && this._state.response != ResponseState.broken) {
+		/* check if data remain in the pipeline, in which case they either need to be consumed, or the
+		*	connection needs to be closed to ensure the sender does not pipe more data over (dropped
+		*	connections have already been cleaned up and cannot receive the data anymore anyways) */
+		if (this.hasDataQueued() && !this._dropped) {
 			if (this.config.drainUpload)
 				await this.drainQueuedData();
 			else
-				this.markAsBroken((this._request.readableLength > 0 ? 'Uploaded data not consumed' : 'Potential uploaded data not consumed'), true, false);
+				this.dropConnection(ConnectionState.broken, (this._request.readableLength > 0 ? 'Uploaded data not consumed' : 'Potential uploaded data not consumed'), true, false);
 		}
 
 		/* check if the connection was an upgrade but was not was accepted, which needs to be
 		*	killed, as the underlying web-server will not clean this connection up anymore */
-		if (this._native.socket != null && this._state.upgrade != UpgradeState.upgraded && this._state.response != ResponseState.broken)
-			this.markAsBroken('Upgrade was not accepted', true, true);
+		if (this._native.socket != null && this._state.upgrade != UpgradeState.upgraded && !this._dropped)
+			this.dropConnection(ConnectionState.broken, 'Upgrade was not accepted', true, true);
 
 		/* kill the throughput timer, as it either does not need to be checked anymore, or it
 		*	will have left the connection as broken, and will automatically be closed now */
@@ -1119,8 +1131,8 @@ export class ClientRequest extends ClientBase {
 		this._throughput.timer = null;
 		this._throughput.active = false;
 
-		/* check if the connection is broken and await its grace cleanup completion */
-		if (this._state.response == ResponseState.broken)
+		/* check if the connection was dropped and await its grace cleanup completion */
+		if (this._dropped)
 			await this._state.breaking!;
 
 		/* recover the original socket timeout (not for sockets, as they take care of the timeout themselves) */
@@ -1132,9 +1144,9 @@ export class ClientRequest extends ClientBase {
 
 	/** respond with an internal error and kill the connection (if [gracefully], give previous responses time to be received) */
 	public killConnection(reason: string, options?: { graceful?: boolean }): void {
-		/* if the response is already completed, treat is as a friendly closing */
-		if (this._state.response == ResponseState.completed)
-			return this.markAsBroken(`Connection killed: ${reason}`, true, true);
+		/* if the response is already completed/broken, treat is as a friendly closing */
+		if (this._state.response == ResponseState.completed || this._dropped)
+			return this.dropConnection(ConnectionState.broken, `Connection killed: ${reason}`, true, true);
 		this.breakWithResponse(`Connection killed: ${reason}`, (options?.graceful ?? false), false, (desc, headers) => this.respondInternalError(desc, { headers }));
 	}
 
@@ -1148,12 +1160,13 @@ export class ClientRequest extends ClientBase {
 		return this._server.cache;
 	}
 
-	/** request has been engaged with (receiving or responding was started) and must be completed by the current handler */
+	/** request has been engaged with (receiving or responding was started, or the connection has been
+	 *	dropped) and must be completed by the current handler instead of being dispatched further */
 	public get claimed(): boolean {
-		return (this._state.response != ResponseState.none || this._state.receive != ReceiveState.none);
+		return (this._state.response != ResponseState.none || this._state.receive != ReceiveState.none || this._dropped);
 	}
 
-	/** resolves whenever the response has been determined (is broken or a response header has been sent) */
+	/** resolves whenever the response has been determined (a response header has been sent or the connection was dropped) */
 	public get responded(): Promise<void> {
 		return this._state.respondedPromise;
 	}
@@ -1496,7 +1509,7 @@ export class ClientRequest extends ClientBase {
 	/** respond with html, can be built on by parent modules, sent once the request has been fully processed (default status is
 	 *	ok; for HEAD builds, no actual content will be constructed or estimated in size); cache policy defaults to [private] */
 	public respondHtml(page: libBuilder.HtmlPage, options?: { status?: libBase.StatusType, headers?: Record<string, string>, cache?: CachePolicy }): void {
-		if (this._state.response != ResponseState.none && this._state.response != ResponseState.preparing)
+		if (this._dropped || (this._state.response != ResponseState.none && this._state.response != ResponseState.preparing))
 			return this.badClientUsage('HTML response on already claimed connection', false);
 
 		const status = (options?.status ?? libBase.Status.Ok);
@@ -1505,7 +1518,7 @@ export class ClientRequest extends ClientBase {
 
 		/* invoke all registered html patchers to let them update the content */
 		this.invokePatcher((patcher) => patcher.html?.(page, status, headers));
-		if (this._state.response != ResponseState.none && this._state.response != ResponseState.preparing)
+		if (this._dropped || (this._state.response != ResponseState.none && this._state.response != ResponseState.preparing))
 			return;
 
 		/* mark first as completed now */
@@ -1677,8 +1690,8 @@ export class ClientRequest extends ClientBase {
 			this.respondConflict({ reason: 'Path already exists' });
 			throw new Error('Path already exists');
 		} catch (err: any) {
-			/* no need to respond on broken connections, as this will already have been logged */
-			if (this._state.response != ResponseState.broken)
+			/* no need to respond on dropped connections, as this will already have been logged */
+			if (!this._dropped)
 				this.respondInternalError(`Failed to write uploaded file: ${err.message}`);
 			throw err;
 		}
@@ -1713,7 +1726,7 @@ export class ClientRequest extends ClientBase {
 
 	/** drain any remaining data being uploaded (must not be called while a request is currently being received) */
 	public async drainUpload(): Promise<void> {
-		if (this._state.response == ResponseState.broken)
+		if (this._dropped)
 			return;
 
 		/* check if the data are currently being received and otherwise mark them as being received */
@@ -1730,7 +1743,7 @@ export class ClientRequest extends ClientBase {
 	/** marks the object as having been handled and returns a web socket or automatically responds
 	 *	with a corresponding error and returns null (automatically validates method and headers) */
 	public async acceptWebSocket(): Promise<ClientSocket | null> {
-		if (this._state.response != ResponseState.none && this._state.response != ResponseState.preparing) {
+		if (this._dropped || (this._state.response != ResponseState.none && this._state.response != ResponseState.preparing)) {
 			this.badClientUsage('WebSocket upgrade on already claimed connection', false);
 			return null;
 		}
@@ -1763,12 +1776,12 @@ export class ClientRequest extends ClientBase {
 				this.error('Failed to upgrade to WebSocket');
 				resolve(null);
 			};
-			this._state.breakPromise.then(() => handleFailure());
+			this._state.droppedPromise.then(() => handleFailure());
 			this._state.closedPromise.then(() => handleFailure());
 
 			/* start the upgrade process (web-socket upgrade handler will automatically send error messages) */
 			native.wss.handleUpgrade(this._request, native.socket, native.head, (ws, _) => {
-				if (!settled && this._state.response == ResponseState.headerSent) {
+				if (!settled && !this._dropped && this._state.response == ResponseState.headerSent) {
 					settled = true, this._state.response = ResponseState.completed;
 
 					/* ensure that the socket is valid as otherwise proper cleanup might not be guaranteed (no
@@ -1781,7 +1794,7 @@ export class ClientRequest extends ClientBase {
 					return resolve(ClientSocket._fromRequest(ws, this));
 				}
 				settled = true;
-				this.markAsBroken('Broken connection upgraded', false, false);
+				this.dropConnection(ConnectionState.broken, 'Broken connection upgraded', false, false);
 				resolve(null);
 			});
 		});
