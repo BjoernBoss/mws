@@ -233,7 +233,9 @@ export enum CachePolicy {
  *	As soon as either is started, the request counts as [claimed] and will not be dispatched to any further
  *	modules. A claimed request must be fully completed (response completed, receive consumed, upgrade awaited)
  *	before the module handler returns. Violations abort the pending streams and are answered with an internal
- *	error. Requests that were never engaged with pass through unhandled.
+ *	error. Modules own their entire subtree: if a handler returns without claiming the request or responding,
+ *	the framework defaults to not-found. Parent modules can intercept any response (including the auto not-found)
+ *	via the patch interface.
  *
  *	Receiving data: Will automatically decode the stream and ensure a given maximum is not passed
  *		=> Any errors while receiving will either auto-respond or send the connection into the broken state, and fail the receive reader (stream user does not need to respond).
@@ -1035,6 +1037,10 @@ export class ClientRequest extends ClientBase {
 			this._state.closedResolve();
 		};
 
+		/* ensure the connection is default replied with not-found */
+		if (!this._dropped && this._state.response == ResponseState.none)
+			this.respondNotFound();
+
 		/* ensure that the data have been fully received */
 		if (!this._dropped && this._state.receive == ReceiveState.receiving)
 			handleFailure('Receive stream not consumed');
@@ -1084,9 +1090,7 @@ export class ClientRequest extends ClientBase {
 		return current;
 	}
 	public _popContext(snapshot: ClientContext): void {
-		/* check if the request has been claimed and cleanup the context */
-		if (this.claimed)
-			this.cleanupContext(false);
+		this.cleanupContext(false);
 
 		/* restore the context */
 		this._path = snapshot.path;
@@ -1102,11 +1106,6 @@ export class ClientRequest extends ClientBase {
 		return new ClientRequest(server, config, protocol, 'upgrade', request, { socket, head, wss });
 	}
 	public async _finalizeConnection(): Promise<void> {
-		/* ensure the connection is default replied with not-found */
-		if (this._state.response == ResponseState.none && !this._dropped)
-			this.respondNotFound();
-
-		/* validate the final state */
 		this.cleanupContext(true);
 
 		/* check if data remain in the pipeline, in which case they either need to be consumed, or the
@@ -1138,7 +1137,6 @@ export class ClientRequest extends ClientBase {
 		/* recover the original socket timeout (not for sockets, as they take care of the timeout themselves) */
 		if (this._state.upgrade != UpgradeState.upgraded || this._state.response != ResponseState.completed)
 			this._request.socket.setTimeout(this._native.timeout ?? 0);
-
 		this._state.completedResolve();
 	}
 
@@ -1161,7 +1159,8 @@ export class ClientRequest extends ClientBase {
 	}
 
 	/** request has been engaged with (receiving or responding was started, or the connection has been
-	 *	dropped) and must be completed by the current handler instead of being dispatched further */
+	 *	dropped); a claimed request will not be dispatched to further modules and the framework will default
+	 *	to not-found if the handler returns without claiming or responding */
 	public get claimed(): boolean {
 		return (this._state.response != ResponseState.none || this._state.receive != ReceiveState.none || this._dropped);
 	}

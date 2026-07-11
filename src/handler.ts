@@ -24,8 +24,9 @@ export type Params = Record<string, any>;
 
 export interface AttachedModule {
 	/** forward the given client to the module, and translate the paths and logging accordingly, if the module
-	 *	is designated for the client; returns false if the client is still unhandled after the handler; params
-	 *	are passed on to the module without modification; no translation is equivalent to [/] => [/] */
+	 *	is designated for the client; returns false if the module could not process the request (module is stopping,
+	 *	translation does not apply, or module is not attached); once handleRequest is invoked, the request is always
+	 *	claimed; params are passed on to the module without modification; no translation is equivalent to [/] => [/] */
 	handle(client: libClient.ClientRequest, options?: { params?: Params, translate?: PathTranslation }): Promise<boolean>;
 
 	/** detach the module from the parent module handler (registered unlinked callback will be invoked before this promise
@@ -43,6 +44,10 @@ export interface AttachedModule {
 }
 
 /**
+*	A module owns its entire subtree: once handleRequest is invoked, the request is guaranteed to be claimed
+*	before the handler returns - if neither receiving nor responding was started, the framework defaults to
+*	not-found. Parent modules can intercept any child response (including the auto not-found) via the patch
+*	interface.
 *	Modules will be stopped by default, once it is fully unlinked from the server again.
 *	If a module is initialized, or stopped, the stop-handler is called.
 *	An initialization will always be followed by a stop-handler call.
@@ -144,24 +149,21 @@ export abstract class ModuleHandler extends libLog.Logger {
 			this._handling.promise = new Promise<void>((res) => this._handling.resolver = res);
 		this._handling.active.add(client);
 
-		/* handle the client but ensure to catch any exceptions and re-throw them once the handler has been cleaned up */
-		let error = null;
+		/* handle the client, and default respond for any errors */
 		try {
 			await this.handleRequest(client, params);
 		} catch (err: any) {
-			error = err;
+			client.respondInternalError(`Uncaught exception: ${err.message}`);
 		}
 
-		/* restore the context, clear the handling promise and remove the client from actively handled clients */
-		this._handling.active.delete(client);
+		/* restore the context (before removing the client, as it will respond, and may otherwise re-enter
+		*	the handler), clear the handling promise and remove the client from actively handled clients */
 		client._popContext(snapshot);
+		this._handling.active.delete(client);
 		if (this._handling.active.size == 0) {
 			this._handling.promise = null;
 			this._handling.resolver();
 		}
-
-		if (error != null)
-			throw error;
 		return client.claimed;
 	}
 	private async _performAttachSelf(server: libServer.Server): Promise<void> {
@@ -355,7 +357,9 @@ export abstract class ModuleHandler extends libLog.Logger {
 
 	/** handle the client request (guaranteed to not have been claimed yet; receiving or responding claims the client, which must
 	 *	then be fully completed - response completed, receive consumed - before this promise resolves, as leftover streams will be
-	 *	aborted; long-running handlers must check 'client.claimed' or await 'client.responded' to allow timely server shutdown) */
+	 *	aborted; if the handler returns without claiming the request, the framework defaults to not-found - parent modules can use
+	 *	the patch interface to intercept this response; long-running handlers must check 'client.claimed' or await 'client.responded'
+	 *	to allow timely server shutdown) */
 	protected abstract handleRequest(client: libClient.ClientRequest, params?: Params): Promise<void>;
 
 	/** module has been stopped (all clients are guaranteed to have left, but accepted WebSockets will be left intact and

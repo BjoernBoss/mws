@@ -95,13 +95,13 @@ export class MyModule extends ModuleHandler {
 }
 ```
 
-Only `handleRequest` is required. Unhandled requests can be handled by parent modules or receive an automatic `404 Not Found`.
+Only `handleRequest` is required. A module owns its entire subtree: if the handler returns without responding, the framework defaults to `404 Not Found`. Parent modules can intercept any child response - including the auto not-found - via the `patch` interface.
 
-Modules form a tree via `linkModule()`. They only ever see requests relative to their `root`. Path translation happens automatically when dispatching to children — client paths are rebased relative to each child module's position in the tree. A module can be linked to multiple parents and will only be initialized once, on first attachment to a server.
+Modules form a tree via `linkModule()`. They only ever see requests relative to their `root`. Path translation happens automatically when dispatching to children - client paths are rebased relative to each child module's position in the tree. A module can be linked to multiple parents and will only be initialized once, on first attachment to a server.
 
 ### Response Patching
 
-Parent modules can register a `Patcher` to inspect and modify — or entirely replace — responses produced further down the module tree:
+Parent modules can register a `Patcher` to inspect and modify - or entirely replace - responses produced further down the module tree:
 
 ```typescript
 client.patch({
@@ -135,7 +135,7 @@ Calling `module.stop()` detaches the module and waits for its active clients to 
 
 Factory functions create common module patterns without subclassing:
 
-### dispatch — Path Routing
+### dispatch - Path Routing
 
 Routes requests to children by longest URL path match. Stops itself once all children have been unlinked.
 
@@ -149,7 +149,7 @@ server.listen(dispatch({
 }), { port: 8080 });
 ```
 
-### host — Hostname Routing
+### host - Hostname Routing
 
 Routes requests to children by longest hostname match (supports sub-domain matching).
 
@@ -162,7 +162,7 @@ server.listen(host({
 }), { port: 8080 });
 ```
 
-### bind — Parameter and Translation Binding
+### bind - Parameter and Translation Binding
 
 Forwards all requests to a single child handler, optionally injecting `params` and a path `translate` map.
 
@@ -175,7 +175,7 @@ const bound = bind(myModule, {
 });
 ```
 
-### check — Host and Port Validation
+### check - Host and Port Validation
 
 Validates the request hostname and port before forwarding. Responds `404` and kills the connection on mismatch.
 
@@ -185,7 +185,7 @@ import { check } from "@bjoernboss/mws";
 const checked = check(myModule, ['localhost', '127.0.0.1'], { port: 8080 });
 ```
 
-### lambda — Callback-Based Handler
+### lambda - Callback-Based Handler
 
 Handles requests via callbacks instead of subclassing, with optional attached child modules.
 
@@ -198,10 +198,9 @@ const handler = lambda({
 		/* runs on first attachment */
 	},
 	handle: async function (client: ClientRequest, params, links) {
+		/* dispatch matching requests; unmatched requests auto-respond with not-found */
 		if (client.isSubPathOf('/api'))
 			await links.api.handle(client, { translate: { '/api': '/' } });
-		else
-			client.respondNotFound();
 	},
 	stop: async function (links) {
 		/* cleanup */
@@ -213,7 +212,7 @@ const handler = lambda({
 
 `ClientRequest` automatically manages requests to handle errors, prevent double-responses, and ensure expected HTTP behavior.
 
-Receiving and responding can be started in any order and may overlap (e.g. streaming an upload back out as the response). As soon as a module starts receiving or responding, the request counts as *claimed*: it will not be dispatched to any further modules, and it must be fully completed — response completed, receive consumed — before the handler returns. Leaving a claimed request incomplete aborts its streams and answers the request with an internal error. Requests that were never engaged with pass through unhandled.
+Receiving and responding can be started in any order and may overlap (e.g. streaming an upload back out as the response). As soon as a module starts receiving or responding, the request counts as *claimed*: it will not be dispatched to any further modules, and it must be fully completed - response completed, receive consumed - before the handler returns. Leaving a claimed request incomplete aborts its streams and answers the request with an internal error. A module owns its entire subtree - if the handler returns without claiming the request, or does not respond to it, the framework defaults to `404 Not Found`. Parent modules can intercept any response via the `patch` interface.
 
 ### Receiving Data
 
@@ -319,7 +318,7 @@ An LRU cache for frequently served files. Encoded variants (gzip, brotli, ...) a
 File paths can be tagged with a unique version identifier so clients can cache them immutably:
 
 ```typescript
-/* style.css becomes style.<id>.css — the id changes when the file changes */
+/* style.css becomes style.<id>.css - the id changes when the file changes */
 const versionedPath = server.cache.immutable('my-module', '/static/style.css');
 ```
 

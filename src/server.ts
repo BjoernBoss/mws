@@ -436,7 +436,7 @@ export interface ServerConfig {
 	/** default timeout for request headers to be fully received [0 disables the timeout; in milliseconds; Default: 30_000] */
 	headerTimeout?: number;
 
-	/** default inactivity timeout — connection is closed if no data is sent or received; resets on any I/O activity, so active transfers are not affected;
+	/** default inactivity timeout - connection is closed if no data is sent or received; resets on any I/O activity, so active transfers are not affected;
 	 *	is temporarily cleared by clients, which handle it themselves via throughput [0 disables the timeout; in milliseconds; Default: 90_000] */
 	connectionTimeout?: number;
 
