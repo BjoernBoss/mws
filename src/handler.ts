@@ -63,7 +63,7 @@ export abstract class ModuleHandler extends libLog.Logger {
 		stopOnDetach: boolean;
 	};
 	private _handling: {
-		active: Set<libClient.ClientRequest>;
+		active: Map<libClient.ClientRequest, Promise<void> | null>;
 		promise: Promise<void> | null;
 		resolver: () => void;
 	};
@@ -83,7 +83,7 @@ export abstract class ModuleHandler extends libLog.Logger {
 		super(name);
 
 		this._config = { name, tagClients: true, tagString: '', stopOnDetach: true };
-		this._handling = { active: new Set<libClient.ClientRequest>(), promise: null, resolver: () => { } };
+		this._handling = { active: new Map<libClient.ClientRequest, Promise<void> | null>(), promise: null, resolver: () => { } };
 		this._stopped = null;
 		this._attachment = { links: new Set<LinkedModules>(), attached: false, server: null, task: { promise: null, order: [], count: 0, resolver: () => { } } };
 	}
@@ -131,10 +131,12 @@ export abstract class ModuleHandler extends libLog.Logger {
 		}
 		return false;
 	}
-	private async _processIncomingClient(client: libClient.ClientRequest, params?: Params, translate?: PathTranslation): Promise<void> {
+	private async _processIncomingClient(parent: ModuleHandler | null, client: libClient.ClientRequest, params?: Params, translate?: PathTranslation): Promise<void> {
 		/* ensure that any outstanding tasks have completed and then check if the client can be processed by this module */
 		await this._drainTaskQueue(false, null);
 		if (!this._attachment.attached || this._handling.active.has(client) || client.claimed || client.server != this._attachment.server)
+			return;
+		if (parent != null && parent._handling.active.get(client) != null)
 			return;
 
 		/* setup the new mapping and path translation and check if the translation can be applied */
@@ -146,13 +148,26 @@ export abstract class ModuleHandler extends libLog.Logger {
 		/* check if the cleanup handler needs to be setup and push the client in general to be handled right now */
 		if (this._handling.active.size == 0)
 			this._handling.promise = new Promise<void>((res) => this._handling.resolver = res);
-		this._handling.active.add(client);
+		this._handling.active.set(client, null);
+
+		/* register the promise to the parent to ensure the parent awaits this handler */
+		let completed: (() => void) | null = null;
+		if (parent != null)
+			parent._handling.active.set(client, new Promise<void>((res) => completed = res));
 
 		/* handle the client, and default respond for any errors */
 		try {
 			await this.handleRequest(client, params);
 		} catch (err: any) {
 			client.respondInternalError(`Uncaught exception: ${err.message}`);
+		}
+
+		/* await the handling of any children and clear the parent's await */
+		while (this._handling.active.get(client) != null)
+			await this._handling.active.get(client);
+		if (parent != null) {
+			parent._handling.active.set(client, null);
+			completed!();
 		}
 
 		/* restore the context (before removing the client, as it will respond, and may otherwise re-enter
@@ -338,7 +353,7 @@ export abstract class ModuleHandler extends libLog.Logger {
 		/* try to immediately perform the initial load and setup the attach module interface */
 		link.setup!(null);
 		return {
-			handle: (client, options) => (stopping ? Promise.resolve() : this._processIncomingClient(client, options?.params, options?.translate)),
+			handle: (client, options) => (stopping ? Promise.resolve() : this._processIncomingClient((parent instanceof libServer.Server ? null : parent), client, options?.params, options?.translate)),
 			unlink: () => link.cleanup(),
 			module: this,
 			linked: () => !stopping,
@@ -419,10 +434,10 @@ export abstract class ModuleHandler extends libLog.Logger {
 
 		(async () => {
 			/* kill any connections and kill all links and drain the remaining task queue
-					*	(will not await the unlinked calls of links where this element is the child) */
+			*	(will not await the unlinked calls of links where this element is the child) */
 			this._performDetachSelf();
 			for (const client of this._handling.active)
-				client.killConnection('Module detached');
+				client[0].killConnection('Module detached');
 			for (const link of this._attachment.links)
 				link.cleanup();
 			await this._drainTaskQueue(true, null);
