@@ -23,11 +23,10 @@ export type PathTranslation = Record<string, string | null>;
 export type Params = Record<string, any>;
 
 export interface AttachedModule {
-	/** forward the given client to the module, and translate the paths and logging accordingly, if the module
-	 *	is designated for the client; returns false if the module could not process the request (module is stopping,
-	 *	translation does not apply, or module is not attached); once handleRequest is invoked, the request is always
-	 *	claimed; params are passed on to the module without modification; no translation is equivalent to [/] => [/] */
-	handle(client: libClient.ClientRequest, options?: { params?: Params, translate?: PathTranslation }): Promise<boolean>;
+	/** forward the given client to the module, and translate the paths and logging accordingly; if the module
+	 *	cannot process the request (stopping, translation does not apply, not attached), the call is a no-op;
+	 *	params are passed on to the module without modification; no translation is equivalent to [/] => [/] */
+	handle(client: libClient.ClientRequest, options?: { params?: Params, translate?: PathTranslation }): Promise<void>;
 
 	/** detach the module from the parent module handler (registered unlinked callback will be invoked before this promise
 	 *	is completed; clients dispatched to the module will not be disconnected directly any may still be active) */
@@ -132,17 +131,17 @@ export abstract class ModuleHandler extends libLog.Logger {
 		}
 		return false;
 	}
-	private async _processIncomingClient(client: libClient.ClientRequest, params?: Params, translate?: PathTranslation): Promise<boolean> {
+	private async _processIncomingClient(client: libClient.ClientRequest, params?: Params, translate?: PathTranslation): Promise<void> {
 		/* ensure that any outstanding tasks have completed and then check if the client can be processed by this module */
 		await this._drainTaskQueue(false, null);
 		if (!this._attachment.attached || this._handling.active.has(client) || client.claimed || client.server != this._attachment.server)
-			return client.claimed;
+			return;
 
 		/* setup the new mapping and path translation and check if the translation can be applied */
 		const logTag = (this._config.tagClients ? (this._config.tagString == '' ? this.identity : this._config.tagString) : '');
 		const snapshot = client._pushContext(translate ?? null, logTag);
 		if (snapshot == null)
-			return client.claimed;
+			return;
 
 		/* check if the cleanup handler needs to be setup and push the client in general to be handled right now */
 		if (this._handling.active.size == 0)
@@ -164,7 +163,6 @@ export abstract class ModuleHandler extends libLog.Logger {
 			this._handling.promise = null;
 			this._handling.resolver();
 		}
-		return client.claimed;
 	}
 	private async _performAttachSelf(server: libServer.Server): Promise<void> {
 		const firstAttachment = (this._attachment.server == null);
@@ -340,7 +338,7 @@ export abstract class ModuleHandler extends libLog.Logger {
 		/* try to immediately perform the initial load and setup the attach module interface */
 		link.setup!(null);
 		return {
-			handle: (client, options) => (stopping ? Promise.resolve(client.claimed) : this._processIncomingClient(client, options?.params, options?.translate)),
+			handle: (client, options) => (stopping ? Promise.resolve() : this._processIncomingClient(client, options?.params, options?.translate)),
 			unlink: () => link.cleanup(),
 			module: this,
 			linked: () => !stopping,
