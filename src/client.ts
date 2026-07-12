@@ -1280,7 +1280,7 @@ export class ClientRequest extends ClientBase {
 		const header = (options?.headers ?? {});
 		this.applyCachePolicy(header, CachePolicy.sensitive, options?.cache);
 
-		const content = (options?.message ?? `An internal server error occurred while processing the request for [${this.url.pathname}].`);
+		const content: string = (options?.message ?? `An internal server error occurred while processing the request for [${this.url.pathname}].`);
 		this.constructQuickResponse(libBase.Status.InternalError, `Reason (not sent): ${reason}`, header, {
 			media: libBase.Media.Text, body: Buffer.from(content, 'utf-8')
 		});
@@ -1317,7 +1317,7 @@ export class ClientRequest extends ClientBase {
 		});
 	}
 
-	/** respond with [bad-request] and a default response (with embedded reason) or a custom text response; cache policy defaults to [private] */
+	/** respond with [bad-request] and a default response (with embedded reason) or a custom text response (message replaces the body and the reason is then logged server-side only); cache policy defaults to [private] */
 	public respondBadRequest(options?: { reason?: string, message?: string, headers?: Record<string, string>, cache?: CachePolicy }): void {
 		const header = (options?.headers ?? {});
 		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
@@ -1328,7 +1328,7 @@ export class ClientRequest extends ClientBase {
 		});
 	}
 
-	/** respond with [conflict] and a default response (with embedded reason) or a custom text response; cache policy defaults to [private] */
+	/** respond with [conflict] and a default response (with embedded reason) or a custom text response (message replaces the body and the reason is then logged server-side only); cache policy defaults to [private] */
 	public respondConflict(options?: { reason?: string, message?: string, headers?: Record<string, string>, cache?: CachePolicy }): void {
 		const header = (options?.headers ?? {});
 		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
@@ -1339,7 +1339,7 @@ export class ClientRequest extends ClientBase {
 		});
 	}
 
-	/** respond with [ok] a default response (with embedded reason) or a custom text response; cache policy defaults to [private] */
+	/** respond with [ok] and a default response (with embedded reason) or a custom text response (message replaces the body and the reason is then logged server-side only); cache policy defaults to [private] */
 	public respondOk(options?: { reason?: string, message?: string, headers?: Record<string, string>, cache?: CachePolicy }): void {
 		const header = (options?.headers ?? {});
 		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
