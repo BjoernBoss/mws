@@ -1275,13 +1275,14 @@ export class ClientRequest extends ClientBase {
 		this._patcher.list.push(patcher);
 	}
 
-	/** respond with [internal-error] and a default text response (reason is logged server-side only); cache policy defaults to [sensitive] */
-	public respondInternalError(reason: string, options?: { headers?: Record<string, string>, cache?: CachePolicy }): void {
+	/** respond with [internal-error] and a default text response (reason is logged server-side only) or a custom text response; cache policy defaults to [sensitive] */
+	public respondInternalError(reason: string, options?: { message?: string, headers?: Record<string, string>, cache?: CachePolicy }): void {
 		const header = (options?.headers ?? {});
 		this.applyCachePolicy(header, CachePolicy.sensitive, options?.cache);
 
+		const content = (options?.message ?? `An internal server error occurred while processing the request for [${this.url.pathname}].`);
 		this.constructQuickResponse(libBase.Status.InternalError, `Reason (not sent): ${reason}`, header, {
-			media: libBase.Media.Text, body: Buffer.from(`An internal server error occurred while processing the request for [${this.url.pathname}].`, 'utf-8')
+			media: libBase.Media.Text, body: Buffer.from(content, 'utf-8')
 		});
 	}
 
@@ -1321,9 +1322,9 @@ export class ClientRequest extends ClientBase {
 		const header = (options?.headers ?? {});
 		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
-		const body: string = options?.message ?? `Request for [${this.url.pathname}] is perceived as malformed${options?.reason == null ? '.' : `:\n${options.reason}`}`;
+		const content: string = (options?.message ?? `Request for [${this.url.pathname}] is perceived as malformed${options?.reason == null ? '.' : `:\n${options.reason}`}`);
 		this.constructQuickResponse(libBase.Status.BadRequest, (options?.reason ?? options?.message ?? null), header, {
-			media: libBase.Media.Text, body: Buffer.from(body, 'utf-8')
+			media: libBase.Media.Text, body: Buffer.from(content, 'utf-8')
 		});
 	}
 
@@ -1332,9 +1333,9 @@ export class ClientRequest extends ClientBase {
 		const header = (options?.headers ?? {});
 		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
-		const body: string = options?.message ?? `Conflict for resource [${this.url.pathname}]${options?.reason == null ? '.' : `:\n${options.reason}`}`;
+		const content: string = (options?.message ?? `Conflict for resource [${this.url.pathname}]${options?.reason == null ? '.' : `:\n${options.reason}`}`);
 		this.constructQuickResponse(libBase.Status.Conflict, (options?.reason ?? options?.message ?? null), header, {
-			media: libBase.Media.Text, body: Buffer.from(body, 'utf-8')
+			media: libBase.Media.Text, body: Buffer.from(content, 'utf-8')
 		});
 	}
 
@@ -1343,19 +1344,32 @@ export class ClientRequest extends ClientBase {
 		const header = (options?.headers ?? {});
 		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
-		const body: string = options?.message ?? `${this.method} was successful for [${this.url.pathname}]${options?.reason == null ? '.' : `:\n${options.reason}`}`;
+		const content: string = (options?.message ?? `${this.method} was successful for [${this.url.pathname}]${options?.reason == null ? '.' : `:\n${options.reason}`}`);
 		this.constructQuickResponse(libBase.Status.Ok, (options?.reason ?? options?.message ?? null), header, {
-			media: libBase.Media.Text, body: Buffer.from(body, 'utf-8')
+			media: libBase.Media.Text, body: Buffer.from(content, 'utf-8')
 		});
 	}
 
-	/** respond with [not-found] and a default text response; cache policy defaults to [private] */
-	public respondNotFound(options?: { headers?: Record<string, string>, cache?: CachePolicy }): void {
+	/** respond with [not-found] and a default response or a custom text response; cache policy defaults to [private] */
+	public respondNotFound(options?: { message?: string, headers?: Record<string, string>, cache?: CachePolicy }): void {
 		const header = (options?.headers ?? {});
 		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
-		this.constructQuickResponse(libBase.Status.NotFound, null, header, {
-			media: libBase.Media.Text, body: Buffer.from(`Resource [${this.url.pathname}] could not be found.`, 'utf-8')
+		const content: string = (options?.message ?? `Resource [${this.url.pathname}] could not be found.`);
+		this.constructQuickResponse(libBase.Status.NotFound, (options?.message ?? null), header, {
+			media: libBase.Media.Text, body: Buffer.from(content, 'utf-8')
+		});
+	}
+
+	/** respond with [created] and a default response or a custom text response; cache policy defaults to [private] */
+	public respondCreated(target: string, options?: { message?: string, headers?: Record<string, string>, cache?: CachePolicy }): void {
+		const header = (options?.headers ?? {});
+		header['Location'] = target;
+		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
+
+		const content: string = (options?.message ?? `Resource [${this.url.pathname}] successfully created:\n${target}`);
+		this.constructQuickResponse(libBase.Status.Created, (options?.message == null ? target : `[${target}]: ${options.message}`), header, {
+			media: libBase.Media.Text, body: Buffer.from(content, 'utf-8')
 		});
 	}
 
@@ -1366,17 +1380,6 @@ export class ClientRequest extends ClientBase {
 
 		this.constructQuickResponse(libBase.Status.HttpVersionNotSupported, minVersion, header, {
 			media: libBase.Media.Text, body: Buffer.from(`Resource [${this.url.pathname}] requires at least [${minVersion}].`, 'utf-8')
-		});
-	}
-
-	/** respond with [created] and a default text response; cache policy defaults to [private] */
-	public respondCreated(target: string, options?: { headers?: Record<string, string>, cache?: CachePolicy }): void {
-		const header = (options?.headers ?? {});
-		header['Location'] = target;
-		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
-
-		this.constructQuickResponse(libBase.Status.Created, target, header, {
-			media: libBase.Media.Text, body: Buffer.from(`Resource [${this.url.pathname}] successfully created:\n${target}`, 'utf-8')
 		});
 	}
 
