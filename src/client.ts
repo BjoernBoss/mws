@@ -888,7 +888,7 @@ export class ClientRequest extends ClientBase {
 
 				/* forward the module-supplied error and ensure the connection is closed */
 				else
-					this.breakWithResponse(`Response closed prematurely: ${err.message}`, false, false, (desc, _) => this.badClientUsage(desc, true));
+					this.breakWithResponse(`Response error: ${err.message}`, false, false, (desc, _) => this.respondInternalError(desc, { headers }));
 				return cb(err);
 			}
 		);
