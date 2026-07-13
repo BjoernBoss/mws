@@ -51,7 +51,9 @@ export class Server extends libLog.Logger {
 		return Listener._fromParams(this, handler, ++this._nextEndpoint, this._stop, options ?? {});
 	}
 
-	/** shutdown the server and unlink all modules (immediately kills all open connections and listener; can be called multiple times) */
+	/** shutdown the server and unlink all modules (immediately kills all open connections
+	 *	and listener; can be called multiple times; must not be awaited from within the
+	 *	request or stop handling of an attached module, as this can lead to deadlocks) */
 	public stop(): Promise<void> {
 		if (this._stop.stopping)
 			return this._stop.stoppedPromise;
@@ -82,7 +84,8 @@ export class Server extends libLog.Logger {
 		return this._config;
 	}
 
-	/** resolves once the server has stopped */
+	/** resolves once the server has stopped (must not be awaited from within the
+	 *	request or stop handling of an attached module, as this can lead to deadlocks) */
 	public get stopped(): Promise<void> {
 		return this._stop.stoppedPromise;
 	}
@@ -330,7 +333,8 @@ export class Listener {
 		return this._config;
 	}
 
-	/** stop the listener and return promise which resolves once fully stopped */
+	/** stop the listener and return promise which resolves once fully stopped (must not be awaited from
+	 *	within the request or stop handling of the attached module tree, as this can lead to deadlocks) */
 	public stop(): Promise<void> {
 		if (this._stop.stopping)
 			return this._stop.stoppedPromise;
@@ -378,7 +382,8 @@ export class Listener {
 		return this._stop.stoppedPromise;
 	}
 
-	/** resolves once the server has stopped */
+	/** resolves once the listener has stopped (must not be awaited from within the request
+	 *	or stop handling of the attached module tree, as this can lead to deadlocks) */
 	public get stopped(): Promise<void> {
 		return this._stop.stoppedPromise;
 	}

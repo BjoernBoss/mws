@@ -1165,12 +1165,17 @@ export class ClientRequest extends ClientBase {
 		return (this._state.response != ResponseState.none || this._state.receive != ReceiveState.none || this._dropped);
 	}
 
-	/** resolves whenever the response has been determined (a response header has been sent or the connection was dropped) */
+	/** resolves whenever the response has been determined (a response header has been sent or the connection was
+	 *	dropped; must only be awaited while a response can still be produced elsewhere, such as by concurrently
+	 *	dispatched modules or background tasks - awaiting it as the sole handler without responding will stall
+	 *	the request until the connection is closed externally) */
 	public get responded(): Promise<void> {
 		return this._state.respondedPromise;
 	}
 
-	/** resolves whenever the request has been fully processed */
+	/** resolves whenever the request has been fully processed (will first resolve after all handlers of the request
+	 *	have returned; must not be awaited from within any handler of the request itself - not even after fully
+	 *	responding - as this will lead to deadlocks) */
 	public get completed(): Promise<void> {
 		return this._state.completedPromise;
 	}
@@ -1969,7 +1974,8 @@ export class ClientSocket extends ClientBase {
 		}
 	}
 
-	/** close the web socket (promise resolved once the close callback has been fully invoked) */
+	/** close the web socket (promise resolved once the close callback has been fully invoked;
+	 *	must not be awaited within a message handler, as this can lead to deadlocks) */
 	public close(): Promise<void> {
 		if (this._closing.promise == null) {
 			this._ws.close();
