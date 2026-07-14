@@ -160,14 +160,14 @@ class HttpRequestResponse extends libStream.Writable {
 	public status: libBase.StatusType;
 	public headers: Record<string, string>;
 	public contentSize: number | null;
-	public dynamicEncode: boolean;
+	public disableEncoding: boolean;
 	public contentType: libBase.MediaType;
 	public headerSent: boolean;
 	public encodingFailed: boolean;
 	public responseCompleted: boolean;
 
 	constructor(writer: libStream.Writable, status: libBase.StatusType, headers: Record<string, string>, contentSize: number | null, contentType: libBase.MediaType,
-		dynamicEncode: boolean, handleData: (chunk: Buffer | null, cb: (err: any) => void) => void, destroy: (err: any, cb: (err: any) => void) => void
+		disableEncoding: boolean, handleData: (chunk: Buffer | null, cb: (err: any) => void) => void, destroy: (err: any, cb: (err: any) => void) => void
 	) {
 		super({
 			write: (chunk, _, cb) => handleData(chunk, cb),
@@ -180,7 +180,7 @@ class HttpRequestResponse extends libStream.Writable {
 		this.status = status;
 		this.headers = headers;
 		this.contentSize = contentSize;
-		this.dynamicEncode = dynamicEncode;
+		this.disableEncoding = disableEncoding;
 		this.contentType = contentType;
 		this.headerSent = false;
 		this.encodingFailed = false;
@@ -373,8 +373,6 @@ export class ClientRequest extends ClientBase {
 	}
 
 	private constructQuickResponse(status: libBase.StatusType, logReason: string | null, headers: Record<string, string>, content?: { media: libBase.MediaType, body?: Buffer } | null): void {
-		if (headers == null)
-			headers = {};
 		const description = `${this.isHead ? 'HEAD:' : ''}[${status.msg}]${logReason == null ? '' : `: ${logReason}`}`;
 
 		/* check if the response can still be sent */
@@ -740,7 +738,7 @@ export class ClientRequest extends ClientBase {
 			fullContentSize = (chunk?.byteLength ?? 0);
 
 		/* check if the content should be dynamically encoded */
-		if (!resp.dynamicEncode) {
+		if (resp.disableEncoding) {
 			if (!this.closeHeader(resp.status, resp.headers, { media: resp.contentType, size: fullContentSize ?? undefined }))
 				return cb(null);
 			return this.sendClientWrite(resp, chunk, last, cb);
@@ -826,7 +824,7 @@ export class ClientRequest extends ClientBase {
 		else
 			resp.writer.end(() => cb(null));
 	}
-	private sendClientData(status: libBase.StatusType, media: libBase.MediaType, headers: Record<string, string>, dynamicEncode: boolean, contentSize: number | null): libStream.Writable {
+	private sendClientData(status: libBase.StatusType, media: libBase.MediaType, headers: Record<string, string>, disableEncoding: boolean, contentSize: number | null): libStream.Writable {
 		const makeErrorStream = (msg: string) => new libStream.Writable({ write(_0, _1, cb) { cb(new Error(msg)) }, final(cb) { cb(new Error(msg)) } });
 
 		/* check if the object is already responded */
@@ -839,7 +837,7 @@ export class ClientRequest extends ClientBase {
 		this._state.response = ResponseState.preparing;
 
 		/* construct the actual response wrapper, which takes care of dynamic encoding and error handling */
-		const output = new HttpRequestResponse(this._native.writer, status, headers, contentSize, media, dynamicEncode,
+		const output = new HttpRequestResponse(this._native.writer, status, headers, contentSize, media, disableEncoding,
 			(chunk: Buffer | null, cb: (err: any) => void) => {
 				if (output.destroyed)
 					return cb(new Error('Already failed'));
@@ -1302,7 +1300,7 @@ export class ClientRequest extends ClientBase {
 	}
 
 	/** respond with a any response of the given configuration (defaults to media-type: text/unknown/-, status: ok); if [lightResponse], the
-	 *	content length is suppressed for head responses (to accomodate short-circuiting responding); cache policy defaults to [private] */
+	 *	content length is suppressed for head responses (to accommodate short-circuiting responding); cache policy defaults to [private] */
 	public respond(content: string | Buffer | null, options?: { media?: libBase.MediaType, status?: libBase.StatusType, headers?: Record<string, string>, lightResponse?: boolean, cache?: CachePolicy }): void {
 		const status = options?.status ?? libBase.Status.Ok;
 		const header = (options?.headers ?? {});
@@ -1317,8 +1315,8 @@ export class ClientRequest extends ClientBase {
 		else if (options?.media == null)
 			media = libBase.Media.Unknown;
 
-		this.constructQuickResponse(status, `[${media.mediaType}] and size [${content.byteLength}]`, header, {
-			media, body: (options?.lightResponse && this.isHead ? undefined : content)
+		this.constructQuickResponse(status, `[${media.mediaType}] of size [${content.byteLength}]`, header, {
+			media, body: ((options?.lightResponse && this.isHead) ? undefined : content)
 		});
 	}
 
@@ -1513,8 +1511,8 @@ export class ClientRequest extends ClientBase {
 		});
 	}
 
-	/** respond with html, can be built on by parent modules, sent once the request has been fully processed (default status is
-	 *	ok; for HEAD builds, no actual content will be constructed or estimated in size); cache policy defaults to [private] */
+	/** respond with html, can be built on by parent modules, sent once the request has been fully processed (default status is ok;
+	 *	for HEAD builds, no actual content will be constructed, nor will its size be estimated); cache policy defaults to [private] */
 	public respondHtml(page: libBuilder.HtmlPage, options?: { status?: libBase.StatusType, headers?: Record<string, string>, cache?: CachePolicy }): void {
 		if (this._dropped || (this._state.response != ResponseState.none && this._state.response != ResponseState.preparing))
 			return this.badClientUsage('HTML response on already claimed connection', false);
@@ -1530,21 +1528,34 @@ export class ClientRequest extends ClientBase {
 
 		/* mark first as completed now */
 		const content = (this.isHead ? undefined : Buffer.from(page.finalize(), 'utf-8'));
-		this.log(`Responding with HTML content and status [${status.msg}]${this.isHead ? ' as light-build' : ''}`);
+		this.log(`Responding with HTML content and status [${status.msg}]${this.isHead ? ' as light-response' : ''}`);
 		this.sendFullResponse(status, headers, { media: libBase.Media.Html, body: content });
 	}
 
+	/** respond with the value encoded as json; if [isJson], the content is expected to be a valid json string (default status is ok;
+	 *	for HEAD builds, no actual content will be constructed, nor will its size be estimated); cache policy defaults to [private] */
+	public respondJson(value: any, options?: { status?: libBase.StatusType, headers?: Record<string, string>, cache?: CachePolicy, isJson?: boolean }): void {
+		const status = options?.status ?? libBase.Status.Ok;
+		const header = (options?.headers ?? {});
+		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
+
+		const content = Buffer.from((options?.isJson ? (value as string) : JSON.stringify(value)), 'utf-8');
+		this.constructQuickResponse(status, `JSON of size [${content.byteLength}]`, header, {
+			media: libBase.Media.Json, body: (this.isHead ? undefined : content)
+		});
+	}
+
 	/** [no-throw but errors, register 'error' handler] send data with [media type] and [status] and return a writable stream (default: status is ok, media is
-	 *	unknown, dynamicEncode is true); if a content size is provided, stream expects exactly this amount of bytes; if [dynamicEncode], the encoder will be
-	 *	dynamically negotiated based on the content; for a HEAD request, no encoding will be negotiated, no lengths verified, and the written data will just be
-	 *	drained (can immediately be ended using '.end()'); cache policy defaults to [private]; errors will automatically close the client connection properly */
-	public respondData(options?: { status?: libBase.StatusType, media?: libBase.MediaType, contentSize?: number, dynamicEncode?: boolean, headers?: Record<string, string>, cache?: CachePolicy }): libStream.Writable {
+	 *	unknown, disableEncoding is false); if a content size is provided, stream expects exactly this amount of bytes; if [disableEncoding], the encoder will not
+	 *	be dynamically negotiated based on the content; for a HEAD request, no lengths will be verified, and the written data will just be drained (can immediately
+	 *	be ended using '.end()'); cache policy defaults to [private]; errors will automatically close the client connection properly */
+	public respondData(options?: { status?: libBase.StatusType, media?: libBase.MediaType, contentSize?: number, disableEncoding?: boolean, headers?: Record<string, string>, cache?: CachePolicy }): libStream.Writable {
 		const status: libBase.StatusType = options?.status ?? libBase.Status.Ok;
 		const headers = (options?.headers ?? {});
 		this.applyCachePolicy(headers, CachePolicy.private, options?.cache);
 
 		this.log(`Responding with data and status [${status.msg}]`);
-		return this.sendClientData(status, options?.media ?? libBase.Media.Unknown, headers, options?.dynamicEncode ?? true, options?.contentSize ?? null);
+		return this.sendClientData(status, options?.media ?? libBase.Media.Unknown, headers, options?.disableEncoding ?? false, options?.contentSize ?? null);
 	}
 
 	/** try to respond with the given file, return false, if the file does not exist (range aware, HEAD aware); specify [checkFreshness]
@@ -1646,7 +1657,7 @@ export class ClientRequest extends ClientBase {
 
 		/* create the writer stream (doesn't throw, but errors; enforce the selected encoder) */
 		const status = (range.state == libHelper.RangeState.noRange ? libBase.Status.Ok : libBase.Status.PartialContent);
-		let stream = this.sendClientData(status, media, headers, false, (reader == null ? range.last - range.first + 1 : reader.contentSize()));
+		let stream = this.sendClientData(status, media, headers, true, (reader == null ? range.last - range.first + 1 : reader.contentSize()));
 
 		let logMsg = `Responding with file-${this.isHead ? 'HEAD' : 'content'} [${range.first} - ${range.last}/${cached.fileSize()}] from [${filePath}]`;
 		if (reader != null) {

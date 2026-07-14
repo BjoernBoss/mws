@@ -240,7 +240,8 @@ const created = await client.receiveToFile('/uploads/file.bin', 10_000_000, { cr
 client.respond('OK', { media: Media.Text, status: Status.Ok });
 
 /* streaming response */
-const writer = client.respondData({ media: Media.Json, dynamicEncode: true });
+const writer = client.respondData({ media: Media.Json, disableEncoding: true });
+writer.once('error', (e) => failure(e));
 writer.end(JSON.stringify(data));
 
 /* file with automatic range requests, etag, last-modified, encoding, and caching */
