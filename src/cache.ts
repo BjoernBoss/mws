@@ -764,6 +764,11 @@ export interface EncodedCache {
 	readSync(): Buffer;
 }
 
+/** wrapper for readable stream, which also exposes the file size */
+export interface SizedReadable extends libStream.Readable {
+	fileSize: number;
+}
+
 /**
  *	all cache host operations which may throw errors and will not log them, and dont guarantee to contain the failing file path;
  *	every error - thrown or emitted by a returned stream - carries the [code] property of the underlying failure (system error
@@ -871,17 +876,19 @@ export class CacheHost extends libLog.Logger {
 	 *	(designed for modules to interact with); if [eager], the file is opened at creation: creation failures throw,
 	 *	a file having vanished since the lookup returns null, and the returned stream must be consumed or destroyed to
 	 *	release the file; otherwise creation failures error on the stream (in which case ENOENT cannot be mapped to null) */
-	public stream(path: string, options?: { checkFreshness?: boolean, eager?: boolean }): libStream.Readable | null {
-		const entry = this.resolveCache(path, options?.checkFreshness ?? false, false) as (Cached | null);
-		if (entry == null)
-			return null;
-		if (options?.eager !== true)
-			return entry.stream();
+	public stream(path: string, options?: { checkFreshness?: boolean, eager?: boolean }): SizedReadable | null {
+		try {
+			const entry = this.resolveCache(path, options?.checkFreshness ?? false, false) as (Cached | null);
+			if (entry == null)
+				return null;
+
+			const wrapped = entry.stream({ eager: options?.eager }) as SizedReadable;
+			wrapped.fileSize = entry.fileSize();
+			return wrapped;
+		}
 
 		/* special abstraction to ensure check-before-use does not result in not-found */
-		try {
-			return entry.stream({ eager: true });
-		} catch (err: any) {
+		catch (err: any) {
 			if (err.code == 'ENOENT')
 				return null;
 			throw err;
