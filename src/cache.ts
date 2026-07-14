@@ -32,6 +32,42 @@ function wrapError(err: any, message: string): NodeJS.ErrnoException {
 		wrapped.code = err.code;
 	return wrapped;
 }
+function sniffStream(stream: libStream.Readable, maxSize: number | null, callback: (data: Buffer) => void): libStream.Readable {
+	let buffers: Buffer[] = [], settled: boolean = false, totalLength: number = 0;
+
+	/* create the transformer stream to cache the data (once an error has settled
+	*	the streams, just pass any data through and skip the caching entirely) */
+	const sniffer = new libStream.Transform({
+		transform: (chunk, _, cb) => {
+			if (!settled) {
+				totalLength += chunk.byteLength;
+				if (maxSize == null || totalLength <= maxSize)
+					buffers.push(chunk);
+				else
+					settled = true, buffers = [];
+			}
+			cb(null, chunk);
+		},
+		final: (cb) => {
+			if (!settled)
+				callback(Buffer.concat(buffers));
+			settled = true;
+			cb(null);
+		}
+	});
+
+	/* setup the exception propagation and return the readable stream */
+	stream.pipe(sniffer);
+	stream.once('error', (err: any) => {
+		settled = true;
+		sniffer.destroy(err);
+	});
+	sniffer.once('error', (err: any) => {
+		settled = true;
+		stream.destroy(err);
+	});
+	return sniffer;
+}
 async function atomicWrite(path: string, content: Buffer | libStream.Readable, logger: libLog.Logger, options?: { what?: string, temporary?: string, create?: boolean }): Promise<boolean> {
 	const tempPath = (options?.temporary ?? `${path}.temp`), create = (options?.create === true);
 	if (options?.what != '')
@@ -534,35 +570,11 @@ class NotCached implements Cached {
 		if (!this.cache.cacheable(this.size) || (options?.start != null && options.start != 0) || (options?.end != null && options.end + 1 != this.size))
 			return stream;
 
-		/* create the transformer stream to cache the data (once an error has settled
-		*	the streams, just pass any data through and skip the caching entirely) */
-		let buffers: Buffer[] = [], settled: boolean = false, totalLength: number = 0;
-		const sniffer = new libStream.Transform({
-			transform: (chunk, _, cb) => {
-				if (!settled) {
-					totalLength += chunk.byteLength;
-					buffers.push(chunk);
-				}
-				cb(null, chunk);
-			},
-			final: (cb) => {
-				if (!settled && totalLength == this.size)
-					this.cache.add(this.path, Buffer.concat(buffers), this.mtime, this.age);
-				cb(null);
-			}
+		/* create the stream-sniffer to collect the data and write them to the cache */
+		return sniffStream(stream, this.size, (data: Buffer) => {
+			if (data.byteLength == this.size)
+				this.cache.add(this.path, data, this.mtime, this.age);
 		});
-
-		/* setup the file exceptions to be propagated to the stream */
-		stream.pipe(sniffer);
-		stream.once('error', (err: any) => {
-			if (settled) return; settled = true;
-			sniffer.destroy(err);
-		});
-		sniffer.once('error', (err: any) => {
-			if (settled) return; settled = true;
-			stream.destroy(err);
-		});
-		return sniffer;
 	}
 
 	public isImmutable(): boolean {
@@ -769,6 +781,13 @@ export interface SizedReadable extends libStream.Readable {
 	fileSize: number;
 }
 
+/** create a sized-readable stream from a normal stream (stream must exactly produce the given number of bytes, or an error) */
+export function createSizedReadable(stream: libStream.Readable, fileSize: number): SizedReadable {
+	const wrapped = stream as SizedReadable;
+	wrapped.fileSize = fileSize;
+	return wrapped;
+}
+
 /**
  *	all cache host operations which may throw errors and will not log them, and dont guarantee to contain the failing file path;
  *	every error - thrown or emitted by a returned stream - carries the [code] property of the underlying failure (system error
@@ -881,10 +900,7 @@ export class CacheHost extends libLog.Logger {
 			const entry = this.resolveCache(path, options?.checkFreshness ?? false, false) as (Cached | null);
 			if (entry == null)
 				return null;
-
-			const wrapped = entry.stream({ eager: options?.eager }) as SizedReadable;
-			wrapped.fileSize = entry.fileSize();
-			return wrapped;
+			return createSizedReadable(entry.stream({ eager: options?.eager }), entry.fileSize());
 		}
 
 		/* special abstraction to ensure check-before-use does not result in not-found */
@@ -899,15 +915,31 @@ export class CacheHost extends libLog.Logger {
 	 *	interact with; writes as utf-8; writes data first to temporary file and then replaces the file atomically;
 	 *	for create: must not replace an existing file; for create: returns false if the file already existed and
 	 *	could not be created, otherwise, returns always true; empty what string will not log anything) */
-	public async write(path: string, data: Buffer | string | libStream.Readable, options?: { what?: string, temporary?: string, create?: boolean }): Promise<boolean> {
+	public async write(path: string, data: Buffer | string | libStream.Readable | SizedReadable, options?: { what?: string, temporary?: string, create?: boolean }): Promise<boolean> {
+		let collected: Buffer | null = null;
 		if (typeof data == 'string')
 			data = Buffer.from(data, 'utf-8');
+
+		/* check if the data are an instance of the sized stream and collect the data to be written to the cache */
+		else if (data instanceof libStream.Readable && typeof (data as any).fileSize == 'number') {
+			const streamSize = (data as SizedReadable).fileSize;
+
+			/* check if the stream could be cached in theory to be written to the cache */
+			if (this._cacheManager.cacheable(streamSize)) {
+				data = sniffStream(data, streamSize, (data: Buffer) => {
+					if (data.byteLength == streamSize)
+						collected = data;
+				});
+			}
+		}
 
 		/* write the data atomically to the destination (let errors propagate out) */
 		if (!await atomicWrite(path, data, this, { what: (options?.what ?? 'via cache'), temporary: options?.temporary, create: options?.create }))
 			return false;
 
-		/* check if the file is a stream (will not be streamed into the cache, as size is unknown) or does not fit into the cache */
+		/* check if the data are available and can be written to the cache (streamed data will not be cached, as their size cannot be determined) */
+		if (collected != null)
+			data = collected;
 		if (data instanceof libStream.Readable || !this._cacheManager.cacheable(data.byteLength))
 			return true;
 		const age = this._cacheManager.allocAge();
