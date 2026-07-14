@@ -839,9 +839,6 @@ export class ClientRequest extends ClientBase {
 		/* construct the actual response wrapper, which takes care of dynamic encoding and error handling */
 		const output = new HttpRequestResponse(this._native.writer, status, headers, contentSize, media, disableEncoding,
 			(chunk: Buffer | null, cb: (err: any) => void) => {
-				if (output.destroyed)
-					return cb(new Error('Already failed'));
-
 				/* check if this is a head-request, in which case the data will just be drained */
 				if (this.isHead && output.responseCompleted)
 					return cb(null);
@@ -919,8 +916,6 @@ export class ClientRequest extends ClientBase {
 		let accumulated = 0;
 		const output = new libStream.Transform({
 			transform: (chunk, _, cb) => {
-				if (output.destroyed)
-					return cb(new Error('Already failed'));
 				if (this._dropped)
 					return cb(new Error('Connection broken'));
 
@@ -1604,7 +1599,7 @@ export class ClientRequest extends ClientBase {
 			reader = cached.encoded(dynamicEncoder);
 
 		/* mark byte-ranges to be supported in principle and add the caching properties */
-		const headers = (options.headers ?? {});
+		const headers = { ...options.headers };
 		const etag = `${(dynamicEncoder != null) ? 'W/' : ''}"${cached.uniqueId()}"`;
 		headers['Vary'] = 'Accept-Encoding';
 		if (dynamicEncoder != null || options.encoded != null)
@@ -1654,9 +1649,24 @@ export class ClientRequest extends ClientBase {
 		}
 		if (range.state == libHelper.RangeState.valid)
 			headers['Content-Range'] = `bytes ${range.first}-${range.last}/${cached.fileSize()}`;
+		const status = (range.state == libHelper.RangeState.noRange ? libBase.Status.Ok : libBase.Status.PartialContent);
+
+		/* create the source stream of the file eagerly, to ensure creation failures can still be answered with a proper
+		*	response (not for HEAD requests, as no content is produced; a file having vanished since the cache lookup counts
+		*	as not-found; the stream is guaranteed to be consumed or destroyed by the pipeline further down) */
+		let source: libStream.Readable | null = null;
+		if (!this.isHead) {
+			try {
+				source = (reader != null ? reader.stream({ eager: true }) : cached.stream({ start: range.first, end: range.last, eager: true }));
+			} catch (err: any) {
+				if (err.code == 'ENOENT')
+					return false;
+				this.respondInternalError(`Failed to open file [${filePath}]: ${err.message}`);
+				return true;
+			}
+		}
 
 		/* create the writer stream (doesn't throw, but errors; enforce the selected encoder) */
-		const status = (range.state == libHelper.RangeState.noRange ? libBase.Status.Ok : libBase.Status.PartialContent);
 		let stream = this.sendClientData(status, media, headers, true, (reader == null ? range.last - range.first + 1 : reader.contentSize()));
 
 		let logMsg = `Responding with file-${this.isHead ? 'HEAD' : 'content'} [${range.first} - ${range.last}/${cached.fileSize()}] from [${filePath}]`;
@@ -1678,9 +1688,8 @@ export class ClientRequest extends ClientBase {
 			return true;
 		}
 
-		/* create the source stream of the file to read from (will not throw any exceptions; no need to respond with internal errors, as the stream will already do so) */
-		const source: libStream.Readable = (reader != null ? reader.stream() : cached.stream({ start: range.first, end: range.last }));
-		await new Promise<void>((resolve) => libStream.pipeline(source, stream, (err: any) => {
+		/* stream the file content out (open failures have already been handled at creation; remaining stream errors are rare and can only break the connection) */
+		await new Promise<void>((resolve) => libStream.pipeline(source!, stream, (err: any) => {
 			if (err != null)
 				this.error(`Failed to stream file [${filePath}]: ${err.message}`);
 			resolve();
@@ -1693,26 +1702,6 @@ export class ClientRequest extends ClientBase {
 	 *	error or logs); an 'error' handler must be attached to the returned stream, as the framework will destroy it with an error on broken connections */
 	public receiveData(maxLength: number | null): libStream.Readable {
 		return this.receiveClientData(maxLength);
-	}
-
-	/** [throws] receive the payload of given max length and write it directly to a file; automatically responds to all errors; writes the file atomically
-	 *	via the cache by either writing it to a temporary file, and then swapping it, or creating it in-place but fail, if the file already exists */
-	public async receiveToFile(path: string, maxLength: number | null, options?: { temporary?: string, create?: boolean }): Promise<void> {
-		this.trace(`Collecting data to: [${path}]`);
-
-		try {
-			/* just let errors close the reader, as it will not close the underlying request, just the pass-through reader */
-			const stream: libStream.Readable = this.receiveClientData(maxLength);
-			if (await this.cache.write(path, stream, { what: '', temporary: options?.temporary, create: options?.create }))
-				return;
-			this.respondConflict({ reason: 'Path already exists' });
-			throw new Error('Path already exists');
-		} catch (err: any) {
-			/* no need to respond on dropped connections, as this will already have been logged */
-			if (!this._dropped)
-				this.respondInternalError(`Failed to write uploaded file: ${err.message}`);
-			throw err;
-		}
 	}
 
 	/** [throws] receive the payload of given max length as a single complete buffer

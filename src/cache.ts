@@ -24,6 +24,14 @@ function readStats(path: string): null | [number, number] {
 	}
 	return null;
 }
+function wrapError(err: any, message: string): NodeJS.ErrnoException {
+	/* rewrap the error to attach context to the message, but preserve the system
+	*	error code and keep the original error accessible via the cause */
+	const wrapped: NodeJS.ErrnoException = new Error(`${message}: ${err.message}`, { cause: err });
+	if (typeof err?.code == 'string')
+		wrapped.code = err.code;
+	return wrapped;
+}
 async function atomicWrite(path: string, content: Buffer | libStream.Readable, logger: libLog.Logger, options?: { what?: string, temporary?: string, create?: boolean }): Promise<boolean> {
 	const tempPath = (options?.temporary ?? `${path}.temp`), create = (options?.create === true);
 	if (options?.what != '')
@@ -69,10 +77,10 @@ async function atomicWrite(path: string, content: Buffer | libStream.Readable, l
 		}
 
 		if (written)
-			throw new Error(`Replace the original file: ${err.message}`);
+			throw wrapError(err, 'Replace the original file');
 		else if (create)
-			throw new Error(`Create file: ${err.message}`);
-		throw new Error(`Write to temporary file [${tempPath}]: ${err.message}`);
+			throw wrapError(err, 'Create file');
+		throw wrapError(err, `Write to temporary file [${tempPath}]`);
 	}
 	return true;
 }
@@ -478,7 +486,7 @@ class AlreadyCached implements Cached {
 	public uniqueId(): string {
 		return `${this.entry.mtime}-${this.entry.data.byteLength}`;
 	}
-	public stream(options?: { start?: number, end?: number }): libStream.Readable {
+	public stream(options?: { start?: number, end?: number, eager?: boolean }): libStream.Readable {
 		return libStream.Readable.from(this.entry.data.subarray(options?.start, (options?.end == null ? undefined : options.end + 1)));
 	}
 	public async read(): Promise<Buffer> {
@@ -507,31 +515,38 @@ class NotCached implements Cached {
 		this.immutable = immutable;
 		this.age = age;
 	}
-	private makeStream(options?: { start?: number, end?: number }): libStream.Readable {
-		/* create the data stream */
+	private makeStream(options?: { start?: number, end?: number, eager?: boolean }): libStream.Readable {
 		let stream: libFs.ReadStream | null = null;
-		try {
+
+		/* create the data stream (eager: open the file immediately and let creation failures
+		*	throw; otherwise open failures will be emitted as errors on the stream itself) */
+		if (options?.eager === true) {
+			const fd = libFs.openSync(this.path, 'r');
+			stream = libFs.createReadStream('', { fd, start: options?.start, end: options?.end });
+		}
+		else try {
 			stream = libFs.createReadStream(this.path, { flags: 'r', start: options?.start, end: options?.end });
 		} catch (err: any) {
-			return new libStream.Readable({ read() { this.destroy(new Error(`Reading file: ${err.message}`)) } });
+			return new libStream.Readable({ read() { this.destroy(wrapError(err, 'Reading file')) } });
 		}
 
 		/* check if only a partial file is being read, or it is too large, in which case it will not be added to the cache */
 		if (!this.cache.cacheable(this.size) || (options?.start != null && options.start != 0) || (options?.end != null && options.end + 1 != this.size))
 			return stream;
 
-		/* create the transformer stream to cache the data */
+		/* create the transformer stream to cache the data (once an error has settled
+		*	the streams, just pass any data through and skip the caching entirely) */
 		let buffers: Buffer[] = [], settled: boolean = false, totalLength: number = 0;
 		const sniffer = new libStream.Transform({
 			transform: (chunk, _, cb) => {
-				if (settled) return cb(new Error('Reading already completed'));
-				totalLength += chunk.byteLength;
-				buffers.push(chunk);
+				if (!settled) {
+					totalLength += chunk.byteLength;
+					buffers.push(chunk);
+				}
 				cb(null, chunk);
 			},
 			final: (cb) => {
-				if (settled) return cb(new Error('Reading already completed'));
-				if (totalLength == this.size)
+				if (!settled && totalLength == this.size)
 					this.cache.add(this.path, Buffer.concat(buffers), this.mtime, this.age);
 				cb(null);
 			}
@@ -565,7 +580,7 @@ class NotCached implements Cached {
 	public uniqueId(): string {
 		return `${this.mtime}-${this.size}`;
 	}
-	public stream(options?: { start?: number, end?: number }): libStream.Readable {
+	public stream(options?: { start?: number, end?: number, eager?: boolean }): libStream.Readable {
 		return this.makeStream(options);
 	}
 	public async read(): Promise<Buffer> {
@@ -615,7 +630,7 @@ function EncodedCache(cache: CacheManager, reader: Cached, entry: CacheEntry | n
 	if (encoding == null) {
 		return {
 			contentSize: () => reader.fileSize(),
-			stream: () => reader.stream(),
+			stream: (options?: { eager?: boolean }) => reader.stream({ eager: options?.eager }),
 			read: () => reader.read(),
 			readSync: () => reader.readSync()
 		};
@@ -632,11 +647,11 @@ function EncodedCache(cache: CacheManager, reader: Cached, entry: CacheEntry | n
 		};
 	}
 
-	const makeStream: () => libStream.Readable = () => {
+	const makeStream: (eager?: boolean) => libStream.Readable = (eager?: boolean) => {
 		let settled: boolean = false;
 
-		/* create the encoded pipe */
-		const stream = reader.stream();
+		/* create the encoded pipe (eager: let creation failures of the source stream throw) */
+		const stream = reader.stream({ eager });
 		const encoder = encoding.makeEncode();
 		let sniffer: libStream.Transform | null = null;
 		stream.pipe(encoder);
@@ -659,17 +674,18 @@ function EncodedCache(cache: CacheManager, reader: Cached, entry: CacheEntry | n
 		if (!cache.cacheable(reader.fileSize()))
 			return encoder;
 
-		/* setup the sniffer stream to collect the cached data */
+		/* setup the sniffer stream to collect the cached data (once an error has settled
+		*	the streams, just pass any data through and skip the caching entirely) */
 		let buffers: Buffer[] = [];
 		sniffer = new libStream.Transform({
 			transform: (chunk, _, cb) => {
-				if (settled) return cb(new Error('Reading already completed'));
-				buffers.push(chunk);
+				if (!settled)
+					buffers.push(chunk);
 				cb(null, chunk);
 			},
 			final: (cb) => {
-				if (settled) return cb(new Error('Reading already completed'));
-				cache.addEncoding(reader.filePath(), Buffer.concat(buffers), age, encoding.name);
+				if (!settled)
+					cache.addEncoding(reader.filePath(), Buffer.concat(buffers), age, encoding.name);
 				cb(null);
 			}
 		});
@@ -686,7 +702,7 @@ function EncodedCache(cache: CacheManager, reader: Cached, entry: CacheEntry | n
 	/* wrap the original reader around the encoder (let errors propagate out) */
 	return {
 		contentSize: () => null,
-		stream: () => makeStream(),
+		stream: (options?: { eager?: boolean }) => makeStream(options?.eager),
 		read: () => StreamToAsync(makeStream()),
 		readSync: () => {
 			/* will be returned as buffer anyways, so might as well
@@ -698,6 +714,7 @@ function EncodedCache(cache: CacheManager, reader: Cached, entry: CacheEntry | n
 	};
 }
 
+/** cached file entry to interact with (all errors follow the CacheHost error code conventions) */
 export interface Cached {
 	/** check if this is an immutable file entry */
 	isImmutable(): boolean;
@@ -715,8 +732,10 @@ export interface Cached {
 	 *	just like the cache identifies them as equivalent: size+last-modified) */
 	uniqueId(): string;
 
-	/** [no-throw but errors, register 'error' handler] object or encoded entry must not be used anymore after reading or streaming from it */
-	stream(options?: { start?: number, end?: number }): libStream.Readable;
+	/** [throws if eager, otherwise no-throw but errors, register 'error' handler] object or encoded entry must not be used anymore
+	 *	after reading or streaming from it; if [eager], the underlying file is opened at creation and creation failures throw (the
+	 *	returned stream must then be consumed or destroyed to release the file); otherwise creation failures error on the stream */
+	stream(options?: { start?: number, end?: number, eager?: boolean }): libStream.Readable;
 
 	/** [throws] object or encoded entry must not be used anymore after reading or streaming from it */
 	read(): Promise<Buffer>;
@@ -728,12 +747,15 @@ export interface Cached {
 	encoded(encoding?: libBase.EncodingType): EncodedCache;
 }
 
+/** encoded view of a cached file entry (all errors follow the CacheHost error code conventions) */
 export interface EncodedCache {
 	/** size in bytes of the encoding (null if not yet determined) */
 	contentSize(): number | null;
 
-	/** [no-throw but errors, register 'error' handler] object or encoded entry must not be used anymore after reading or streaming from it */
-	stream(): libStream.Readable;
+	/** [throws if eager, otherwise no-throw but errors, register 'error' handler] object or encoded entry must not be used anymore
+	 *	after reading or streaming from it; if [eager], the underlying file is opened at creation and creation failures throw (the
+	 *	returned stream must then be consumed or destroyed to release the file); otherwise creation failures error on the stream */
+	stream(options?: { eager?: boolean }): libStream.Readable;
 
 	/** [throws] object or encoded entry must not be used anymore after reading or streaming from it */
 	read(): Promise<Buffer>;
@@ -742,9 +764,11 @@ export interface EncodedCache {
 	readSync(): Buffer;
 }
 
-/** 
- *	all cache host operations which may throw errors and will not log them, and dont guarantee to contain the failing file path
- *	file operations with the cache ignore symlinks and will follow them at all times.
+/**
+ *	all cache host operations which may throw errors and will not log them, and dont guarantee to contain the failing file path;
+ *	every error - thrown or emitted by a returned stream - carries the [code] property of the underlying failure (system error
+ *	codes such as ENOENT, EACCES, ENOSPC, ..., or node/zlib stream codes); errors rewrapped for context preserve the code and
+ *	expose the original via [cause]; file operations with the cache ignore symlinks and will follow them at all times.
  */
 export class CacheHost extends libLog.Logger {
 	private _cacheManager: CacheManager;
@@ -843,13 +867,25 @@ export class CacheHost extends libLog.Logger {
 		}
 	}
 
-	/** [no-throw but errors, register 'error' handler] create a read stream of the data (designed for modules to interact with) */
-	public stream(path: string, options?: { checkFreshness?: boolean }): libStream.Readable | null {
-		/* let errors just propagate out (unable to catch ENOENT errors as they are embedded into the stream errors) */
+	/** [throws if eager, otherwise no-throw but errors, register 'error' handler] create a read stream of the data
+	 *	(designed for modules to interact with); if [eager], the file is opened at creation: creation failures throw,
+	 *	a file having vanished since the lookup returns null, and the returned stream must be consumed or destroyed to
+	 *	release the file; otherwise creation failures error on the stream (in which case ENOENT cannot be mapped to null) */
+	public stream(path: string, options?: { checkFreshness?: boolean, eager?: boolean }): libStream.Readable | null {
 		const entry = this.resolveCache(path, options?.checkFreshness ?? false, false) as (Cached | null);
 		if (entry == null)
 			return null;
-		return entry.stream();
+		if (options?.eager !== true)
+			return entry.stream();
+
+		/* special abstraction to ensure check-before-use does not result in not-found */
+		try {
+			return entry.stream({ eager: true });
+		} catch (err: any) {
+			if (err.code == 'ENOENT')
+				return null;
+			throw err;
+		}
 	}
 
 	/** [throws] write data atomically to the disk and conditionally update the cache (designed for modules to
