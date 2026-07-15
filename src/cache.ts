@@ -63,7 +63,7 @@ function sniffStream(stream: libStream.Readable, expected: number | null, callba
 	});
 	return sniffer;
 }
-async function atomicWrite(path: string, content: Buffer | libStream.Readable, logger: libLog.Logger, options?: { what?: string, temporary?: string, create?: boolean }): Promise<boolean> {
+async function atomicWrite(path: string, content: Buffer | libStream.Readable, logger: libLog.Logger, options?: { what?: string, temporary?: string, create?: boolean }): Promise<void> {
 	const tempPath = (options?.temporary ?? `${path}.temp`), create = (options?.create === true);
 	if (options?.what != '')
 		logger.trace(`Writing ${options?.what ?? 'data'} to [${path}]`);
@@ -76,8 +76,6 @@ async function atomicWrite(path: string, content: Buffer | libStream.Readable, l
 	} catch (err: any) {
 		if (content instanceof libStream.Readable)
 			content.destroy();
-		if (create && err.code == 'EEXIST')
-			return false;
 		if (create)
 			throw wrapError(err, 'Create file');
 		throw wrapError(err, `Create temporary file [${tempPath}]`);
@@ -123,7 +121,6 @@ async function atomicWrite(path: string, content: Buffer | libStream.Readable, l
 			throw wrapError(err, 'Write to file');
 		throw wrapError(err, `Write to temporary file [${tempPath}]`);
 	}
-	return true;
 }
 
 interface CacheEntry {
@@ -881,11 +878,10 @@ export class CacheHost extends libLog.Logger {
 		}
 	}
 
-	/** [throws] write data atomically to the disk and conditionally update the cache (designed for modules to
-	 *	interact with; writes as utf-8; writes data first to temporary file and then replaces the file atomically;
-	 *	for create: must not replace an existing file; for create: returns false if the file already existed and
-	 *	could not be created, otherwise, returns always true; empty what string will not log anything) */
-	public async write(path: string, data: Buffer | string | libStream.Readable | SizedReadable, options?: { what?: string, temporary?: string, create?: boolean }): Promise<boolean> {
+	/** [throws] write data atomically to the disk and conditionally update the cache (designed for modules
+	 *	to interact with; writes as utf-8; writes data first to temporary file and then replaces the file
+	 *	atomically; for create: must not replace an existing file; empty what string will not log anything) */
+	public async write(path: string, data: Buffer | string | libStream.Readable | SizedReadable, options?: { what?: string, temporary?: string, create?: boolean }): Promise<void> {
 		let collected: Buffer | null = null;
 		if (typeof data == 'string')
 			data = Buffer.from(data, 'utf-8');
@@ -895,14 +891,13 @@ export class CacheHost extends libLog.Logger {
 			data = sniffStream(data, data.fileSize, (sniffed: Buffer) => { collected = sniffed; });
 
 		/* write the data atomically to the destination (let errors propagate out) */
-		if (!await atomicWrite(path, data, this, { what: (options?.what ?? 'via cache'), temporary: options?.temporary, create: options?.create }))
-			return false;
+		await atomicWrite(path, data, this, { what: (options?.what ?? 'via cache'), temporary: options?.temporary, create: options?.create });
 
 		/* check if the data are available and can be written to the cache (unsized streamed data will not be cached, as their size cannot be determined) */
 		if (collected != null)
 			data = collected;
 		if (data instanceof libStream.Readable || !this._cacheManager.cacheable(data.byteLength))
-			return true;
+			return;
 		const age = this._cacheManager.allocAge();
 
 		/* fetch the new state and update the cache (let errors propagate out; only if the write-state seems consistent) */
@@ -911,7 +906,6 @@ export class CacheHost extends libLog.Logger {
 			this._cacheManager.drop(path);
 		else if (stats[0] == data.byteLength)
 			this._cacheManager.add(path, data, stats[1], age);
-		return true;
 	}
 
 	/** [throws] remove the data from the physical disk and from the cache (designed
