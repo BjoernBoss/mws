@@ -743,8 +743,8 @@ export interface SizedReadable extends libStream.Readable {
 	fileSize: number;
 }
 
-/** create a sized-readable stream from a normal stream (stream must exactly produce the given number of bytes, or
- *	an error; only streams branded by this function are recognized as sized - such as by isSizedReadable or write) */
+/** create a sized-readable stream from a normal stream (stream should exactly produce the given number of bytes, or an error; other behavior
+ *	may be treated as an error; only streams branded by this function are recognized as sized - such as by isSizedReadable or write) */
 export function createSizedReadable(stream: libStream.Readable, fileSize: number): SizedReadable {
 	const wrapped = stream as SizedReadable;
 	wrapped.fileSize = fileSize;
@@ -758,10 +758,11 @@ export function isSizedReadable(stream: unknown): stream is SizedReadable {
 }
 
 /**
- *	all cache host operations which may throw errors and will not log them, and dont guarantee to contain the failing file path;
- *	every error - thrown or emitted by a returned stream - carries the [code] property of the underlying failure (system error
- *	codes such as ENOENT, EACCES, ENOSPC, ..., or node/zlib stream codes); errors rewrapped for context preserve the code and
- *	expose the original via [cause]; file operations with the cache ignore symlinks and will follow them at all times.
+ *	all cache host operations which may throw errors and will not log them, and dont guarantee to contain the failing file path; every
+ *	error - thrown or emitted by a returned stream - carries the [code] property of the underlying failure (system error codes such as
+ *	ENOENT, EACCES, ENOSPC, ..., or node/zlib stream codes); errors originating from caller-provided streams (such as content streams
+ *	passed to write) only carry whatever [code] the caller attached to them, which may be none; errors rewrapped for context preserve
+ *	the code and expose the original via [cause]; file operations with the cache ignore symlinks and will follow them at all times.
  */
 export class CacheHost extends libLog.Logger {
 	private _cacheManager: CacheManager;
@@ -897,7 +898,7 @@ export class CacheHost extends libLog.Logger {
 		if (!await atomicWrite(path, data, this, { what: (options?.what ?? 'via cache'), temporary: options?.temporary, create: options?.create }))
 			return false;
 
-		/* check if the data are available and can be written to the cache (streamed data will not be cached, as their size cannot be determined) */
+		/* check if the data are available and can be written to the cache (unsized streamed data will not be cached, as their size cannot be determined) */
 		if (collected != null)
 			data = collected;
 		if (data instanceof libStream.Readable || !this._cacheManager.cacheable(data.byteLength))
