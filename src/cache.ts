@@ -11,6 +11,7 @@ import * as libCrypto from "crypto";
 const UNIQUE_ID_CHARS = '0123456789abcdefghijklmnopqrstuvwxyz'
 const UNIQUE_ID_LENGTH = 10;
 const ID_EXTENSION_REGEX = RegExp(`^\\.[${UNIQUE_ID_CHARS}]{${UNIQUE_ID_LENGTH}}$`, 'i');
+const SizedReadableBrand = Symbol('mws.sized-readable');
 
 function readStats(path: string): null | [number, number] {
 	try {
@@ -32,16 +33,15 @@ function wrapError(err: any, message: string): NodeJS.ErrnoException {
 		wrapped.code = err.code;
 	return wrapped;
 }
-function sniffStream(stream: libStream.Readable, maxSize: number | null, callback: (data: Buffer) => void): libStream.Readable {
+function sniffStream(stream: libStream.Readable, expected: number | null, callback: (data: Buffer) => void): libStream.Readable {
 	let buffers: Buffer[] = [], settled: boolean = false, totalLength: number = 0;
 
-	/* create the transformer stream to cache the data (once an error has settled
-	*	the streams, just pass any data through and skip the caching entirely) */
+	/* create the transformer stream to cache the data */
 	const sniffer = new libStream.Transform({
 		transform: (chunk, _, cb) => {
 			if (!settled) {
 				totalLength += chunk.byteLength;
-				if (maxSize == null || totalLength <= maxSize)
+				if (expected == null || totalLength <= expected)
 					buffers.push(chunk);
 				else
 					settled = true, buffers = [];
@@ -49,22 +49,17 @@ function sniffStream(stream: libStream.Readable, maxSize: number | null, callbac
 			cb(null, chunk);
 		},
 		final: (cb) => {
-			if (!settled)
+			if (!settled && (expected == null || totalLength == expected))
 				callback(Buffer.concat(buffers));
 			settled = true;
 			cb(null);
 		}
 	});
 
-	/* setup the exception propagation and return the readable stream */
-	stream.pipe(sniffer);
-	stream.once('error', (err: any) => {
-		settled = true;
-		sniffer.destroy(err);
-	});
-	sniffer.once('error', (err: any) => {
-		settled = true;
-		stream.destroy(err);
+	/* pipe the source stream data through the sniffer and ensure errors cleanup the internal state properly */
+	libStream.pipeline(stream, sniffer, (err: any) => {
+		if (err != null)
+			settled = true, buffers = [];
 	});
 	return sniffer;
 }
@@ -73,16 +68,28 @@ async function atomicWrite(path: string, content: Buffer | libStream.Readable, l
 	if (options?.what != '')
 		logger.trace(`Writing ${options?.what ?? 'data'} to [${path}]`);
 
+	/* eagerly create the destination file to let creation failures propagate out immediately and separately from any write failures (for
+	*	create: to detect an already existing file; an open-failure leaves the content stream unconsumed, hence release it explicitly) */
+	let handle: libFsPromises.FileHandle;
+	try {
+		handle = await libFsPromises.open((create ? path : tempPath), (create ? 'wx' : 'w'));
+	} catch (err: any) {
+		if (content instanceof libStream.Readable)
+			content.destroy();
+		if (create && err.code == 'EEXIST')
+			return false;
+		if (create)
+			throw wrapError(err, 'Create file');
+		throw wrapError(err, `Create temporary file [${tempPath}]`);
+	}
+
 	let written = false;
 	try {
-		/* check if a stream or buffer is being written */
+		/* check if a stream or buffer is being written (the file stream takes
+		*	ownership of the handle and closes it upon completion or destruction) */
 		if (content instanceof libStream.Readable) {
 			await new Promise<void>((resolve, reject) => {
-				let stream: libStream.Writable | null = null;
-				try { stream = libFs.createWriteStream((create ? path : tempPath), { flags: (create ? 'wx' : 'w') }); }
-				catch (err: any) { return reject(err); }
-
-				libStream.pipeline(content, stream, (err: any) => {
+				libStream.pipeline(content, handle.createWriteStream(), (err: any) => {
 					if (err == null)
 						resolve();
 					else
@@ -90,18 +97,16 @@ async function atomicWrite(path: string, content: Buffer | libStream.Readable, l
 				});
 			});
 		}
-		else
-			await libFsPromises.writeFile((create ? path : tempPath), content, { flag: (create ? 'wx' : 'w') });
+		else {
+			try { await handle.writeFile(content); }
+			finally { await handle.close().catch(() => { }); }
+		}
 		written = true;
 
 		/* move the file into place */
 		if (!create)
 			await libFsPromises.rename(tempPath, path);
 	} catch (err: any) {
-		/* check if the file already existed */
-		if (create && err.code == 'EEXIST')
-			return false;
-
 		if (options?.what != '')
 			logger.trace(`Removing partially written [${create ? path : tempPath}]`);
 
@@ -115,7 +120,7 @@ async function atomicWrite(path: string, content: Buffer | libStream.Readable, l
 		if (written)
 			throw wrapError(err, 'Replace the original file');
 		else if (create)
-			throw wrapError(err, 'Create file');
+			throw wrapError(err, 'Write to file');
 		throw wrapError(err, `Write to temporary file [${tempPath}]`);
 	}
 	return true;
@@ -571,10 +576,7 @@ class NotCached implements Cached {
 			return stream;
 
 		/* create the stream-sniffer to collect the data and write them to the cache */
-		return sniffStream(stream, this.size, (data: Buffer) => {
-			if (data.byteLength == this.size)
-				this.cache.add(this.path, data, this.mtime, this.age);
-		});
+		return sniffStream(stream, this.size, (data: Buffer) => this.cache.add(this.path, data, this.mtime, this.age));
 	}
 
 	public isImmutable(): boolean {
@@ -660,55 +662,15 @@ function EncodedCache(cache: CacheManager, reader: Cached, entry: CacheEntry | n
 	}
 
 	const makeStream: (eager?: boolean) => libStream.Readable = (eager?: boolean) => {
-		let settled: boolean = false;
-
 		/* create the encoded pipe (eager: let creation failures of the source stream throw) */
 		const stream = reader.stream({ eager });
-		const encoder = encoding.makeEncode();
-		let sniffer: libStream.Transform | null = null;
-		stream.pipe(encoder);
+		const encoder = libStream.pipeline(stream, encoding.makeEncode(), () => { });
 
-		/* setup the stream exceptions to be propgated through */
-		stream.once('error', (err: any) => {
-			if (settled) return; settled = true;
-			encoder.destroy(err);
-			if (sniffer != null)
-				sniffer.destroy(err);
-		});
-		encoder.once('error', (err: any) => {
-			if (settled) return; settled = true;
-			stream.destroy(err);
-			if (sniffer != null)
-				sniffer.destroy(err);
-		});
-
-		/* check if there is even a chance for the data to be cached */
+		/* check if there is even a chance for the data to be cached and then attach the
+		*	sniffer to collect the encoded data (encoded size is not known upfront) */
 		if (!cache.cacheable(reader.fileSize()))
 			return encoder;
-
-		/* setup the sniffer stream to collect the cached data (once an error has settled
-		*	the streams, just pass any data through and skip the caching entirely) */
-		let buffers: Buffer[] = [];
-		sniffer = new libStream.Transform({
-			transform: (chunk, _, cb) => {
-				if (!settled)
-					buffers.push(chunk);
-				cb(null, chunk);
-			},
-			final: (cb) => {
-				if (!settled)
-					cache.addEncoding(reader.filePath(), Buffer.concat(buffers), age, encoding.name);
-				cb(null);
-			}
-		});
-
-		/* setup the stream exceptions to be propgated through */
-		sniffer.once('error', (err: any) => {
-			if (settled) return; settled = true;
-			stream.destroy(err);
-			encoder.destroy(err);
-		});
-		return encoder.pipe(sniffer);
+		return sniffStream(encoder, null, (data: Buffer) => cache.addEncoding(reader.filePath(), data, age, encoding.name));
 	};
 
 	/* wrap the original reader around the encoder (let errors propagate out) */
@@ -781,11 +743,18 @@ export interface SizedReadable extends libStream.Readable {
 	fileSize: number;
 }
 
-/** create a sized-readable stream from a normal stream (stream must exactly produce the given number of bytes, or an error) */
+/** create a sized-readable stream from a normal stream (stream must exactly produce the given number of bytes, or
+ *	an error; only streams branded by this function are recognized as sized - such as by isSizedReadable or write) */
 export function createSizedReadable(stream: libStream.Readable, fileSize: number): SizedReadable {
 	const wrapped = stream as SizedReadable;
 	wrapped.fileSize = fileSize;
+	(wrapped as any)[SizedReadableBrand] = true;
 	return wrapped;
+}
+
+/** check if the object is a sized-readable stream created via createSizedReadable */
+export function isSizedReadable(stream: unknown): stream is SizedReadable {
+	return (stream instanceof libStream.Readable && (stream as any)[SizedReadableBrand] === true);
 }
 
 /**
@@ -921,17 +890,8 @@ export class CacheHost extends libLog.Logger {
 			data = Buffer.from(data, 'utf-8');
 
 		/* check if the data are an instance of the sized stream and collect the data to be written to the cache */
-		else if (data instanceof libStream.Readable && typeof (data as any).fileSize == 'number') {
-			const streamSize = (data as SizedReadable).fileSize;
-
-			/* check if the stream could be cached in theory to be written to the cache */
-			if (this._cacheManager.cacheable(streamSize)) {
-				data = sniffStream(data, streamSize, (data: Buffer) => {
-					if (data.byteLength == streamSize)
-						collected = data;
-				});
-			}
-		}
+		else if (isSizedReadable(data) && this._cacheManager.cacheable(data.fileSize))
+			data = sniffStream(data, data.fileSize, (sniffed: Buffer) => { collected = sniffed; });
 
 		/* write the data atomically to the destination (let errors propagate out) */
 		if (!await atomicWrite(path, data, this, { what: (options?.what ?? 'via cache'), temporary: options?.temporary, create: options?.create }))
