@@ -11,7 +11,7 @@ import * as libCrypto from "crypto";
 const UNIQUE_ID_CHARS = '0123456789abcdefghijklmnopqrstuvwxyz'
 const UNIQUE_ID_LENGTH = 10;
 const ID_EXTENSION_REGEX = RegExp(`^\\.[${UNIQUE_ID_CHARS}]{${UNIQUE_ID_LENGTH}}$`, 'i');
-const SizedReadableBrand = Symbol('mws.sized-readable');
+const FileReadableBrand = Symbol('mws.file-readable');
 
 function readStats(path: string): null | [number, number] {
 	try {
@@ -63,7 +63,7 @@ function sniffStream(stream: libStream.Readable, expected: number | null, callba
 	});
 	return sniffer;
 }
-async function atomicWrite(path: string, content: Buffer | libStream.Readable, logger: libLog.Logger, options?: { what?: string, temporary?: string, create?: boolean }): Promise<void> {
+async function atomicWrite(path: string, content: Buffer | libStream.Readable, logger: libLog.Logger, options?: { what?: string, temporary?: string, create?: boolean, mtime?: number }): Promise<void> {
 	const tempPath = (options?.temporary ?? `${path}.temp`), create = (options?.create === true);
 	if (options?.what != '')
 		logger.trace(`Writing ${options?.what ?? 'data'} to [${path}]`);
@@ -99,6 +99,11 @@ async function atomicWrite(path: string, content: Buffer | libStream.Readable, l
 			try { await handle.writeFile(content); }
 			finally { await handle.close().catch(() => { }); }
 		}
+
+		/* apply the explicit modified-time (before the rename, to let the file be moved into place fully
+		*	configured; as fractional seconds, to prevent sub-millisecond stat values from being truncated) */
+		if (options?.mtime != null)
+			await libFsPromises.utimes((create ? path : tempPath), options.mtime / 1000, options.mtime / 1000);
 		written = true;
 
 		/* move the file into place */
@@ -521,6 +526,9 @@ class AlreadyCached implements Cached {
 	public lastModified(): string {
 		return new Date(this.entry.mtime).toUTCString();
 	}
+	public timeModified(): number {
+		return this.entry.mtime;
+	}
 	public uniqueId(): string {
 		return `${this.entry.mtime}-${this.entry.data.byteLength}`;
 	}
@@ -587,6 +595,9 @@ class NotCached implements Cached {
 	}
 	public lastModified(): string {
 		return new Date(this.mtime).toUTCString();
+	}
+	public timeModified(): number {
+		return this.mtime;
 	}
 	public uniqueId(): string {
 		return `${this.mtime}-${this.size}`;
@@ -699,6 +710,9 @@ export interface Cached {
 	/** fetch the last modified time formatted for the network */
 	lastModified(): string;
 
+	/** fetch the last modified time in milliseconds since the epoch */
+	timeModified(): number;
+
 	/** fetch the unique-id to identify this version of the cached file (constructed,
 	 *	just like the cache identifies them as equivalent: size+last-modified) */
 	uniqueId(): string;
@@ -735,23 +749,25 @@ export interface EncodedCache {
 	readSync(): Buffer;
 }
 
-/** wrapper for readable stream, which also exposes the file size */
-export interface SizedReadable extends libStream.Readable {
+/** wrapper for readable stream, which also exposes the file size and optionally the last modified time in milliseconds */
+export interface FileReadable extends libStream.Readable {
 	fileSize: number;
+	timeModified?: number;
 }
 
-/** create a sized-readable stream from a normal stream (stream should exactly produce the given number of bytes, or an error; other behavior
- *	may be treated as an error; only streams branded by this function are recognized as sized - such as by isSizedReadable or write) */
-export function createSizedReadable(stream: libStream.Readable, fileSize: number): SizedReadable {
-	const wrapped = stream as SizedReadable;
+/** create a file-readable stream from a normal stream (stream should exactly produce the given number of bytes, or an error; other behavior
+ *	may be treated as an error; only streams branded by this function are recognized as sized - such as by isFileReadable or write) */
+export function createFileReadable(stream: libStream.Readable, fileSize: number, timeModified?: number): FileReadable {
+	const wrapped = stream as FileReadable;
 	wrapped.fileSize = fileSize;
-	(wrapped as any)[SizedReadableBrand] = true;
+	wrapped.timeModified = timeModified;
+	(wrapped as any)[FileReadableBrand] = true;
 	return wrapped;
 }
 
-/** check if the object is a sized-readable stream created via createSizedReadable */
-export function isSizedReadable(stream: unknown): stream is SizedReadable {
-	return (stream instanceof libStream.Readable && (stream as any)[SizedReadableBrand] === true);
+/** check if the object is a sized-readable stream created via createFileReadable */
+export function isFileReadable(stream: unknown): stream is FileReadable {
+	return (stream instanceof libStream.Readable && (stream as any)[FileReadableBrand] === true);
 }
 
 /**
@@ -862,12 +878,12 @@ export class CacheHost extends libLog.Logger {
 	 *	(designed for modules to interact with); if [eager], the file is opened at creation: creation failures throw,
 	 *	a file having vanished since the lookup returns null, and the returned stream must be consumed or destroyed to
 	 *	release the file; otherwise creation failures error on the stream (in which case ENOENT cannot be mapped to null) */
-	public stream(path: string, options?: { checkFreshness?: boolean, eager?: boolean }): SizedReadable | null {
+	public stream(path: string, options?: { checkFreshness?: boolean, eager?: boolean }): FileReadable | null {
 		try {
 			const entry = this.resolveCache(path, options?.checkFreshness ?? false, false) as (Cached | null);
 			if (entry == null)
 				return null;
-			return createSizedReadable(entry.stream({ eager: options?.eager }), entry.fileSize());
+			return createFileReadable(entry.stream({ eager: options?.eager }), entry.fileSize(), entry.timeModified());
 		}
 
 		/* special abstraction to ensure check-before-use does not result in not-found */
@@ -880,18 +896,19 @@ export class CacheHost extends libLog.Logger {
 
 	/** [throws] write data atomically to the disk and conditionally update the cache (designed for modules
 	 *	to interact with; writes as utf-8; writes data first to temporary file and then replaces the file
-	 *	atomically; for create: must not replace an existing file; empty what string will not log anything) */
-	public async write(path: string, data: Buffer | string | libStream.Readable | SizedReadable, options?: { what?: string, temporary?: string, create?: boolean }): Promise<void> {
+	 *	atomically; for create: must not replace an existing file; for mtime: apply the given modified-time
+	 *	in milliseconds since the epoch to the written file; empty what string will not log anything) */
+	public async write(path: string, data: Buffer | string | libStream.Readable | FileReadable, options?: { what?: string, temporary?: string, create?: boolean, mtime?: number }): Promise<void> {
 		let collected: Buffer | null = null;
 		if (typeof data == 'string')
 			data = Buffer.from(data, 'utf-8');
 
 		/* check if the data are an instance of the sized stream and collect the data to be written to the cache */
-		else if (isSizedReadable(data) && this._cacheManager.cacheable(data.fileSize))
+		else if (isFileReadable(data) && this._cacheManager.cacheable(data.fileSize))
 			data = sniffStream(data, data.fileSize, (sniffed: Buffer) => { collected = sniffed; });
 
 		/* write the data atomically to the destination (let errors propagate out) */
-		await atomicWrite(path, data, this, { what: (options?.what ?? 'via cache'), temporary: options?.temporary, create: options?.create });
+		await atomicWrite(path, data, this, { what: (options?.what ?? 'via cache'), temporary: options?.temporary, create: options?.create, mtime: options?.mtime });
 
 		/* check if the data are available and can be written to the cache (unsized streamed data will not be cached, as their size cannot be determined) */
 		if (collected != null)
