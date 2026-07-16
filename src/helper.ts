@@ -283,7 +283,8 @@ export function escapePlaceholders(content: string): string {
 	return out;
 }
 
-/** sanitize path and remove relative path components and convert it to an absolute path */
+/** sanitize path and remove relative path components and convert it to an absolute path;
+ *	if [relative], path will be sanitized, but may remain relative, such as [../foo] */
 export function sanitize(path: string, relative: boolean): string {
 	/* treat the path as absolute, but preserve backward traversals into the root */
 	let out = '/';
