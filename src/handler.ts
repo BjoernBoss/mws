@@ -15,7 +15,10 @@ interface LinkedModules {
 
 /**
 *	Translation to be applied for nested children and reversed for any paths produced by the children.
-*	Paths are matched by longest path. A null translation is considered not being mapped and will not be forwarded.
+*	Paths are matched by longest path. Unmapped paths will not be forwarded.
+*	A null translation is considered not being mapped and will not be forwarded.
+*	Reversed paths will implicitly use the identity translation for unmapped paths.
+*	Mappings must be URI encoded, if their representation requires it.
 */
 export type PathTranslation = Record<string, string | null>;
 

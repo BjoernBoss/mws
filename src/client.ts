@@ -12,8 +12,8 @@ import * as libUrl from "url";
 import * as libWs from "ws";
 import * as libHttp from "http";
 
-const BAD_HTTP_STRING_REGEX: RegExp = /[\x00-\x1f\x7f]/;
-const BAD_HTTP_HEADER_NAME_REGEX: RegExp = /[\x00-\x1f\x7f\(\)<>@,;:\\"/\[\]\?=\{\} \t]/;
+const BAD_HTTP_STRING_REGEX: RegExp = /[\x00-\x1f\x7f]|[^\x00-\xff]/;
+const BAD_HTTP_HEADER_NAME_REGEX: RegExp = /[\x00-\x1f\x7f\(\)<>@,;:\\"/\[\]\?=\{\} \t]|[^\x00-\x7f]/;
 
 class ClientContext {
 	public path: string;
@@ -68,40 +68,32 @@ class ClientBase extends libLog.Logger {
 		return this._config
 	}
 
-	/** create a path relative from the current module into the clients traversed server space */
+	/** create a path relative from the current module into the clients traversed server space (path must be
+	 *	properly URI encoded; returns URI encoded path, as translations guarantee to also be properly URI encoded) */
 	public makePath(path: string): string {
 		path = libHelper.sanitize(path, false);
-		let output = path;
+		let output = path, unmapped = false;
 
 		for (let i = this._translation.length - 1; i >= 0; --i) {
-			let nullCheck = false, match: [string, string | null] | null = null;
+			let match: [string, string] | null = null;
 
 			/* find the best reverse mapping and apply it */
 			for (const [from, to] of Object.entries(this._translation[i])) {
-				if (to == null)
-					nullCheck = true;
-				else if (libHelper.isSubPath(to, output) && (match == null || match[1]!.length < to.length))
+				if (to != null && libHelper.isSubPath(to, output) && (match == null || match[1].length < to.length))
 					match = [from, to];
 			}
+
+			/* check if a mapping has been found and reverse-apply it and otherwise use an implicit identity mapping (no need to
+			*	check any forward mappings as no certain decisions can be made until the path has been fully reverse-translated) */
 			if (match != null)
-				output = libHelper.rebasePath(match[1]!, match[0], output);
-
-			/* check if the translation contained null-mappings and check if
-			*	the final unpacked path re-maps into the null-mapping */
-			if (nullCheck) {
-				match = null;
-				for (const [from, to] of Object.entries(this._translation[i])) {
-					if (libHelper.isSubPath(from, output) && (match == null || match[0].length < from.length))
-						match = [from, to];
-				}
-			}
-
-			/* check if the path could not be translated */
-			if (match == null || match[1] == null) {
-				this.warning(`Path [${path}] is not mapped by translations`);
-				return path;
-			}
+				output = libHelper.rebasePath(match[1], match[0], output);
+			else
+				unmapped = true;
 		}
+
+		/* check if the final path was partially unmapped */
+		if (unmapped)
+			this.warning(`Path [${path}] is not mapped by translations`);
 		return output;
 	}
 
@@ -333,7 +325,7 @@ export class ClientRequest extends ClientBase {
 
 		/* register the necessary network error handlers (only relevant if not already dropped) */
 		const handleNetworkEvent = (desc: string) => {
-			if (!this._dropped)
+			if (!this.dropped)
 				this.dropConnection(ConnectionState.disconnected, (this._state.response == ResponseState.completed ? '' : desc), false, true);
 		};
 		const lostHandler = () => handleNetworkEvent('Connection lost');
@@ -378,7 +370,7 @@ export class ClientRequest extends ClientBase {
 		/* check if the response can still be sent */
 		if (this._state.response == ResponseState.completed)
 			this.warning(`Request already completed, discarding response ${description}`);
-		else if (this._dropped)
+		else if (this.dropped)
 			this.trace(`Request broken, discarding response ${description}`);
 		else if (this._state.response == ResponseState.headerSent)
 			this.dropConnection(ConnectionState.broken, `Overlap with committed response ${description}`, false, false);
@@ -391,7 +383,7 @@ export class ClientRequest extends ClientBase {
 		}
 	}
 	private failThroughput(): void {
-		if (this.config.throughputThreshold <= 0 || !this._throughput.active || this._dropped)
+		if (this.config.throughputThreshold <= 0 || !this._throughput.active || this.dropped)
 			return;
 
 		/* check if the connection is still considered busy and should receive a grace delay */
@@ -544,7 +536,7 @@ export class ClientRequest extends ClientBase {
 			writer.once('close', () => handler());
 		});
 	}
-	private get _dropped(): boolean {
+	private get dropped(): boolean {
 		return (this._state.connection != ConnectionState.healthy);
 	}
 	private dropConnection(state: ConnectionState, reason: string, graceful: boolean, expected: boolean): void {
@@ -560,7 +552,7 @@ export class ClientRequest extends ClientBase {
 
 		/* check if the connection has already been dropped, in which
 		*	case at most the forceful destruction needs to be applied */
-		if (this._dropped) {
+		if (this.dropped) {
 			if (!graceful)
 				this.killNativeConnection(false);
 			return;
@@ -598,7 +590,7 @@ export class ClientRequest extends ClientBase {
 		this.respondInternalError(`Bad Usage: ${reason}`, (close ? { headers: { 'Connection': 'close' } } : undefined));
 	}
 	private breakWithResponse(description: string, graceful: boolean, expected: boolean, respond: (description: string, headers: Record<string, string>) => void): void {
-		if (!this._dropped && (this._state.response == ResponseState.none || this._state.response == ResponseState.preparing)) {
+		if (!this.dropped && (this._state.response == ResponseState.none || this._state.response == ResponseState.preparing)) {
 			respond(description, { 'Connection': 'close' });
 			this.dropConnection(ConnectionState.broken, '', true, expected);
 		}
@@ -666,7 +658,7 @@ export class ClientRequest extends ClientBase {
 
 		/* invoke all registered patchers to let them update the content */
 		this.invokePatcher((patcher) => patcher.response?.(status, headers));
-		if (this._dropped || (this._state.response != ResponseState.none && this._state.response != ResponseState.preparing))
+		if (this.dropped || (this._state.response != ResponseState.none && this._state.response != ResponseState.preparing))
 			return false;
 
 		/* mark the response as determined as it will now be sent this way */
@@ -828,7 +820,7 @@ export class ClientRequest extends ClientBase {
 		const makeErrorStream = (msg: string) => new libStream.Writable({ write(_0, _1, cb) { cb(new Error(msg)) }, final(cb) { cb(new Error(msg)) } });
 
 		/* check if the object is already responded */
-		if (this._dropped)
+		if (this.dropped)
 			return makeErrorStream('Connection broken');
 		if (this._state.response != ResponseState.none) {
 			this.badClientUsage('Response on already claimed connection', false);
@@ -844,7 +836,7 @@ export class ClientRequest extends ClientBase {
 					return cb(null);
 
 				/* check if the connection has been marked as failed or completed */
-				if (this._dropped)
+				if (this.dropped)
 					return cb(new Error('Connection broken'));
 				if (this._state.response == ResponseState.completed)
 					return cb(new Error('Responding to completed response'));
@@ -874,7 +866,7 @@ export class ClientRequest extends ClientBase {
 					output.writer.destroy();
 
 				/* check if the client was consumed by another response and should not be closed/responded to anymore */
-				if (this._dropped || (!output.headerSent && this._state.response != ResponseState.preparing))
+				if (this.dropped || (!output.headerSent && this._state.response != ResponseState.preparing))
 					return cb(err);
 
 				/* check if its an encoding failure (header must already have been sent) */
@@ -907,7 +899,7 @@ export class ClientRequest extends ClientBase {
 			this.badClientUsage('Already receiving data', false);
 			return makeErrorStream('Connection is already being received');
 		}
-		if (this._dropped)
+		if (this.dropped)
 			return makeErrorStream('Connection broken');
 		this._state.receive = ReceiveState.receiving;
 
@@ -916,7 +908,7 @@ export class ClientRequest extends ClientBase {
 		let accumulated = 0;
 		const output = new libStream.Transform({
 			transform: (chunk, _, cb) => {
-				if (this._dropped)
+				if (this.dropped)
 					return cb(new Error('Connection broken'));
 
 				/* check the maximum count (is violated) */
@@ -1031,19 +1023,19 @@ export class ClientRequest extends ClientBase {
 		};
 
 		/* ensure the connection is default replied with not-found */
-		if (!this._dropped && this._state.response == ResponseState.none)
+		if (!this.dropped && this._state.response == ResponseState.none)
 			this.respondNotFound();
 
 		/* ensure that the data have been fully received */
-		if (!this._dropped && this._state.receive == ReceiveState.receiving)
+		if (!this.dropped && this._state.receive == ReceiveState.receiving)
 			handleFailure('Receive stream not consumed');
 
 		/* check if the upgrade was not fully awaited */
-		if (!this._dropped && this._state.upgrade == UpgradeState.upgrading)
+		if (!this.dropped && this._state.upgrade == UpgradeState.upgrading)
 			handleFailure('Upgrade not fully awaited');
 
 		/* ensure that the response was properly sent */
-		if (!this._dropped && this._state.response != ResponseState.completed)
+		if (!this.dropped && this._state.response != ResponseState.completed)
 			handleFailure('Response not completed');
 	}
 
@@ -1104,7 +1096,7 @@ export class ClientRequest extends ClientBase {
 		/* check if data remain in the pipeline, in which case they either need to be consumed, or the
 		*	connection needs to be closed to ensure the sender does not pipe more data over (dropped
 		*	connections have already been cleaned up and cannot receive the data anymore anyways) */
-		if (this.hasDataQueued() && !this._dropped) {
+		if (this.hasDataQueued() && !this.dropped) {
 			if (this.config.drainUpload)
 				await this.drainQueuedData();
 			else
@@ -1113,7 +1105,7 @@ export class ClientRequest extends ClientBase {
 
 		/* check if the connection was an upgrade but was not was accepted, which needs to be
 		*	killed, as the underlying web-server will not clean this connection up anymore */
-		if (this._native.socket != null && this._state.upgrade != UpgradeState.upgraded && !this._dropped)
+		if (this._native.socket != null && this._state.upgrade != UpgradeState.upgraded && !this.dropped)
 			this.dropConnection(ConnectionState.broken, 'Upgrade was not accepted', true, true);
 
 		/* kill the throughput timer, as it either does not need to be checked anymore, or it
@@ -1124,7 +1116,7 @@ export class ClientRequest extends ClientBase {
 		this._throughput.active = false;
 
 		/* check if the connection was dropped and await its grace cleanup completion */
-		if (this._dropped)
+		if (this.dropped)
 			await this._state.breaking!;
 
 		/* recover the original socket timeout (not for sockets, as they take care of the timeout themselves) */
@@ -1136,7 +1128,7 @@ export class ClientRequest extends ClientBase {
 	/** respond with an internal error and kill the connection (if [gracefully], give previous responses time to be received) */
 	public killConnection(reason: string, options?: { graceful?: boolean }): void {
 		/* if the response is already completed/broken, treat is as a friendly closing */
-		if (this._state.response == ResponseState.completed || this._dropped)
+		if (this._state.response == ResponseState.completed || this.dropped)
 			return this.dropConnection(ConnectionState.broken, `Connection killed: ${reason}`, true, true);
 		this.breakWithResponse(`Connection killed: ${reason}`, (options?.graceful ?? false), false, (desc, headers) => this.respondInternalError(desc, { headers }));
 	}
@@ -1155,7 +1147,7 @@ export class ClientRequest extends ClientBase {
 	 *	dropped); a claimed request will not be dispatched to further modules and the framework will default
 	 *	to not-found if the handler returns without claiming or responding */
 	public get claimed(): boolean {
-		return (this._state.response != ResponseState.none || this._state.receive != ReceiveState.none || this._dropped);
+		return (this._state.response != ResponseState.none || this._state.receive != ReceiveState.none || this.dropped);
 	}
 
 	/** resolves whenever the response has been determined (a response header has been sent or the connection was
@@ -1275,7 +1267,7 @@ export class ClientRequest extends ClientBase {
 
 	/** respond with [internal-error] and a default text response (reason is logged server-side only) or a custom text response; cache policy defaults to [sensitive] */
 	public respondInternalError(reason: string, options?: { message?: string, headers?: Record<string, string>, cache?: CachePolicy }): void {
-		const header = (options?.headers ?? {});
+		const header = { ...options?.headers };
 		this.applyCachePolicy(header, CachePolicy.sensitive, options?.cache);
 
 		const content: string = (options?.message ?? `An internal server error occurred while processing the request for [${this.url.pathname}].`);
@@ -1286,7 +1278,7 @@ export class ClientRequest extends ClientBase {
 
 	/** respond with [forbidden] and a default text response (reason will be logged server-side only) or a custom text response; cache policy defaults to [sensitive] */
 	public respondForbidden(options?: { reason?: string, message?: string, headers?: Record<string, string>, cache?: CachePolicy }): void {
-		const header = (options?.headers ?? {});
+		const header = { ...options?.headers };
 		this.applyCachePolicy(header, CachePolicy.sensitive, options?.cache);
 
 		const logReason = (options?.reason != null ? `Reason (not sent): ${options.reason}` : options?.message ?? null);
@@ -1298,7 +1290,7 @@ export class ClientRequest extends ClientBase {
 	 *	content length is suppressed for head responses (to accommodate short-circuiting responding); cache policy defaults to [private] */
 	public respond(content: string | Buffer | null, options?: { media?: libBase.MediaType, status?: libBase.StatusType, headers?: Record<string, string>, lightResponse?: boolean, cache?: CachePolicy }): void {
 		const status = options?.status ?? libBase.Status.Ok;
-		const header = (options?.headers ?? {});
+		const header = { ...options?.headers };
 		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
 		if (content == null)
@@ -1317,7 +1309,7 @@ export class ClientRequest extends ClientBase {
 
 	/** respond with [bad-request] and a default response (with embedded reason) or a custom text response (message replaces the body and the reason is then logged server-side only); cache policy defaults to [private] */
 	public respondBadRequest(options?: { reason?: string, message?: string, headers?: Record<string, string>, cache?: CachePolicy }): void {
-		const header = (options?.headers ?? {});
+		const header = { ...options?.headers };
 		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
 		const content: string = (options?.message ?? `Request for [${this.url.pathname}] is perceived as malformed${options?.reason == null ? '.' : `:\n${options.reason}`}`);
@@ -1328,7 +1320,7 @@ export class ClientRequest extends ClientBase {
 
 	/** respond with [conflict] and a default response (with embedded reason) or a custom text response (message replaces the body and the reason is then logged server-side only); cache policy defaults to [private] */
 	public respondConflict(options?: { reason?: string, message?: string, headers?: Record<string, string>, cache?: CachePolicy }): void {
-		const header = (options?.headers ?? {});
+		const header = { ...options?.headers };
 		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
 		const content: string = (options?.message ?? `Conflict for resource [${this.url.pathname}]${options?.reason == null ? '.' : `:\n${options.reason}`}`);
@@ -1339,7 +1331,7 @@ export class ClientRequest extends ClientBase {
 
 	/** respond with [ok] and a default response (with embedded reason) or a custom text response (message replaces the body and the reason is then logged server-side only); cache policy defaults to [private] */
 	public respondOk(options?: { reason?: string, message?: string, headers?: Record<string, string>, cache?: CachePolicy }): void {
-		const header = (options?.headers ?? {});
+		const header = { ...options?.headers };
 		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
 		const content: string = (options?.message ?? `${this.method} was successful for [${this.url.pathname}]${options?.reason == null ? '.' : `:\n${options.reason}`}`);
@@ -1350,7 +1342,7 @@ export class ClientRequest extends ClientBase {
 
 	/** respond with [not-found] and a default response or a custom text response; cache policy defaults to [private] */
 	public respondNotFound(options?: { message?: string, headers?: Record<string, string>, cache?: CachePolicy }): void {
-		const header = (options?.headers ?? {});
+		const header = { ...options?.headers };
 		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
 		const content: string = (options?.message ?? `Resource [${this.url.pathname}] could not be found.`);
@@ -1359,9 +1351,10 @@ export class ClientRequest extends ClientBase {
 		});
 	}
 
-	/** respond with [created] and a default response or a custom text response; cache policy defaults to [private] */
+	/** respond with [created] and a default response or a custom text response; [target]
+	 *	must be a well formatted URI encoded string; cache policy defaults to [private] */
 	public respondCreated(target: string, options?: { message?: string, headers?: Record<string, string>, cache?: CachePolicy }): void {
-		const header = (options?.headers ?? {});
+		const header = { ...options?.headers };
 		header['Location'] = target;
 		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
@@ -1373,7 +1366,7 @@ export class ClientRequest extends ClientBase {
 
 	/** respond with [http-version not supported] and a default text response; cache policy defaults to [private] */
 	public respondHttpVersionNotSupported(minVersion: string, options?: { headers?: Record<string, string>, cache?: CachePolicy }): void {
-		const header = (options?.headers ?? {});
+		const header = { ...options?.headers };
 		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
 		this.constructQuickResponse(libBase.Status.HttpVersionNotSupported, minVersion, header, {
@@ -1383,7 +1376,7 @@ export class ClientRequest extends ClientBase {
 
 	/** respond with [not-modified] and no body (ensure the etag and/or last-modified is set); cache policy defaults to [private] */
 	public respondNotModified(options?: { etag?: string, lastModified?: string, headers?: Record<string, string>, cache?: CachePolicy }): void {
-		const header = (options?.headers ?? {});
+		const header = { ...options?.headers };
 		if (options?.etag != null && !('ETag' in header))
 			header['ETag'] = options.etag;
 		if (options?.lastModified != null && !('Last-Modified' in header))
@@ -1395,7 +1388,7 @@ export class ClientRequest extends ClientBase {
 
 	/** respond with [precondition-failed] and a default text response (ensure the etag and/or last-modified is set); cache policy defaults to [private] */
 	public respondPreconditionFailed(reason: string, options?: { etag?: string, lastModified?: string, headers?: Record<string, string>, cache?: CachePolicy }): void {
-		const header = (options?.headers ?? {});
+		const header = { ...options?.headers };
 		if (options?.etag != null && !('ETag' in header))
 			header['ETag'] = options.etag;
 		if (options?.lastModified != null && !('Last-Modified' in header))
@@ -1409,7 +1402,7 @@ export class ClientRequest extends ClientBase {
 
 	/** respond with [range-not-satisfiable] and a default text response; cache policy defaults to [private] */
 	public respondRangeIssue(range: string, size: number, options?: { headers?: Record<string, string>, cache?: CachePolicy }): void {
-		const header = (options?.headers ?? {});
+		const header = { ...options?.headers };
 		header['Content-Range'] = `bytes */${size}`;
 		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
@@ -1420,7 +1413,7 @@ export class ClientRequest extends ClientBase {
 
 	/** respond with [unsupported-media-type] and a default text response; cache policy defaults to [private] */
 	public respondUnsupportedMediaType(used: string, allowed: string, options?: { headers?: Record<string, string>, cache?: CachePolicy }): void {
-		const header = (options?.headers ?? {});
+		const header = { ...options?.headers };
 		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
 		this.constructQuickResponse(libBase.Status.UnsupportedMediaType, `Allowed was [${allowed}] but [${used}] was used`, header, {
@@ -1430,7 +1423,7 @@ export class ClientRequest extends ClientBase {
 
 	/** respond with [method-not-allowed] and a default text response; cache policy defaults to [private] */
 	public respondMethodNotAllowed(method: string, allowed: string, options?: { headers?: Record<string, string>, cache?: CachePolicy }): void {
-		const header = (options?.headers ?? {});
+		const header = { ...options?.headers };
 		header['Allow'] = allowed;
 		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
@@ -1441,7 +1434,7 @@ export class ClientRequest extends ClientBase {
 
 	/** respond with [request-timeout] and a default text response; cache policy defaults to [private] */
 	public respondRequestTimeout(reason: string, options?: { headers?: Record<string, string>, cache?: CachePolicy }): void {
-		const header = (options?.headers ?? {});
+		const header = { ...options?.headers };
 		header['Connection'] = 'close';
 		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
@@ -1452,7 +1445,7 @@ export class ClientRequest extends ClientBase {
 
 	/** respond with [content-too-large] and a default text response; cache policy defaults to [private] */
 	public respondContentTooLarge(allowed: number, atLeastProvided: number, options?: { headers?: Record<string, string>, cache?: CachePolicy }): void {
-		const header = (options?.headers ?? {});
+		const header = { ...options?.headers };
 		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
 		this.constructQuickResponse(libBase.Status.ContentTooLarge, `[${atLeastProvided}] > [${allowed}]`, header, {
@@ -1462,7 +1455,7 @@ export class ClientRequest extends ClientBase {
 
 	/** respond with [update-required] and a default text response; cache policy defaults to [private] */
 	public respondUpdateRequired(upgrade: string, options?: { headers?: Record<string, string>, cache?: CachePolicy }): void {
-		const header = (options?.headers ?? {});
+		const header = { ...options?.headers };
 		if (!('Connection' in header))
 			header['Connection'] = 'upgrade';
 		header['Upgrade'] = upgrade;
@@ -1473,9 +1466,10 @@ export class ClientRequest extends ClientBase {
 		});
 	}
 
-	/** respond with [see-other] to the given target and a default text response (forces method GET); cache policy defaults to [private] */
+	/** respond with [see-other] to the given target and a default text response (forces method GET);
+	 *	[target] must be a well formatted URI encoded string; cache policy defaults to [private] */
 	public respondSeeOther(target: string, options?: { headers?: Record<string, string>, cache?: CachePolicy }): void {
-		const header = (options?.headers ?? {});
+		const header = { ...options?.headers };
 		header['Location'] = target;
 		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
@@ -1484,9 +1478,10 @@ export class ClientRequest extends ClientBase {
 		});
 	}
 
-	/** respond with [temporary-redirect] to the given target and a default text response (preserves method); cache policy defaults to [private] */
+	/** respond with [temporary-redirect] to the given target and a default text response (preserves method);
+	 *	[target] must be a well formatted URI encoded string; cache policy defaults to [private] */
 	public respondTemporaryRedirect(target: string, options?: { headers?: Record<string, string>, cache?: CachePolicy }): void {
-		const header = (options?.headers ?? {});
+		const header = { ...options?.headers };
 		header['Location'] = target;
 		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
@@ -1495,9 +1490,10 @@ export class ClientRequest extends ClientBase {
 		});
 	}
 
-	/** respond with [permanent-redirect] to the given target and a default text response (preserves method); cache policy defaults to [private] */
+	/** respond with [permanent-redirect] to the given target and a default text response (preserves method);
+	 *	[target] must be a well formatted URI encoded string; cache policy defaults to [private] */
 	public respondPermanentRedirect(target: string, options?: { headers?: Record<string, string>, cache?: CachePolicy }): void {
-		const header = (options?.headers ?? {});
+		const header = { ...options?.headers };
 		header['Location'] = target;
 		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
@@ -1509,16 +1505,16 @@ export class ClientRequest extends ClientBase {
 	/** respond with html, can be built on by parent modules, sent once the request has been fully processed (default status is ok;
 	 *	for HEAD builds, no actual content will be constructed, nor will its size be estimated); cache policy defaults to [private] */
 	public respondHtml(page: libBuilder.HtmlPage, options?: { status?: libBase.StatusType, headers?: Record<string, string>, cache?: CachePolicy }): void {
-		if (this._dropped || (this._state.response != ResponseState.none && this._state.response != ResponseState.preparing))
+		if (this.dropped || (this._state.response != ResponseState.none && this._state.response != ResponseState.preparing))
 			return this.badClientUsage('HTML response on already claimed connection', false);
 
 		const status = (options?.status ?? libBase.Status.Ok);
-		const headers = (options?.headers ?? {});
+		const headers = { ...options?.headers };
 		this.applyCachePolicy(headers, CachePolicy.private, options?.cache);
 
 		/* invoke all registered html patchers to let them update the content */
 		this.invokePatcher((patcher) => patcher.html?.(page, status, headers));
-		if (this._dropped || (this._state.response != ResponseState.none && this._state.response != ResponseState.preparing))
+		if (this.dropped || (this._state.response != ResponseState.none && this._state.response != ResponseState.preparing))
 			return;
 
 		/* mark first as completed now */
@@ -1531,7 +1527,7 @@ export class ClientRequest extends ClientBase {
 	 *	for HEAD builds, no actual content will be constructed, nor will its size be estimated); cache policy defaults to [private] */
 	public respondJson(value: any, options?: { status?: libBase.StatusType, headers?: Record<string, string>, cache?: CachePolicy, isJson?: boolean }): void {
 		const status = options?.status ?? libBase.Status.Ok;
-		const header = (options?.headers ?? {});
+		const header = { ...options?.headers };
 		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
 		const content = Buffer.from((options?.isJson ? (value as string) : JSON.stringify(value)), 'utf-8');
@@ -1546,7 +1542,7 @@ export class ClientRequest extends ClientBase {
 	 *	be ended using '.end()'); cache policy defaults to [private]; errors will automatically close the client connection properly */
 	public respondData(options?: { status?: libBase.StatusType, media?: libBase.MediaType, contentSize?: number, disableEncoding?: boolean, headers?: Record<string, string>, cache?: CachePolicy }): libStream.Writable {
 		const status: libBase.StatusType = options?.status ?? libBase.Status.Ok;
-		const headers = (options?.headers ?? {});
+		const headers = { ...options?.headers };
 		this.applyCachePolicy(headers, CachePolicy.private, options?.cache);
 
 		this.log(`Responding with data and status [${status.msg}]`);
@@ -1555,9 +1551,10 @@ export class ClientRequest extends ClientBase {
 
 	/** try to respond with the given file, return false, if the file does not exist (range aware, HEAD aware); specify [checkFreshness]
 	 *	to re-validate the file stats on disk before serving from cache; the media type can be overwritten (defaults to extracting
-	 *	media-type from the file-path); [encoding] describes the encoding of a pre-encoded file (warning: no checks against
-	 *	accepted encodings performed!); status will be [Ok], [partial-content], [not-modified] or according errors cache aware and
-	 *	etag/last-modified aware; cache policy defaults to [immutable] for versioned paths, or [static] otherwise */
+	 *	media-type from the file-path); [encoding] describes the encoding of a pre-encoded file (warning: no checks against accepted
+	 *	encodings performed!); status will be [Ok], [partial-content], [not-modified] or according errors cache aware and etag/last-modified
+	 *	aware; cache policy defaults to [immutable] for versioned paths, or [static] otherwise; immutable paths must be created relative
+	 *	to the modules path space (i.e. before ClientRequest.makePath), as outdated id's are redirected via makePath */
 	public async tryRespondFile(filePath: string, options?: { encoded?: string, media?: libBase.MediaType, headers?: Record<string, string>, checkFreshness?: boolean, cache?: CachePolicy }): Promise<boolean> {
 		if (options == null)
 			options = {};
@@ -1574,7 +1571,7 @@ export class ClientRequest extends ClientBase {
 			return true;
 		}
 		if (typeof cached == 'string') {
-			this.respondPermanentRedirect(cached);
+			this.respondPermanentRedirect(this.makePath(encodeURI(cached)));
 			return true;
 		}
 
@@ -1733,7 +1730,7 @@ export class ClientRequest extends ClientBase {
 
 	/** drain any remaining data being uploaded (must not be called while a request is currently being received) */
 	public async drainUpload(): Promise<void> {
-		if (this._dropped)
+		if (this.dropped)
 			return;
 
 		/* check if the data are currently being received and otherwise mark them as being received */
@@ -1750,7 +1747,7 @@ export class ClientRequest extends ClientBase {
 	/** marks the object as having been handled and returns a web socket or automatically responds
 	 *	with a corresponding error and returns null (automatically validates method and headers) */
 	public async acceptWebSocket(): Promise<ClientSocket | null> {
-		if (this._dropped || (this._state.response != ResponseState.none && this._state.response != ResponseState.preparing)) {
+		if (this.dropped || (this._state.response != ResponseState.none && this._state.response != ResponseState.preparing)) {
 			this.badClientUsage('WebSocket upgrade on already claimed connection', false);
 			return null;
 		}
@@ -1788,7 +1785,7 @@ export class ClientRequest extends ClientBase {
 
 			/* start the upgrade process (web-socket upgrade handler will automatically send error messages) */
 			native.wss.handleUpgrade(this._request, native.socket, native.head, (ws, _) => {
-				if (!settled && !this._dropped && this._state.response == ResponseState.headerSent) {
+				if (!settled && !this.dropped && this._state.response == ResponseState.headerSent) {
 					settled = true, this._state.response = ResponseState.completed;
 
 					/* ensure that the socket is valid as otherwise proper cleanup might not be guaranteed (no
