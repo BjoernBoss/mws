@@ -99,7 +99,7 @@ Only `handleRequest` is required. A module owns its entire subtree: if the handl
 
 Modules form a tree via `linkModule()`. They only ever see requests relative to their `root`. Path translation happens automatically when dispatching to children - client paths are rebased relative to each child module's position in the tree. A module can be linked to multiple parents and will only be initialized once, on first attachment to a server.
 
-### Path Translation to Children
+### Remapping Endpoints of Children
 
 Translations are applied when dispatching to a child module:
 
