@@ -182,6 +182,7 @@ class HttpRequestResponse extends libStream.Writable {
 	public status: libBase.StatusType;
 	public headers: Record<string, string>;
 	public contentSize: number | null;
+	public logDetail: string | null;
 	public disableEncoding: boolean;
 	public contentType: libBase.MediaType;
 	public headerSent: boolean;
@@ -189,7 +190,7 @@ class HttpRequestResponse extends libStream.Writable {
 	public responseCompleted: boolean;
 
 	constructor(writer: libStream.Writable, status: libBase.StatusType, headers: Record<string, string>, contentSize: number | null, contentType: libBase.MediaType,
-		disableEncoding: boolean, handleData: (chunk: Buffer | null, cb: (err: any) => void) => void, destroy: (err: any, cb: (err: any) => void) => void
+		logDetail: string | null, disableEncoding: boolean, handleData: (chunk: Buffer | null, cb: (err: any) => void) => void, destroy: (err: any, cb: (err: any) => void) => void
 	) {
 		super({
 			write: (chunk, _, cb) => handleData(chunk, cb),
@@ -202,6 +203,7 @@ class HttpRequestResponse extends libStream.Writable {
 		this.status = status;
 		this.headers = headers;
 		this.contentSize = contentSize;
+		this.logDetail = logDetail;
 		this.disableEncoding = disableEncoding;
 		this.contentType = contentType;
 		this.headerSent = false;
@@ -404,7 +406,9 @@ export class ClientRequest extends ClientBase {
 		for (const cb of this._throughput.busyCheck) {
 			let result = false;
 			try { result = cb(); }
-			catch (err: any) { this.error(`Unhandled exception in busy check: ${err.message}`); }
+			catch (err: any) {
+				this.badClientUsage(`Unhandled exception in busy check: ${err.message}`, false);
+			}
 			if (!result) continue;
 
 			this.trace(`Deferring throughput closing as connection is busy`);
@@ -636,16 +640,14 @@ export class ClientRequest extends ClientBase {
 		this._patcher.index = index;
 	}
 
-	private closeHeader(status: libBase.StatusType, headers: Record<string, string>, content?: { media: libBase.MediaType, size?: number, encoding?: string }): boolean {
-		let logMsg = `Sending [${status.msg}] ${this.isHead ? 'HEAD ' : ''}`;
-		if (content?.media == null)
-			logMsg += `for no content`;
-		else {
-			logMsg += `[${content.media.mediaType}] of size [${content?.size ?? 'unknown'}]`;
-			if (content.encoding != null)
-				logMsg += ` dynamically encoded using [${content.encoding}]`;
-		}
-		this.trace(logMsg);
+	private closeHeader(status: libBase.StatusType, headers: Record<string, string>, content: { media: libBase.MediaType, size?: number } | null, logDetail: string | null): boolean {
+		let logMessage = `${this.isHead ? 'HEAD:' : ''}${status.code}:[${status.msg}]`;
+		if (content == null)
+			logMessage += ' with no content';
+		else
+			logMessage += ` of size [${content.size ?? 'unkown'}] and type [${content.media.mediaType}]`;
+		if (logDetail != null)
+			logMessage += `: ${logDetail}`;
 
 		/* configure the default header values */
 		if (!('Accept-Ranges' in headers))
@@ -673,8 +675,15 @@ export class ClientRequest extends ClientBase {
 
 		/* invoke all registered patchers to let them update the content */
 		this.invokePatcher((patcher) => patcher.response?.(status, headers));
-		if (this.dropped || (this._state.response != ResponseState.none && this._state.response != ResponseState.preparing))
+		if (this.dropped || (this._state.response != ResponseState.none && this._state.response != ResponseState.preparing)) {
+			this.trace(`Discarding response after patcher ${logMessage}`);
 			return false;
+		}
+
+		if (status.code >= 500)
+			this.error(`Responding with ${logMessage}`);
+		else
+			this.log(`Responding with ${logMessage}`);
 
 		/* mark the response as determined as it will now be sent this way */
 		this._state.response = ResponseState.headerSent;
@@ -692,30 +701,26 @@ export class ClientRequest extends ClientBase {
 		}
 		return true;
 	}
-	private sendFullResponse(status: libBase.StatusType, logReason: string | null, headers: Record<string, string>, content: { media: libBase.MediaType, body?: Buffer } | null): void {
-		const description = `${this.isHead ? 'HEAD:' : ''}[${status.code}: ${status.msg}]${logReason == null ? '' : `: ${logReason}`}`;
-
+	private sendFullResponse(status: libBase.StatusType, logDetail: string | null, headers: Record<string, string>, content: { media: libBase.MediaType, body?: Buffer } | null): void {
 		/* check if the response can still be sent */
-		if (this._state.response == ResponseState.completed)
-			return this.warning(`Request already completed, discarding response ${description}`);
-		else if (this.dropped)
-			return this.trace(`Request broken, discarding response ${description}`);
-		else if (this._state.response == ResponseState.headerSent)
-			return this.dropConnection(ConnectionState.broken, `Overlap with committed response ${description}`, false, false);
+		if (this.dropped || this._state.response == ResponseState.headerSent || this._state.response == ResponseState.completed) {
+			const description = `${this.isHead ? 'HEAD:' : ''}[${status.code}: ${status.msg}]${logDetail == null ? '' : `: ${logDetail}`}`;
 
-		/* log the response result */
-		if (status.code >= 500)
-			this.error(`Responding with ${description}`);
-		else
-			this.log(`Responding with ${description}`);
+			if (this._state.response == ResponseState.completed)
+				return this.warning(`Request already completed, discarding response ${description}`);
+			else if (this.dropped)
+				return this.trace(`Request broken, discarding response ${description}`);
+			return this.dropConnection(ConnectionState.broken, `Overlap with committed response ${description}`, false, false);
+		}
 
 		/* check if the response body can be dynamically encoded */
 		let encoding: libBase.EncodingType | null = null;
+		let contentSize: number | null = content?.body?.byteLength ?? null;
 		if (content != null) {
 			headers['Vary'] = 'Accept-Encoding';
 
 			/* check if the data should be encoded (if the size is not known, pretend the buffer to be large enough) */
-			encoding = libHelper.negotiateEncoding(this.headers['accept-encoding'] ?? null, content.body?.byteLength ?? null, content.media);
+			encoding = libHelper.negotiateEncoding(this.headers['accept-encoding'] ?? null, contentSize, content.media);
 			if (encoding != null) {
 				if (content.body != null)
 					content.body = encoding.encodeBuffer(content.body);
@@ -723,7 +728,11 @@ export class ClientRequest extends ClientBase {
 			}
 		}
 
-		if (!this.closeHeader(status, headers, (content == null ? undefined : { media: content.media, size: content.body?.byteLength, encoding: encoding?.name })))
+		let fullDetail = logDetail;
+		if (encoding != null)
+			fullDetail += (logDetail == '' ? 'D' : ' d') + `ynamically [${encoding.name}] encoded from [${contentSize ?? 'unknown'}]`;
+
+		if (!this.closeHeader(status, headers, (content == null ? null : { media: content.media, size: content.body?.byteLength }), fullDetail))
 			return;
 		this._state.response = ResponseState.completed;
 
@@ -763,7 +772,7 @@ export class ClientRequest extends ClientBase {
 
 		/* check if the content should be dynamically encoded */
 		if (resp.disableEncoding) {
-			if (!this.closeHeader(resp.status, resp.headers, { media: resp.contentType, size: fullContentSize ?? undefined }))
+			if (!this.closeHeader(resp.status, resp.headers, { media: resp.contentType, size: fullContentSize ?? undefined }, resp.logDetail))
 				return cb(null);
 			return this.sendClientWrite(resp, chunk, last, cb);
 		}
@@ -773,7 +782,7 @@ export class ClientRequest extends ClientBase {
 		*	assume an encoding - can always be disabled in the real run, should the data be too short) */
 		let encoding = libHelper.negotiateEncoding(this.headers['accept-encoding'] ?? null, fullContentSize ?? chunk?.byteLength ?? null, resp.contentType);
 		if (encoding == null) {
-			if (!this.closeHeader(resp.status, resp.headers, { media: resp.contentType, size: fullContentSize ?? undefined }))
+			if (!this.closeHeader(resp.status, resp.headers, { media: resp.contentType, size: fullContentSize ?? undefined }, resp.logDetail))
 				return cb(null);
 			return this.sendClientWrite(resp, chunk, last, cb);
 		}
@@ -801,7 +810,8 @@ export class ClientRequest extends ClientBase {
 			});
 		}
 
-		if (!this.closeHeader(resp.status, resp.headers, { media: resp.contentType, size: fullContentSize ?? undefined, encoding: encoding.name }))
+		const logDetail = (resp.logDetail ?? '') + (resp.logDetail == null ? 'D' : ' d') + `ynamically [${encoding.name}] encoded`;
+		if (!this.closeHeader(resp.status, resp.headers, { media: resp.contentType, size: fullContentSize ?? undefined }, logDetail))
 			return cb(null);
 		return this.sendClientWrite(resp, chunk, last, cb);
 	}
@@ -848,20 +858,18 @@ export class ClientRequest extends ClientBase {
 		else
 			resp.writer.end(() => cb(null));
 	}
-	private sendClientData(status: libBase.StatusType, media: libBase.MediaType, headers: Record<string, string>, disableEncoding: boolean, contentSize: number | null): libStream.Writable {
+	private sendClientData(status: libBase.StatusType, media: libBase.MediaType, headers: Record<string, string>, disableEncoding: boolean, contentSize: number | null, logDetail: string | null): libStream.Writable {
 		const makeErrorStream = (msg: string) => new libStream.Writable({ write(_0, _1, cb) { cb(new Error(msg)) }, final(cb) { cb(new Error(msg)) } });
 
 		/* check if the object is already responded */
 		if (this.dropped)
 			return makeErrorStream('Connection broken');
-		if (this._state.response != ResponseState.none) {
-			this.badClientUsage('Response on already claimed connection', false);
+		if (this._state.response != ResponseState.none)
 			return makeErrorStream('Connection already responded');
-		}
 		this._state.response = ResponseState.preparing;
 
 		/* construct the actual response wrapper, which takes care of dynamic encoding and error handling */
-		const output = new HttpRequestResponse(this._native.writer, status, headers, contentSize, media, disableEncoding,
+		const output = new HttpRequestResponse(this._native.writer, status, headers, contentSize, media, logDetail, disableEncoding,
 			(chunk: Buffer | null, cb: (err: any) => void) => {
 				/* check if this is a head-request, in which case the data will just be drained */
 				if (this.isHead && output.responseCompleted)
@@ -1323,9 +1331,9 @@ export class ClientRequest extends ClientBase {
 		const header = { ...options?.headers };
 		this.applyCachePolicy(header, CachePolicy.sensitive, options?.cache);
 
-		const logReason = (options?.reason != null ? `Reason (not sent): ${options.reason}` : options?.message ?? null);
+		const logDetail = (options?.reason != null ? `Reason (not sent): ${options.reason}` : options?.message ?? null);
 		const content = (options?.message ?? `Access to [${this.url.pathname}] denied.`);
-		this.sendFullResponse(libBase.Status.Forbidden, logReason, header, { media: libBase.Media.Text, body: Buffer.from(content, 'utf-8') });
+		this.sendFullResponse(libBase.Status.Forbidden, logDetail, header, { media: libBase.Media.Text, body: Buffer.from(content, 'utf-8') });
 	}
 
 	/** respond with a any response of the given configuration (defaults to media-type: text/unknown/-, status: ok); if [lightResponse], the
@@ -1556,7 +1564,7 @@ export class ClientRequest extends ClientBase {
 
 		/* mark first as completed now */
 		const content = (this.isHead ? undefined : Buffer.from(page.finalize(), 'utf-8'));
-		this.sendFullResponse(status, `HTML of size [${content?.byteLength ?? 'light-response'}]`, header, {
+		this.sendFullResponse(status, `Built HTML${this.isHead ? ' light-response' : ''}`, header, {
 			media: libBase.Media.Html, body: content
 		});
 	}
@@ -1569,7 +1577,7 @@ export class ClientRequest extends ClientBase {
 		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
 		const content = (this.isHead ? undefined : Buffer.from((options?.isJson ? (value as string) : JSON.stringify(value)), 'utf-8'));
-		this.sendFullResponse(status, `JSON of size [${content?.byteLength ?? 'light-response'}]`, header, {
+		this.sendFullResponse(status, `Created JSON${this.isHead ? ' light-response' : ''}`, header, {
 			media: libBase.Media.Json, body: content
 		});
 	}
@@ -1583,8 +1591,7 @@ export class ClientRequest extends ClientBase {
 		const headers = { ...options?.headers };
 		this.applyCachePolicy(headers, CachePolicy.private, options?.cache);
 
-		this.log(`Responding with data and status [${status.msg}]`);
-		return this.sendClientData(status, options?.media ?? libBase.Media.Unknown, headers, options?.disableEncoding ?? false, options?.contentSize ?? null);
+		return this.sendClientData(status, options?.media ?? libBase.Media.Unknown, headers, options?.disableEncoding ?? false, options?.contentSize ?? null, 'Application data');
 	}
 
 	/** try to respond with the given file, return false, if the file does not exist (range aware, HEAD aware); specify [checkFreshness] to re-validate the file stats
@@ -1700,15 +1707,13 @@ export class ClientRequest extends ClientBase {
 		}
 
 		/* create the writer stream (doesn't throw, but errors; enforce the selected encoder) */
-		let stream = this.sendClientData(status, media, headers, true, (reader == null ? range.last - range.first + 1 : reader.contentSize()));
-
-		let logMsg = `Responding with file-${this.isHead ? 'HEAD' : 'content'} [${range.first} - ${range.last}/${cached.fileSize()}] from [${filePath}]`;
+		let logDetail = `File [${range.first} - ${range.last}/${cached.fileSize()}] from [${filePath}]`;
 		if (reader != null) {
-			logMsg += ` encoded using [${dynamicEncoder!.name}]`;
+			logDetail += ` encoded using [${dynamicEncoder!.name}]`;
 			if (reader.contentSize() != null)
-				logMsg += ` from cache as [${reader.contentSize()}] bytes`;
+				logDetail += ` from cache`;
 		}
-		this.log(logMsg);
+		const stream = this.sendClientData(status, media, headers, true, (reader == null ? range.last - range.first + 1 : reader.contentSize()), logDetail);
 
 		/* check if this is a head request, in which case the stream can just immediately be closed again, to prevent
 		*	the file from consuming resources (null-catch any errors to ensure they are not propagated out of the connection) */
@@ -1783,10 +1788,8 @@ export class ClientRequest extends ClientBase {
 	/** marks the object as having been handled and returns a web socket or automatically responds
 	 *	with a corresponding error and returns null (automatically validates method and headers) */
 	public async acceptWebSocket(): Promise<ClientSocket | null> {
-		if (this.dropped || (this._state.response != ResponseState.none && this._state.response != ResponseState.preparing)) {
-			this.badClientUsage('WebSocket upgrade on already claimed connection', false);
+		if (this.dropped || (this._state.response != ResponseState.none && this._state.response != ResponseState.preparing))
 			return null;
-		}
 
 		/* check if the connection is a valid upgrade request (and ensure that the underlying web-server, also detected it) */
 		let connection = libHelper.splitAndTrimList(this.headers.connection?.toLowerCase() ?? null, ',', false);
