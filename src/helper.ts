@@ -283,6 +283,30 @@ export function escapePlaceholders(content: string): string {
 	return out;
 }
 
+/** normalize the URI encoding of the path to a canonical form by ensuring only the following characters are encoded
+ *	('% / \ ? # [ ] < > ^ ' ` { | }', space control characters, and non-ascii), and sanitize the final path (returns
+ *	only the sanitized path and 'false', if it contained malformed escape sequences or invalid UTF-8) */
+export function normalizeEncodedPath(path: string): [string, boolean] {
+	const NORMALIZED_VALID_CHARS = /%(24|26|2B|2C|3A|3B|3D|40)/g;
+	const components = path.replaceAll('\\', '/').split('/');
+
+	/* decode and re-encode every component to produce the canonical encoding */
+	for (let i = 0; i < components.length; ++i) {
+		/* try to decode the component and leave the entire path sanitized as-is on errors */
+		let decoded = '';
+		try { decoded = decodeURIComponent(components[i]); }
+		catch (_) {
+			return [sanitize(path, false), false];
+		}
+
+		/* re-encode the component to the reduced canonical set */
+		components[i] = encodeURIComponent(decoded).replace(NORMALIZED_VALID_CHARS, (c) => decodeURIComponent(c));
+	}
+
+	/* create the final sanitized complete path */
+	return [sanitize(components.join('/'), false), true];
+}
+
 /** sanitize path and remove relative path components and convert it to an absolute path;
  *	if [relative], path will be sanitized, but may remain relative, such as [../foo] */
 export function sanitize(path: string, relative: boolean): string {

@@ -827,9 +827,10 @@ export class CacheHost extends libLog.Logger {
 		return this._config;
 	}
 
-	/** [throws] if [checkFreshness] is true, re-validate the file stats on disk before serving from cache (defaults
-	 *	to false); resolve immutable ids automatically (Cached to interact with cache; null, if it does not exist,
-	 *	string if the immutable path has been permanently moved to the new path in source space) */
+	/** [throws] if [checkFreshness] is true, re-validate the file stats on disk before serving from cache (defaults to
+	 *	false); resolve immutable ids automatically (Cached to interact with cache; null, if it does not exist, string if
+	 *	the immutable path has been permanently moved to the new path in source space; the redirected path will be in the
+	 *	same shape as originally used to create the immutable path: relative to the owner module and URI encoded) */
 	public fetchImmutable(path: string, options?: { checkFreshness?: boolean }): Cached | string | null {
 		return this.resolveCache(path, options?.checkFreshness ?? false, true);
 	}
@@ -841,11 +842,11 @@ export class CacheHost extends libLog.Logger {
 	}
 
 	/** generate a unique tagged path for the given query path, which will change whenever the underlying file changes;
-	 *	[checkFreshness]: if true, re-validate the file stats on disk to detect changes (defaults to false); creates
-	 *	a path to a file, which looks similar to the source, except that the name includes a unique id, which will be
-	 *	used to identity the given file state (will be removed from the final target path to be served, to identify
-	 *	the actual source); [path] should be given in the module's path space (i.e. before applying client.makePath),
-	 *	as this path will be used as basis for redirects in case of oudated id's */
+	 *	[checkFreshness]: if true, re-validate the file stats on disk to detect changes (defaults to false); creates a path
+	 *	to a file, which looks similar to the source, except that the name includes a unique id, which will be used to
+	 *	identify the given file state (will be removed from the final target path to be served, to identify the actual source);
+	 *	[path] must be given in the module's path space (i.e. before applying client.makePath), and URI encoded as this path
+	 *	will be used as basis for redirects in case of outdated id's; path's URI encoding is preserved by the produced path */
 	public immutable(module: string, path: string, options?: { checkFreshness?: boolean }): string {
 		return this._immutableManager.make(module, path, options?.checkFreshness ?? false);
 	}

@@ -151,9 +151,13 @@ export function Meta(name: HtmlString, content: HtmlString): HtmlComponent {
 export function Title(name: HtmlString): HtmlComponent {
 	return new DualTag('title', {}, new EmbeddedContent(HtmlGuard.get(name).content, true));
 }
+
+/** load external css; path must be properly URI encoded (is only html-escaped, never URI encoded) */
 export function LoadStyle(path: HtmlString): HtmlComponent {
 	return new SingleTag('link', { rel: 'stylesheet', type: 'text/css', href: path });
 }
+
+/** load external javascript; path must be properly URI encoded (is only html-escaped, never URI encoded) */
 export function LoadScript(path: HtmlString, properties: Record<string, HtmlString> = {}): HtmlComponent {
 	return new DualTag('script', { ...properties, src: path }, []);
 }

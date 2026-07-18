@@ -32,18 +32,19 @@ class ClientContext {
 }
 
 class ClientBase extends libLog.Logger {
+	private _server: libServer.Server;
 	private _config: BurntClientConfig;
 	protected _path: string;
 	protected _translation: Record<string, string | null>[];
 
-	protected constructor(url: libUrl.URL, kind: string, config: BurntClientConfig);
-	protected constructor(client: ClientBase, kind: string, config: BurntClientConfig);
-	protected constructor(arg: libUrl.URL | ClientBase, kind: string, config: BurntClientConfig) {
+	protected constructor(url: libUrl.URL, kind: string, server: libServer.Server, config: BurntClientConfig);
+	protected constructor(client: ClientBase, kind: string, server: libServer.Server, config: BurntClientConfig);
+	protected constructor(arg: libUrl.URL | ClientBase, kind: string, server: libServer.Server, config: BurntClientConfig) {
 		super(kind);
 
 		if (arg instanceof libUrl.URL) {
 			this._translation = [];
-			this._path = libHelper.sanitize(arg.pathname, false);
+			this._path = arg.pathname;
 			this.url = arg;
 		}
 		else {
@@ -52,15 +53,27 @@ class ClientBase extends libLog.Logger {
 			this.url = arg.url;
 		}
 
+		this._server = server;
 		this._config = config;
 	}
 
-	/** raw request origin (no host will result in '_'; host will be lower-case; NOT sanitized) */
+	/** raw request origin (host will be lower-case; NOT sanitized) */
 	readonly url: libUrl.URL;
 
-	/** path relative to current module (fully sanitized and clean path, does not end in a slash, unless its root) */
+	/** path relative to current module (fully sanitized and clean path, does not end in a slash, unless its root; remains
+	 *	URI encoded in the canonical form; only characters, which may not appear literally in a path component, remain encoded) */
 	public get path(): string {
 		return this._path;
+	}
+
+	/** server the client originates from */
+	public get server(): libServer.Server {
+		return this._server;
+	}
+
+	/** cache host used by this server and client */
+	public get cache(): libCache.CacheHost {
+		return this._server.cache;
 	}
 
 	/** configuration used by this client */
@@ -68,11 +81,14 @@ class ClientBase extends libLog.Logger {
 		return this._config
 	}
 
-	/** create a path relative from the current module into the clients traversed server space (path must be
-	 *	properly URI encoded; returns URI encoded path, as translations guarantee to also be properly URI encoded) */
+	/** create a path relative from the current module into the clients traversed server space (path must be properly URI encoded and will be normalized
+	 *	and sanitized to the canonical encoding; returns a canonically URI encoded path, as translations guarantee to also be properly URI encoded) */
 	public makePath(path: string): string {
-		path = libHelper.sanitize(path, false);
-		let output = path, unmapped = false;
+		/* normalize and sanitize the path */
+		const [sanitized, valid] = libHelper.normalizeEncodedPath(path);
+		if (!valid)
+			this.warning(`Path [${path}] contains malformed URI encoding`);
+		let output = sanitized, unmapped = false;
 
 		for (let i = this._translation.length - 1; i >= 0; --i) {
 			let match: [string, string] | null = null;
@@ -95,6 +111,16 @@ class ClientBase extends libLog.Logger {
 		if (unmapped)
 			this.warning(`Path [${path}] is not mapped by translations`);
 		return output;
+	}
+
+	/** create a path tagged with an immutable id relative from the current module into the clients traversed server
+	 *	space (path must be properly URI encoded and will be normalized and sanitized to the canonical encoding;
+	 *	returns a canonically URI encoded path, as translations and cache guarantee to also be properly URI encoded) */
+	public makeImmutable(module: string, path: string, options?: { checkFreshness?: boolean }): string {
+		const [sanitized, valid] = libHelper.normalizeEncodedPath(path);
+		if (!valid)
+			this.warning(`Path [${path}] contains malformed URI encoding`);
+		return this.makePath(this.cache.immutable(module, sanitized, options));
 	}
 
 	/** check if the path relative to the current module is a sub path or the same of the given test base path (can be /base or /base/...) */
@@ -217,6 +243,10 @@ export enum CachePolicy {
  *	Does not throw any exceptions, unless explicitly stated.
  *	Http HEAD aware (will silently drain any data sent from a HEAD request).
  *
+ *	HTTP version will at least be 1.1 (thereby enforcing host field).
+ *	The path will be sanitized and canonically encoded (will always be relative to last translation).
+ *	The 'url' component encodes the raw request, without any sanitization.
+ *
  *	Path remains URI encoded, as it was received, and path building will use the same encoded paths.
  *	Repeated request responding may override any ongoing responses and may terminate the connection; depending on the prior state.
  *	Not responded to requests will result in [not-found].
@@ -286,10 +316,9 @@ export class ClientRequest extends ClientBase {
 		timeout?: number;
 	};
 	private _request: libHttp.IncomingMessage;
-	private _server: libServer.Server;
 
 	private constructor(server: libServer.Server, config: BurntClientConfig, protocol: string, kind: string, request: libHttp.IncomingMessage, response: libHttp.ServerResponse | { socket: libStream.Duplex, head: Buffer, wss: libWs.WebSocketServer }) {
-		super(new libUrl.URL(`${protocol}://${request.headers.host?.toLowerCase() ?? '_'}${request.url}`), kind, config);
+		super(new libUrl.URL(`${protocol}://${request.headers.host?.toLowerCase() ?? '_'}${request.url}`), kind, server, config);
 		this._patcher = { list: [], index: null };
 
 		let respondedResolve: any = null, completedResolve: any = null, closedResolve: any = null, droppedResolve: any = null;
@@ -314,7 +343,6 @@ export class ClientRequest extends ClientBase {
 		this._state.droppedResolve = droppedResolve;
 
 		this._request = request;
-		this._server = server;
 
 		/* setup the throughput measurement to detect any stalling connections */
 		this._throughput = { timer: null, deadline: 0, start: 0, active: true, busyCheck: [] };
@@ -1051,8 +1079,13 @@ export class ClientRequest extends ClientBase {
 		else {
 			sanitized = {};
 			for (const [_from, _to] of Object.entries(map)) {
-				const from = libHelper.sanitize(_from, false);
-				const to = (_to == null ? null : libHelper.sanitize(_to, false));
+				/* normalize and sanitize the encoding of the mapping (to ensure matching against the canonically encoded paths is consistent) */
+				const [from, validFrom] = libHelper.normalizeEncodedPath(_from);
+				const [to, validTo] = (_to == null ? ['', false] : libHelper.normalizeEncodedPath(_to));
+				if (!validFrom || !validTo) {
+					this.warning(`Translation [${_from}] => [${_to}] contains malformed URI encoding`);
+					continue;
+				}
 				sanitized[from] = to;
 
 				/* check if the mapping can be applied to the current path */
@@ -1089,6 +1122,21 @@ export class ClientRequest extends ClientBase {
 	}
 	public static _fromUpgrade(protocol: string, request: libHttp.IncomingMessage, socket: libStream.Duplex, head: Buffer, config: BurntClientConfig, server: libServer.Server, wss: libWs.WebSocketServer): ClientRequest {
 		return new ClientRequest(server, config, protocol, 'upgrade', request, { socket, head, wss });
+	}
+	public _initializeConnection(): boolean {
+		/* validate the HTTP version (to ensure a host value is provided) */
+		if (this._request.httpVersion == '1.0') {
+			this.respondHttpVersionNotSupported('1.1');
+			return false;
+		}
+
+		/* normalize the path encoding and validate it */
+		const [normalized, valid] = libHelper.normalizeEncodedPath(this._path);
+		if (!valid)
+			this.respondBadRequest({ reason: 'Malformed URI encoding in path' });
+		else
+			this._path = normalized;
+		return valid;
 	}
 	public async _finalizeConnection(): Promise<void> {
 		this.cleanupContext(true);
@@ -1131,16 +1179,6 @@ export class ClientRequest extends ClientBase {
 		if (this._state.response == ResponseState.completed || this.dropped)
 			return this.dropConnection(ConnectionState.broken, `Connection killed: ${reason}`, true, true);
 		this.breakWithResponse(`Connection killed: ${reason}`, (options?.graceful ?? false), false, (desc, headers) => this.respondInternalError(desc, { headers }));
-	}
-
-	/** server the client originates from */
-	public get server(): libServer.Server {
-		return this._server;
-	}
-
-	/** cache host used by this server and client */
-	public get cache(): libCache.CacheHost {
-		return this._server.cache;
 	}
 
 	/** request has been engaged with (receiving or responding was started, or the connection has been
@@ -1549,12 +1587,11 @@ export class ClientRequest extends ClientBase {
 		return this.sendClientData(status, options?.media ?? libBase.Media.Unknown, headers, options?.disableEncoding ?? false, options?.contentSize ?? null);
 	}
 
-	/** try to respond with the given file, return false, if the file does not exist (range aware, HEAD aware); specify [checkFreshness]
-	 *	to re-validate the file stats on disk before serving from cache; the media type can be overwritten (defaults to extracting
-	 *	media-type from the file-path); [encoding] describes the encoding of a pre-encoded file (warning: no checks against accepted
-	 *	encodings performed!); status will be [Ok], [partial-content], [not-modified] or according errors cache aware and etag/last-modified
-	 *	aware; cache policy defaults to [immutable] for versioned paths, or [static] otherwise; immutable paths must be created relative
-	 *	to the modules path space (i.e. before ClientRequest.makePath), as outdated id's are redirected via makePath */
+	/** try to respond with the given file, return false, if the file does not exist (range aware, HEAD aware); specify [checkFreshness] to re-validate the file stats
+	 *	on disk before serving from cache; the media type can be overwritten (defaults to extracting media-type from the file-path); [encoding] describes the encoding
+	 *	of a pre-encoded file (warning: no checks against accepted encodings performed!); status will be [Ok], [partial-content], [not-modified] or according errors
+	 *	cache aware and etag/last-modified aware; cache policy defaults to [immutable] for versioned paths, or [static] otherwise; immutable paths must be created
+	 *	relative to the modules path space (i.e. before ClientRequest.makePath) and from properly URI encoded paths, as outdated id's are redirected via makePath */
 	public async tryRespondFile(filePath: string, options?: { encoded?: string, media?: libBase.MediaType, headers?: Record<string, string>, checkFreshness?: boolean, cache?: CachePolicy }): Promise<boolean> {
 		if (options == null)
 			options = {};
@@ -1571,7 +1608,7 @@ export class ClientRequest extends ClientBase {
 			return true;
 		}
 		if (typeof cached == 'string') {
-			this.respondPermanentRedirect(this.makePath(encodeURI(cached)));
+			this.respondPermanentRedirect(this.makePath(cached));
 			return true;
 		}
 
@@ -1831,7 +1868,7 @@ export class ClientSocket extends ClientBase {
 	}
 
 	private constructor(ws: libWs.WebSocket, source: ClientRequest) {
-		super(source, 'socket', source.config);
+		super(source, 'socket', source.server, source.config);
 		this._ws = ws;
 		this._alive = { timer: null, isAlive: true };
 		this._closing = { promise: null, closed: null, defer: 0 };

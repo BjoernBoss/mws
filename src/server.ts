@@ -188,36 +188,37 @@ export class Listener {
 		this._host.self.info(`Successfully started [${this._self.endpoint}] on ${this._self.listening} with handler [${this._native.attached.module.identity}]`);
 		this.emitEventSync('listening', address);
 	}
-	private async handleClient(request: libHttp.IncomingMessage, client: libClient.ClientRequest): Promise<void> {
+	private async handleClient(client: libClient.ClientRequest): Promise<boolean> {
 		if (this._handling.count++ == 0)
 			this._handling.promise = new Promise<void>((res) => this._handling.resolver = res);
 		const endpoint = `${this._host.self.identity}.${this._self.endpoint}`;
 
 		/* register the completed log immediately to ensure it is logged as the first thing before the other completed awaits execute */
-		client.log(`Connected to [${endpoint}] using [method: ${request.method ?? '_'}] from [${request.socket.remoteAddress}]:${request.socket.remotePort} to [${client.url.href}] (user-agent: [${request.headers['user-agent'] ?? ''}])`);
+		client.log(`Connected to [${endpoint}] using [method: ${client.method ?? '_'}] from [${client.remote.address}]:${client.remote.port} to [${client.url.href}] (user-agent: [${client.headers['user-agent'] ?? ''}])`);
 		client.completed.then(() => client.log(`Completed on [${endpoint}]`));
 
 		try {
-			if (request.httpVersion == '1.0')
-				client.respondHttpVersionNotSupported('1.1');
-			else
+			/* initialize the connection (performs initial validations) and then pass it to the handler */
+			if (client._initializeConnection())
 				await this._native.attached.handle(client);
 		} catch (err: any) {
 			client.respondInternalError(`Uncaught exception: ${err.message}`);
 		}
 
 		/* kill the connection on any errors, as the finalizing normally ensures that the response is completed */
+		let result = true;
 		try {
 			await client._finalizeConnection();
 		} catch (err: any) {
 			client.error(`Fatal error while finalizing [${client.identity}]: ${err.message}`);
-			request.destroy(new Error('Unhandled exception'));
+			result = false;
 		}
 
 		if (--this._handling.count == 0) {
 			this._handling.promise = null;
 			this._handling.resolver();
 		}
+		return result;
 	}
 	private configure(who: string, options: ListenOptions): void {
 		/* defer the failure to allow the caller to attach listeners */
@@ -309,7 +310,8 @@ export class Listener {
 		}
 
 		const client = libClient.ClientRequest._fromRequest(this._self.protocol, request, response, this._config, this._host.self);
-		await this.handleClient(request, client);
+		if (!await this.handleClient(client))
+			request.destroy(new Error('Fatal handling error'));
 	}
 
 	/** manually pass an upgrade through the listener (takes ownership of the connection; immediately closes the connection if the listener is not running anymore) */
@@ -320,7 +322,8 @@ export class Listener {
 		}
 
 		const client = libClient.ClientRequest._fromUpgrade(this._self.protocol, request, socket, head, this._config, this._host.self, this._native.wss);
-		await this.handleClient(request, client);
+		if (!await this.handleClient(client))
+			request.destroy(new Error('Fatal handling error'));
 	}
 
 	/** server this listener belongs to */

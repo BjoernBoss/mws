@@ -5,6 +5,7 @@ import * as libLog from "./log.js";
 import * as libBase from "./base.js";
 import * as libServer from "./server.js";
 import * as libCache from "./cache.js";
+import * as libHelper from "./helper.js";
 
 interface LinkedModules {
 	parent: ModuleHandler | null;
@@ -18,7 +19,8 @@ interface LinkedModules {
 *	Paths are matched by longest path. Unmapped paths will not be forwarded.
 *	A null translation is considered not being mapped and will not be forwarded.
 *	Reversed paths will implicitly use the identity translation for unmapped paths.
-*	Mappings must be URI encoded, if their representation requires it.
+*	Mappings must be URI encoded, if their representation requires it, and will be
+*	normalized to the canonical encoding (mappings with malformed encodings are skipped).
 */
 export type PathTranslation = Record<string, string | null>;
 
@@ -464,7 +466,7 @@ export abstract class ModuleHandler extends libLog.Logger {
 
 /**
 *	Simple module handler implementation, which dispatches requests to different children based on the request path (longest match).
-*	Stops itself once all children have been unlinked. Own parameters are not forwarded.
+*	Used paths must be URI encoded. Stops itself once all children have been unlinked. Own parameters are not forwarded.
 */
 export function dispatch(map: Record<string, ModuleHandler>, options?: { name?: string }): DispatchModule {
 	return new DispatchModule(map, options);
@@ -476,7 +478,13 @@ export class DispatchModule extends ModuleHandler {
 		super(options?.name ?? 'dispatch');
 		this.mapping = {};
 
-		for (const [key, handler] of Object.entries(map)) {
+		for (const [_key, handler] of Object.entries(map)) {
+			/* normalize the encoding of the key, as it is matched against the canonically encoded client path */
+			const [key, valid] = libHelper.normalizeEncodedPath(_key);
+			if (!valid) {
+				this.warning(`Ignoring mapping [${_key}] with malformed URI encoding by [${handler.identity}]`);
+				continue;
+			}
 			if (key in this.mapping) {
 				this.warning(`Ignoring duplicate mapping [${key}] by [${handler.identity}]`);
 				continue;
