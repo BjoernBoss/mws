@@ -57,6 +57,32 @@ class ClientBase extends libLog.Logger {
 		this._config = config;
 	}
 
+	private makeTranslatedPath(path: string): string {
+		let original = path, unmapped = false;
+
+		for (let i = this._translation.length - 1; i >= 0; --i) {
+			let match: [string, string] | null = null;
+
+			/* find the best reverse mapping and apply it */
+			for (const [from, to] of Object.entries(this._translation[i])) {
+				if (to != null && libHelper.isSubPath(to, path) && (match == null || match[1].length < to.length))
+					match = [from, to];
+			}
+
+			/* check if a mapping has been found and reverse-apply it and otherwise use an implicit identity mapping (no need to
+			*	check any forward mappings as no certain decisions can be made until the path has been fully reverse-translated) */
+			if (match != null)
+				path = libHelper.rebasePath(match[1], match[0], path);
+			else
+				unmapped = true;
+		}
+
+		/* check if the final path was partially unmapped */
+		if (unmapped)
+			this.warning(`Path [${original}] is not mapped by translations`);
+		return path;
+	}
+
 	/** raw request origin (host will be lower-case; NOT sanitized) */
 	readonly url: libUrl.URL;
 
@@ -88,29 +114,7 @@ class ClientBase extends libLog.Logger {
 		const [sanitized, valid] = libHelper.normalizeEncodedPath(path);
 		if (!valid)
 			this.warning(`Path [${path}] contains malformed URI encoding`);
-		let output = sanitized, unmapped = false;
-
-		for (let i = this._translation.length - 1; i >= 0; --i) {
-			let match: [string, string] | null = null;
-
-			/* find the best reverse mapping and apply it */
-			for (const [from, to] of Object.entries(this._translation[i])) {
-				if (to != null && libHelper.isSubPath(to, output) && (match == null || match[1].length < to.length))
-					match = [from, to];
-			}
-
-			/* check if a mapping has been found and reverse-apply it and otherwise use an implicit identity mapping (no need to
-			*	check any forward mappings as no certain decisions can be made until the path has been fully reverse-translated) */
-			if (match != null)
-				output = libHelper.rebasePath(match[1], match[0], output);
-			else
-				unmapped = true;
-		}
-
-		/* check if the final path was partially unmapped */
-		if (unmapped)
-			this.warning(`Path [${path}] is not mapped by translations`);
-		return output;
+		return this.makeTranslatedPath(sanitized);
 	}
 
 	/** create a path tagged with an immutable id relative from the current module into the clients traversed server
@@ -120,7 +124,7 @@ class ClientBase extends libLog.Logger {
 		const [sanitized, valid] = libHelper.normalizeEncodedPath(path);
 		if (!valid)
 			this.warning(`Path [${path}] contains malformed URI encoding`);
-		return this.makePath(this.cache.immutable(module, sanitized, options));
+		return this.makeTranslatedPath(this.cache.immutable(module, sanitized, options));
 	}
 
 	/** check if the path relative to the current module is a sub path or the same of the given test base path (can be /base or /base/...) */
@@ -392,24 +396,6 @@ export class ClientRequest extends ClientBase {
 		this._request.socket.setTimeout((this.config.throughputWindow + this.config.throughputGrace) * 2);
 	}
 
-	private constructQuickResponse(status: libBase.StatusType, logReason: string | null, headers: Record<string, string>, content?: { media: libBase.MediaType, body?: Buffer } | null): void {
-		const description = `${this.isHead ? 'HEAD:' : ''}[${status.msg}]${logReason == null ? '' : `: ${logReason}`}`;
-
-		/* check if the response can still be sent */
-		if (this._state.response == ResponseState.completed)
-			this.warning(`Request already completed, discarding response ${description}`);
-		else if (this.dropped)
-			this.trace(`Request broken, discarding response ${description}`);
-		else if (this._state.response == ResponseState.headerSent)
-			this.dropConnection(ConnectionState.broken, `Overlap with committed response ${description}`, false, false);
-		else {
-			if (status.code >= 500)
-				this.error(`Responding with ${description}`);
-			else
-				this.log(`Responding with ${description}`);
-			this.sendFullResponse(status, headers, content ?? undefined);
-		}
-	}
 	private failThroughput(): void {
 		if (this.config.throughputThreshold <= 0 || !this._throughput.active || this.dropped)
 			return;
@@ -638,13 +624,14 @@ export class ClientRequest extends ClientBase {
 		/* invoke all registered patcher to let them modify the content (in reverse order to ensure
 		*	first added is last executed, and check if one of them produced an alternate response) */
 		for (this._patcher.index = (index == null ? this._patcher.list.length : index) - 1; this._patcher.index >= 0; --this._patcher.index) {
+			if (this._state.response != ResponseState.none && this._state.response != ResponseState.preparing)
+				break;
+
 			try {
 				cb(this._patcher.list[this._patcher.index]);
 			} catch (err: any) {
 				this.badClientUsage(`Unhandled exception in patcher: ${err.message}`, false);
 			}
-			if (this._state.response != ResponseState.none && this._state.response != ResponseState.preparing)
-				break;
 		}
 		this._patcher.index = index;
 	}
@@ -705,7 +692,24 @@ export class ClientRequest extends ClientBase {
 		}
 		return true;
 	}
-	private sendFullResponse(status: libBase.StatusType, headers: Record<string, string>, content?: { media: libBase.MediaType, body?: Buffer }): void {
+	private sendFullResponse(status: libBase.StatusType, logReason: string | null, headers: Record<string, string>, content: { media: libBase.MediaType, body?: Buffer } | null): void {
+		const description = `${this.isHead ? 'HEAD:' : ''}[${status.code}: ${status.msg}]${logReason == null ? '' : `: ${logReason}`}`;
+
+		/* check if the response can still be sent */
+		if (this._state.response == ResponseState.completed)
+			return this.warning(`Request already completed, discarding response ${description}`);
+		else if (this.dropped)
+			return this.trace(`Request broken, discarding response ${description}`);
+		else if (this._state.response == ResponseState.headerSent)
+			return this.dropConnection(ConnectionState.broken, `Overlap with committed response ${description}`, false, false);
+
+		/* log the response result */
+		if (status.code >= 500)
+			this.error(`Responding with ${description}`);
+		else
+			this.log(`Responding with ${description}`);
+
+		/* check if the response body can be dynamically encoded */
 		let encoding: libBase.EncodingType | null = null;
 		if (content != null) {
 			headers['Vary'] = 'Accept-Encoding';
@@ -1309,7 +1313,7 @@ export class ClientRequest extends ClientBase {
 		this.applyCachePolicy(header, CachePolicy.sensitive, options?.cache);
 
 		const content: string = (options?.message ?? `An internal server error occurred while processing the request for [${this.url.pathname}].`);
-		this.constructQuickResponse(libBase.Status.InternalError, `Reason (not sent): ${reason}`, header, {
+		this.sendFullResponse(libBase.Status.InternalError, `Reason (not sent): ${reason}`, header, {
 			media: libBase.Media.Text, body: Buffer.from(content, 'utf-8')
 		});
 	}
@@ -1321,7 +1325,7 @@ export class ClientRequest extends ClientBase {
 
 		const logReason = (options?.reason != null ? `Reason (not sent): ${options.reason}` : options?.message ?? null);
 		const content = (options?.message ?? `Access to [${this.url.pathname}] denied.`);
-		this.constructQuickResponse(libBase.Status.Forbidden, logReason, header, { media: libBase.Media.Text, body: Buffer.from(content, 'utf-8') });
+		this.sendFullResponse(libBase.Status.Forbidden, logReason, header, { media: libBase.Media.Text, body: Buffer.from(content, 'utf-8') });
 	}
 
 	/** respond with a any response of the given configuration (defaults to media-type: text/unknown/-, status: ok); if [lightResponse], the
@@ -1332,7 +1336,7 @@ export class ClientRequest extends ClientBase {
 		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
 		if (content == null)
-			return this.constructQuickResponse(status, 'no body', header, null);
+			return this.sendFullResponse(status, 'no body', header, null);
 
 		let media = options?.media ?? libBase.Media.Text;
 		if (typeof content == 'string')
@@ -1340,7 +1344,7 @@ export class ClientRequest extends ClientBase {
 		else if (options?.media == null)
 			media = libBase.Media.Unknown;
 
-		this.constructQuickResponse(status, `[${media.mediaType}] of size [${content.byteLength}]`, header, {
+		this.sendFullResponse(status, `[${media.mediaType}] of size [${content.byteLength}]`, header, {
 			media, body: ((options?.lightResponse && this.isHead) ? undefined : content)
 		});
 	}
@@ -1351,7 +1355,7 @@ export class ClientRequest extends ClientBase {
 		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
 		const content: string = (options?.message ?? `Request for [${this.url.pathname}] is perceived as malformed${options?.reason == null ? '.' : `:\n${options.reason}`}`);
-		this.constructQuickResponse(libBase.Status.BadRequest, (options?.reason ?? options?.message ?? null), header, {
+		this.sendFullResponse(libBase.Status.BadRequest, (options?.reason ?? options?.message ?? null), header, {
 			media: libBase.Media.Text, body: Buffer.from(content, 'utf-8')
 		});
 	}
@@ -1362,7 +1366,7 @@ export class ClientRequest extends ClientBase {
 		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
 		const content: string = (options?.message ?? `Conflict for resource [${this.url.pathname}]${options?.reason == null ? '.' : `:\n${options.reason}`}`);
-		this.constructQuickResponse(libBase.Status.Conflict, (options?.reason ?? options?.message ?? null), header, {
+		this.sendFullResponse(libBase.Status.Conflict, (options?.reason ?? options?.message ?? null), header, {
 			media: libBase.Media.Text, body: Buffer.from(content, 'utf-8')
 		});
 	}
@@ -1373,7 +1377,7 @@ export class ClientRequest extends ClientBase {
 		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
 		const content: string = (options?.message ?? `${this.method} was successful for [${this.url.pathname}]${options?.reason == null ? '.' : `:\n${options.reason}`}`);
-		this.constructQuickResponse(libBase.Status.Ok, (options?.reason ?? options?.message ?? null), header, {
+		this.sendFullResponse(libBase.Status.Ok, (options?.reason ?? options?.message ?? null), header, {
 			media: libBase.Media.Text, body: Buffer.from(content, 'utf-8')
 		});
 	}
@@ -1384,7 +1388,7 @@ export class ClientRequest extends ClientBase {
 		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
 		const content: string = (options?.message ?? `Resource [${this.url.pathname}] could not be found.`);
-		this.constructQuickResponse(libBase.Status.NotFound, (options?.message ?? null), header, {
+		this.sendFullResponse(libBase.Status.NotFound, (options?.message ?? null), header, {
 			media: libBase.Media.Text, body: Buffer.from(content, 'utf-8')
 		});
 	}
@@ -1397,7 +1401,7 @@ export class ClientRequest extends ClientBase {
 		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
 		const content: string = (options?.message ?? `Resource [${this.url.pathname}] successfully created:\n${target}`);
-		this.constructQuickResponse(libBase.Status.Created, (options?.message == null ? target : `[${target}]: ${options.message}`), header, {
+		this.sendFullResponse(libBase.Status.Created, (options?.message == null ? target : `[${target}]: ${options.message}`), header, {
 			media: libBase.Media.Text, body: Buffer.from(content, 'utf-8')
 		});
 	}
@@ -1407,7 +1411,7 @@ export class ClientRequest extends ClientBase {
 		const header = { ...options?.headers };
 		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
-		this.constructQuickResponse(libBase.Status.HttpVersionNotSupported, minVersion, header, {
+		this.sendFullResponse(libBase.Status.HttpVersionNotSupported, minVersion, header, {
 			media: libBase.Media.Text, body: Buffer.from(`Resource [${this.url.pathname}] requires at least [${minVersion}].`, 'utf-8')
 		});
 	}
@@ -1421,7 +1425,7 @@ export class ClientRequest extends ClientBase {
 			header['Last-Modified'] = options.lastModified;
 		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
-		this.constructQuickResponse(libBase.Status.NotModified, null, header, null);
+		this.sendFullResponse(libBase.Status.NotModified, null, header, null);
 	}
 
 	/** respond with [precondition-failed] and a default text response (ensure the etag and/or last-modified is set); cache policy defaults to [private] */
@@ -1433,7 +1437,7 @@ export class ClientRequest extends ClientBase {
 			header['Last-Modified'] = options.lastModified;
 		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
-		this.constructQuickResponse(libBase.Status.PreconditionFailed, reason, header, {
+		this.sendFullResponse(libBase.Status.PreconditionFailed, reason, header, {
 			media: libBase.Media.Text, body: Buffer.from(`Precondition for resource [${this.url.pathname}] failed:\n${reason}`, 'utf-8')
 		});
 	}
@@ -1444,7 +1448,7 @@ export class ClientRequest extends ClientBase {
 		header['Content-Range'] = `bytes */${size}`;
 		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
-		this.constructQuickResponse(libBase.Status.RangeIssue, `[${range}] cannot be satisfied for size [${size}]`, header, {
+		this.sendFullResponse(libBase.Status.RangeIssue, `[${range}] cannot be satisfied for size [${size}]`, header, {
 			media: libBase.Media.Text, body: Buffer.from(`Range [${range}] cannot be satisfied for [${this.url.pathname}] of size ${size}.`, 'utf-8')
 		});
 	}
@@ -1454,7 +1458,7 @@ export class ClientRequest extends ClientBase {
 		const header = { ...options?.headers };
 		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
-		this.constructQuickResponse(libBase.Status.UnsupportedMediaType, `Allowed was [${allowed}] but [${used}] was used`, header, {
+		this.sendFullResponse(libBase.Status.UnsupportedMediaType, `Allowed was [${allowed}] but [${used}] was used`, header, {
 			media: libBase.Media.Text, body: Buffer.from(`Media type [${used}] not supported for [${this.url.pathname}].\nAllowed: ${allowed}`, 'utf-8')
 		});
 	}
@@ -1465,7 +1469,7 @@ export class ClientRequest extends ClientBase {
 		header['Allow'] = allowed;
 		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
-		this.constructQuickResponse(libBase.Status.MethodNotAllowed, `Allowed was [${allowed}] but [${method}] was used`, header, {
+		this.sendFullResponse(libBase.Status.MethodNotAllowed, `Allowed was [${allowed}] but [${method}] was used`, header, {
 			media: libBase.Media.Text, body: Buffer.from(`Method ${method} not allowed for [${this.url.pathname}].\nAllowed: ${allowed}.`, 'utf-8')
 		});
 	}
@@ -1476,7 +1480,7 @@ export class ClientRequest extends ClientBase {
 		header['Connection'] = 'close';
 		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
-		this.constructQuickResponse(libBase.Status.RequestTimeout, reason, header, {
+		this.sendFullResponse(libBase.Status.RequestTimeout, reason, header, {
 			media: libBase.Media.Text, body: Buffer.from(`Request processing of [${this.url.pathname}] timed out:\n${reason}`, 'utf-8')
 		});
 	}
@@ -1486,7 +1490,7 @@ export class ClientRequest extends ClientBase {
 		const header = { ...options?.headers };
 		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
-		this.constructQuickResponse(libBase.Status.ContentTooLarge, `[${atLeastProvided}] > [${allowed}]`, header, {
+		this.sendFullResponse(libBase.Status.ContentTooLarge, `[${atLeastProvided}] > [${allowed}]`, header, {
 			media: libBase.Media.Text, body: Buffer.from(`Content of at least size ${atLeastProvided} too large for [${this.url.pathname}].\nAt most ${allowed} bytes are allowed.`, 'utf-8')
 		});
 	}
@@ -1499,7 +1503,7 @@ export class ClientRequest extends ClientBase {
 		header['Upgrade'] = upgrade;
 		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
-		this.constructQuickResponse(libBase.Status.UpgradeRequired, `Required: ${upgrade}`, header, {
+		this.sendFullResponse(libBase.Status.UpgradeRequired, `Required: ${upgrade}`, header, {
 			media: libBase.Media.Text, body: Buffer.from(`Endpoint [${this.url.pathname}] requires an upgrade.\nRequired: ${upgrade}`, 'utf-8')
 		});
 	}
@@ -1511,7 +1515,7 @@ export class ClientRequest extends ClientBase {
 		header['Location'] = target;
 		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
-		this.constructQuickResponse(libBase.Status.SeeOther, target, header, {
+		this.sendFullResponse(libBase.Status.SeeOther, target, header, {
 			media: libBase.Media.Text, body: Buffer.from(`Continue at: ${target}`, 'utf-8')
 		});
 	}
@@ -1523,7 +1527,7 @@ export class ClientRequest extends ClientBase {
 		header['Location'] = target;
 		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
-		this.constructQuickResponse(libBase.Status.TemporaryRedirect, target, header, {
+		this.sendFullResponse(libBase.Status.TemporaryRedirect, target, header, {
 			media: libBase.Media.Text, body: Buffer.from(`Resource [${this.url.pathname}] temporarily redirects to:\n${target}`, 'utf-8')
 		});
 	}
@@ -1535,7 +1539,7 @@ export class ClientRequest extends ClientBase {
 		header['Location'] = target;
 		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
-		this.constructQuickResponse(libBase.Status.PermanentRedirect, target, header, {
+		this.sendFullResponse(libBase.Status.PermanentRedirect, target, header, {
 			media: libBase.Media.Text, body: Buffer.from(`Resource [${this.url.pathname}] permanently redirects to:\n${target}`, 'utf-8')
 		});
 	}
@@ -1543,22 +1547,18 @@ export class ClientRequest extends ClientBase {
 	/** respond with html, can be built on by parent modules, sent once the request has been fully processed (default status is ok;
 	 *	for HEAD builds, no actual content will be constructed, nor will its size be estimated); cache policy defaults to [private] */
 	public respondHtml(page: libBuilder.HtmlPage, options?: { status?: libBase.StatusType, headers?: Record<string, string>, cache?: CachePolicy }): void {
-		if (this.dropped || (this._state.response != ResponseState.none && this._state.response != ResponseState.preparing))
-			return this.badClientUsage('HTML response on already claimed connection', false);
-
 		const status = (options?.status ?? libBase.Status.Ok);
-		const headers = { ...options?.headers };
-		this.applyCachePolicy(headers, CachePolicy.private, options?.cache);
+		const header = { ...options?.headers };
+		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
 		/* invoke all registered html patchers to let them update the content */
-		this.invokePatcher((patcher) => patcher.html?.(page, status, headers));
-		if (this.dropped || (this._state.response != ResponseState.none && this._state.response != ResponseState.preparing))
-			return;
+		this.invokePatcher((patcher) => patcher.html?.(page, status, header));
 
 		/* mark first as completed now */
 		const content = (this.isHead ? undefined : Buffer.from(page.finalize(), 'utf-8'));
-		this.log(`Responding with HTML content and status [${status.msg}]${this.isHead ? ' as light-response' : ''}`);
-		this.sendFullResponse(status, headers, { media: libBase.Media.Html, body: content });
+		this.sendFullResponse(status, `HTML of size [${content?.byteLength ?? 'light-response'}]`, header, {
+			media: libBase.Media.Html, body: content
+		});
 	}
 
 	/** respond with the value encoded as json; if [isJson], the content is expected to be a valid json string (default status is ok;
@@ -1568,9 +1568,9 @@ export class ClientRequest extends ClientBase {
 		const header = { ...options?.headers };
 		this.applyCachePolicy(header, CachePolicy.private, options?.cache);
 
-		const content = Buffer.from((options?.isJson ? (value as string) : JSON.stringify(value)), 'utf-8');
-		this.constructQuickResponse(status, `JSON of size [${content.byteLength}]`, header, {
-			media: libBase.Media.Json, body: (this.isHead ? undefined : content)
+		const content = (this.isHead ? undefined : Buffer.from((options?.isJson ? (value as string) : JSON.stringify(value)), 'utf-8'));
+		this.sendFullResponse(status, `JSON of size [${content?.byteLength ?? 'light-response'}]`, header, {
+			media: libBase.Media.Json, body: content
 		});
 	}
 
@@ -1677,8 +1677,7 @@ export class ClientRequest extends ClientBase {
 
 		/* check if the file is empty (can only happen for unused ranges, which would otherwise have issues) */
 		if ((reader == null ? cached.fileSize() : reader.contentSize()) === 0) {
-			this.log(`Sending empty content for [${filePath}]`);
-			this.sendFullResponse(libBase.Status.Ok, headers, { media, body: Buffer.alloc(0) });
+			this.sendFullResponse(libBase.Status.Ok, `Empty content of [${filePath}]`, headers, { media, body: Buffer.alloc(0) });
 			return true;
 		}
 		if (range.state == libHelper.RangeState.valid)
