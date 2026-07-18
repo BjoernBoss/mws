@@ -284,8 +284,9 @@ export function escapePlaceholders(content: string): string {
 }
 
 /** normalize the URI encoding of the path to a canonical form by ensuring only the following characters are encoded
- *	('% / \ ? # [ ] < > ^ ' ` { | }', space control characters, and non-ascii), and sanitize the final path (returns
- *	only the sanitized path and 'false', if it contained malformed escape sequences or invalid UTF-8) */
+ *	using uppercase hex ('% / \ ? # [ ] < > ^ " ` { | }', space, control characters, and non-ascii), treating literal
+ *	backslashes as path separators, and sanitize the final path (returns only the sanitized path and 'false', if the
+ *	path contained malformed escape sequences or invalid UTF-8) */
 export function normalizeEncodedPath(path: string): [string, boolean] {
 	const NORMALIZED_VALID_CHARS = /%(24|26|2B|2C|3A|3B|3D|40)/g;
 	const components = path.replaceAll('\\', '/').split('/');

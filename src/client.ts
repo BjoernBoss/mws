@@ -1081,7 +1081,7 @@ export class ClientRequest extends ClientBase {
 			for (const [_from, _to] of Object.entries(map)) {
 				/* normalize and sanitize the encoding of the mapping (to ensure matching against the canonically encoded paths is consistent) */
 				const [from, validFrom] = libHelper.normalizeEncodedPath(_from);
-				const [to, validTo] = (_to == null ? ['', false] : libHelper.normalizeEncodedPath(_to));
+				const [to, validTo]: [string | null, boolean] = (_to == null ? [null, true] : libHelper.normalizeEncodedPath(_to));
 				if (!validFrom || !validTo) {
 					this.warning(`Translation [${_from}] => [${_to}] contains malformed URI encoding`);
 					continue;
