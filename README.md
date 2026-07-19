@@ -43,6 +43,10 @@ server.listen(new HelloModule(), {
 });
 ```
 
+## Logging System
+
+The framework defaults to write all of its logs out to `mws.logGlobal`. It in turn passes the formatted logs to all of the loggers registered via `mws.addLogger`. For convenience, there exist colorful console loggers, file loggers (writes logging contents to a file), log filters, or request loggers, which format the multiple request related logs into single-line logs.
+
 ## Listeners
 
 `server.listen()` returns a `Listener` that emits `'listening'`, `'failed'`, and `'stopped'` events:

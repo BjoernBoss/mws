@@ -257,7 +257,7 @@ export function createLogFilter(target: LogConsumer, filter: (level: LogLevel, i
 *		=> Default: '%{METHOD} [%{URL}] => %{MSG}'
 *	- other: %{MSG} (used for any logs not associated with a request or before/after the request cycle)
 *		=> Default: '%{MSG}' */
-export function createRequestLogger(target: LogConsumer, pattern: { response?: string, issue?: string, socket?: string, file?: string, request?: string, other?: string }): LogConsumer {
+export function createRequestLogger(target: LogConsumer, pattern?: { response?: string, issue?: string, socket?: string, file?: string, request?: string, other?: string }): LogConsumer {
 	const open: Record<string, { values: Record<string, string>, logged: boolean }> = {};
 
 	const patternResponse = pattern?.response ?? '%{METHOD} [%{URL}] => %{CODE} (%{STATUS})';
@@ -303,7 +303,7 @@ export function createRequestLogger(target: LogConsumer, pattern: { response?: s
 			const params: Record<string, string> = { CODE: response[1], STATUS: response[2], SIZE: response[3] ?? '-', TYPE: response[4] ?? '-' };
 			const file = (response[5] == null ? null : response[5].match(_logs.REQUEST_FILE_DETAIL_REGEX));
 
-			if (file != null && pattern.file != null)
+			if (file != null && pattern?.file != null)
 				target(level, date, identity, expandPattern(pattern.file, index, { ...params, FILE: file[1] }));
 			else
 				target(level, date, identity, expandPattern(patternResponse, index, params));
@@ -335,7 +335,7 @@ export function createRequestLogger(target: LogConsumer, pattern: { response?: s
 		if (handleLog(level, date, identity, msg))
 			return;
 
-		if (pattern.other != null)
+		if (pattern?.other != null)
 			target(level, date, identity, expandPattern(pattern.other, null, { MSG: msg }));
 		else
 			target(level, date, identity, msg);
