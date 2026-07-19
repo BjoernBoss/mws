@@ -561,7 +561,7 @@ export class ClientRequest extends ClientBase {
 		/* disconnects and expected breaks (remote-caused or documented cleanup) are logged as
 		*	normal logs, only breaks caused by server-side misbehavior are logged as errors */
 		if (reason != '') {
-			const description = `Connection ${state == ConnectionState.disconnected ? 'disconnected' : 'broken'}: [${reason}]`;
+			const description = libLog._logs.buildConnectionStatusLog(state == ConnectionState.disconnected, reason);
 			if (expected)
 				this.log(description);
 			else
@@ -641,13 +641,7 @@ export class ClientRequest extends ClientBase {
 	}
 
 	private closeHeader(status: libBase.StatusType, headers: Record<string, string>, content: { media: libBase.MediaType, size?: number } | null, logDetail: string | null): boolean {
-		let logMessage = `${this.isHead ? 'HEAD:' : ''}${status.code}:[${status.msg}]`;
-		if (content == null)
-			logMessage += ' with no content';
-		else
-			logMessage += ` of size [${content.size ?? 'unkown'}] and type [${content.media.mediaType}]`;
-		if (logDetail != null)
-			logMessage += `: ${logDetail}`;
+		const logMessage = libLog._logs.buildResponseDescription(status.code, status.msg, (content == null ? null : { size: content.size, type: content.media.mediaType }), logDetail);
 
 		/* configure the default header values */
 		if (!('Accept-Ranges' in headers))
@@ -681,9 +675,9 @@ export class ClientRequest extends ClientBase {
 		}
 
 		if (status.code >= 500)
-			this.error(`Responding with ${logMessage}`);
+			this.error(libLog._logs.buildResponseLog(logMessage));
 		else
-			this.log(`Responding with ${logMessage}`);
+			this.log(libLog._logs.buildResponseLog(logMessage));
 
 		/* mark the response as determined as it will now be sent this way */
 		this._state.response = ResponseState.headerSent;
@@ -704,7 +698,7 @@ export class ClientRequest extends ClientBase {
 	private sendFullResponse(status: libBase.StatusType, logDetail: string | null, headers: Record<string, string>, content: { media: libBase.MediaType, body?: Buffer } | null): void {
 		/* check if the response can still be sent */
 		if (this.dropped || this._state.response == ResponseState.headerSent || this._state.response == ResponseState.completed) {
-			const description = `${this.isHead ? 'HEAD:' : ''}[${status.code}: ${status.msg}]${logDetail == null ? '' : `: ${logDetail}`}`;
+			const description = libLog._logs.buildResponseDescription(status.code, status.msg, (content == null ? null : { size: content.body?.byteLength, type: content.media.mediaType }), logDetail);
 
 			if (this._state.response == ResponseState.completed)
 				return this.warning(`Request already completed, discarding response ${description}`);
@@ -728,10 +722,7 @@ export class ClientRequest extends ClientBase {
 			}
 		}
 
-		let fullDetail = logDetail;
-		if (encoding != null)
-			fullDetail += (logDetail == '' ? 'D' : ' d') + `ynamically [${encoding.name}] encoded from [${contentSize ?? 'unknown'}]`;
-
+		const fullDetail = (encoding == null ? logDetail : (logDetail == null ? 'D' : `${logDetail} d`) + `ynamically [${encoding.name}] encoded from [${contentSize ?? 'unknown'}]`);
 		if (!this.closeHeader(status, headers, (content == null ? null : { media: content.media, size: content.body?.byteLength }), fullDetail))
 			return;
 		this._state.response = ResponseState.completed;
@@ -862,10 +853,14 @@ export class ClientRequest extends ClientBase {
 		const makeErrorStream = (msg: string) => new libStream.Writable({ write(_0, _1, cb) { cb(new Error(msg)) }, final(cb) { cb(new Error(msg)) } });
 
 		/* check if the object is already responded */
-		if (this.dropped)
+		if (this.dropped) {
+			this.trace('Request broken, discarding streamed response');
 			return makeErrorStream('Connection broken');
-		if (this._state.response != ResponseState.none)
+		}
+		if (this._state.response != ResponseState.none) {
+			this.trace('Request already responded, discarding streamed response');
 			return makeErrorStream('Connection already responded');
+		}
 		this._state.response = ResponseState.preparing;
 
 		/* construct the actual response wrapper, which takes care of dynamic encoding and error handling */
@@ -935,12 +930,14 @@ export class ClientRequest extends ClientBase {
 		const makeErrorStream = (msg: string) => new libStream.Readable({ read() { this.destroy(new Error(msg)) } });
 
 		/* check if the object is ready for receiving */
+		if (this.dropped) {
+			this.trace('Request broken, discarding receive');
+			return makeErrorStream('Connection broken');
+		}
 		if (this._state.receive != ReceiveState.none) {
-			this.badClientUsage('Already receiving data', false);
+			this.trace('Request already receiving, discarding additional receive');
 			return makeErrorStream('Connection is already being received');
 		}
-		if (this.dropped)
-			return makeErrorStream('Connection broken');
 		this._state.receive = ReceiveState.receiving;
 
 		/* setup the accumulation transformer (which will also be returned in the end; mark receiving
@@ -1684,7 +1681,7 @@ export class ClientRequest extends ClientBase {
 
 		/* check if the file is empty (can only happen for unused ranges, which would otherwise have issues) */
 		if ((reader == null ? cached.fileSize() : reader.contentSize()) === 0) {
-			this.sendFullResponse(libBase.Status.Ok, `Empty content of [${filePath}]`, headers, { media, body: Buffer.alloc(0) });
+			this.sendFullResponse(libBase.Status.Ok, libLog._logs.buildFileEmpty(filePath), headers, { media, body: Buffer.alloc(0) });
 			return true;
 		}
 		if (range.state == libHelper.RangeState.valid)
@@ -1707,7 +1704,7 @@ export class ClientRequest extends ClientBase {
 		}
 
 		/* create the writer stream (doesn't throw, but errors; enforce the selected encoder) */
-		let logDetail = `File [${range.first} - ${range.last}/${cached.fileSize()}] from [${filePath}]`;
+		let logDetail = libLog._logs.buildFileDetail(range.first, range.last, cached.fileSize(), filePath);
 		if (reader != null) {
 			logDetail += ` encoded using [${dynamicEncoder!.name}]`;
 			if (reader.contentSize() != null)
@@ -1788,8 +1785,10 @@ export class ClientRequest extends ClientBase {
 	/** marks the object as having been handled and returns a web socket or automatically responds
 	 *	with a corresponding error and returns null (automatically validates method and headers) */
 	public async acceptWebSocket(): Promise<ClientSocket | null> {
-		if (this.dropped || (this._state.response != ResponseState.none && this._state.response != ResponseState.preparing))
+		if (this.dropped || (this._state.response != ResponseState.none && this._state.response != ResponseState.preparing)) {
+			this.trace('Request broken or already claimed, discarding websocket upgrade');
 			return null;
+		}
 
 		/* check if the connection is a valid upgrade request (and ensure that the underlying web-server, also detected it) */
 		let connection = libHelper.splitAndTrimList(this.headers.connection?.toLowerCase() ?? null, ',', false);
@@ -1907,7 +1906,7 @@ export class ClientSocket extends ClientBase {
 
 		/* perserve the root identity for internal logs and the log extension of the base for open logs */
 		this._log = { self: this.identity, root: '', tagList: [] };
-		source.log(`WebSocket accepted: [${this.identity}]`);
+		source.log(libLog._logs.buildWebSocketAcceptedLog(this.identity));
 		const extIndex = source.identity.indexOf('.');
 		if (extIndex > 0)
 			this.logSetIdentity(`${this.identity}${source.identity.substring(extIndex)}`);

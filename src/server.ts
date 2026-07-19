@@ -194,8 +194,8 @@ export class Listener {
 		const endpoint = `${this._host.self.identity}.${this._self.endpoint}`;
 
 		/* register the completed log immediately to ensure it is logged as the first thing before the other completed awaits execute */
-		client.log(`Connected to [${endpoint}] using [method: ${client.method ?? '_'}] from [${client.remote.address}]:${client.remote.port} to [${client.url.href}] (user-agent: [${client.headers['user-agent'] ?? ''}])`);
-		client.completed.then(() => client.log(`Completed on [${endpoint}]`));
+		client.log(libLog._logs.buildConnectedLog(endpoint, client.method ?? '_', client.remote.address ?? '_', client.remote.port ?? 0, client.url.href, client.headers['user-agent'] ?? ''));
+		client.completed.then(() => client.log(libLog._logs.buildCompletedLog(endpoint)));
 
 		try {
 			/* initialize the connection (performs initial validations) and then pass it to the handler */

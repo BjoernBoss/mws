@@ -5,7 +5,7 @@ import * as libLog from "./log.js";
 import * as libUrl from "url";
 import * as libPath from "path";
 
-const helperLogger = libLog.createLogger('helper');
+const helperLogger = libLog.createLoggerIdentity('helper');
 
 /* setup the reverse list of file-endings to media types and encoding-names to encoding types */
 const FileEndingToMediaTypeMapping: Record<string, libBase.MediaType> = {};

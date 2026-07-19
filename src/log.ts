@@ -29,6 +29,59 @@ function formatLine(level: LogLevel, date: string, identity: string, msg: string
 		return `[${date}] ${printLevel}: [${identity}] ${msg}\n`;
 	return `[${date}] ${printLevel}: [${identity}] ${msg}`;
 }
+function settleWrapper(consumer: LogConsumer): LogConsumer {
+	let settled = false;
+	return (level: LogLevel | null, date: string, identity: string, msg: string): void => {
+		if (settled) return;
+		if (level == null) settled = true;
+		consumer(level, date, identity, msg);
+	};
+}
+
+export const _logs = {
+	REQUEST_CONNECT_REGEX: /^Connected to \[(.*)\] using \[method: (.*)\] from (\[.*\]:\d+) to \[(.*)\] \(user-agent: \[(.*)\]\)$/,
+	buildConnectedLog: function (endpoint: string, method: string, address: string, port: number, url: string, userAgent: string): string {
+		return `Connected to [${endpoint}] using [method: ${method}] from [${address}]:${port} to [${url}] (user-agent: [${userAgent}])`;
+	},
+
+	REQUEST_COMPLETED_REGEX: /^Completed on \[.*\]$/,
+	buildCompletedLog: function (endpoint: string): string {
+		return `Completed on [${endpoint}]`;
+	},
+
+	REQUEST_RESPONSE_REGEX: /^Responding with (\d+):\[([^\]]*)\](?: of size \[([^\]]*)\] and type \[([^\]]*)\]| with no content)(?:: (.*))?$/,
+	buildResponseLog: function (description: string): string {
+		return `Responding with ${description}`;
+	},
+	buildResponseDescription: function (code: number, msg: string, content: { size?: number, type: string } | null, detail: string | null): string {
+		let output = `${code}:[${msg}]`;
+		if (content == null)
+			output += ' with no content';
+		else
+			output += ` of size [${content.size ?? 'unknown'}] and type [${content.type}]`;
+		if (detail != null)
+			output += `: ${detail}`;
+		return output;
+	},
+
+	REQUEST_FILE_DETAIL_REGEX: /^(?:File \[[^\]]*\] from|Empty file) \[(.*?)\]( .*)?$/,
+	buildFileEmpty: function (filePath: string): string {
+		return `Empty file [${filePath}]`;
+	},
+	buildFileDetail: function (first: number, last: number, total: number, filePath: string): string {
+		return `File [${first} - ${last}/${total}] from [${filePath}]`;
+	},
+
+	REQUEST_CONNECTION_STATUS_REGEX: /^Connection (broken|disconnected): \[(.*)\]$/,
+	buildConnectionStatusLog: function (disconnected: boolean, reason: string): string {
+		return `Connection ${disconnected ? 'disconnected' : 'broken'}: [${reason}]`;
+	},
+
+	REQUEST_WEBSOCKET_REGEX: /^WebSocket accepted: \[(.*)\]$/,
+	buildWebSocketAcceptedLog: function (identity: string): string {
+		return `WebSocket accepted: [${identity}]`;
+	}
+} as const;
 
 /** supported log level */
 export type LogLevel = 'error' | 'info' | 'warning' | 'log' | 'trace';
@@ -41,7 +94,7 @@ export type Detacher = () => void;
 
 /** implementation of a console logger */
 export function createConsoleLogger(): LogConsumer {
-	return (level: LogLevel | null, date: string, identity: string, msg: string) => {
+	return settleWrapper((level: LogLevel | null, date: string, identity: string, msg: string) => {
 		if (level == null)
 			return;
 		let levelPrint: string = formatLevel(level);
@@ -68,15 +121,22 @@ export function createConsoleLogger(): LogConsumer {
 		}
 
 		console.log(`\x1b[90m[${date}] ${levelColor}${levelPrint}\x1b[0m: [\x1b[93m${identity}\x1b[0m] ${msg}`);
-	};
+	});
 }
 
 /** implementation of a logger which receives a well formatted line */
 export function createLineLogger(cb: (line: string) => void): LogConsumer {
-	return (level: LogLevel | null, date: string, identity: string, msg: string) => {
+	return settleWrapper((level: LogLevel | null, date: string, identity: string, msg: string) => {
 		if (level != null)
 			cb(formatLine(level, date, identity, msg, false));
-	};
+	});
+}
+
+/** implementation of a logger which receives the separate log components (cleanup of log consumer is automatically consumed and enforced) */
+export function createLogger(log: (level: LogLevel, date: string, identity: string, msg: string) => void): LogConsumer {
+	return settleWrapper((level: LogLevel | null, date: string, identity: string, msg: string) => {
+		if (level != null) log(level, date, identity, msg);
+	});
 }
 
 /** file overwriting preservation mode */
@@ -126,7 +186,7 @@ export function createFileLogger(filePath: string, options?: { flushingDelayMs?:
 	const sizeSwapFile: number = (options?.sizeSwapFile == null ? DEFAULT_FILE_SIZE_SWAP_FILE : options.sizeSwapFile);
 
 	/* setup the actual closure handler */
-	return (level: LogLevel | null, date: string, identity: string, msg: string) => {
+	return settleWrapper((level: LogLevel | null, date: string, identity: string, msg: string) => {
 		/* check if the logger is being disabled and reset the file state */
 		if (level == null) {
 			flushToFile();
@@ -167,29 +227,123 @@ export function createFileLogger(filePath: string, options?: { flushingDelayMs?:
 
 		try { fileHandle = libFs.openSync(filePath, 'w'); } catch (_) { }
 		logFileSize = 0;
-	};
+	});
 }
 
-/** implementation of a log filter, which can filter by matching level and identity including a given sub-string, and then forwards these logs to the target logger */
-export function createLogFilter(target: LogConsumer, options?: { level?: LogLevel | LogLevel[], identity?: string | string[] }): LogConsumer {
-	const filterLevel = (options?.level == null ? null : new Set<string>(Array.isArray(options.level) ? options.level : [options.level]));
-	const filterIdentity = (options?.identity == null ? null : (Array.isArray(options.identity) ? options.identity : [options.identity]));
-
-	return (level: LogLevel | null, date: string, identity: string, msg: string) => {
+/** implementation of a log filter, which only forwards logs, which the filter callback deem relevant, based on the level and identity */
+export function createLogFilter(target: LogConsumer, filter: (level: LogLevel, identity: string, msg: string) => boolean): LogConsumer {
+	return settleWrapper((level: LogLevel | null, date: string, identity: string, msg: string) => {
 		if (level == null)
 			return target(null, '', '', '');
 
-		/* check if the level is supported */
-		if (filterLevel != null && !filterLevel.has(level))
-			return;
-		if (filterIdentity != null && !filterIdentity.some((value) => identity.includes(value)))
-			return;
-		target(level, date, identity, msg);
+		/* check if the message should be logged */
+		if (filter(level, identity, msg))
+			target(level, date, identity, msg);
+	});
+}
+
+/** implementation of a request logger, which condenses the various logs produced per request/upgrade into a single
+*	line per relevant event (response sent, connection issue, websocket accepted) and formatted using the given patterns
+*	(unknown placeholders are left as-is, missing values are set to '-'; unknown request behavior is logged as an issue).
+*	The logger consumes request flow logs (connect > response/issue/socket > completed).
+*	- all requests: %{ENDPOINT} (endpoint), %{METHOD} (method), %{REMOTE} (remote), %{URL} (url), %{AGENT} (user-agent)
+*	- response/file: %{CODE}, %{STATUS}, %{SIZE}, %{TYPE} - file additionally %{FILE} (falls back to response if not given)
+*		=> Default: '%{METHOD} [%{URL}] => %{CODE} (%{STATUS})'
+*	- issue: %{WHAT}, %{REASON}
+*		=> Default: '%{METHOD} [%{URL}] => %{WHAT}'
+*	- socket: %{SOCKET}
+*		=> Default: '%{METHOD} [%{URL}] => WebSocket Accepted (%{SOCKET})'
+*	- request: %{MSG} (request related logs, which where not part of the parsed request flow)
+*		=> Default: '%{METHOD} [%{URL}] => %{MSG}'
+*	- other: %{MSG} (used for any logs not associated with a request or before/after the request cycle)
+*		=> Default: '%{MSG}' */
+export function createRequestLogger(target: LogConsumer, pattern: { response?: string, issue?: string, socket?: string, file?: string, request?: string, other?: string }): LogConsumer {
+	const open: Record<string, { values: Record<string, string>, logged: boolean }> = {};
+
+	const patternResponse = pattern?.response ?? '%{METHOD} [%{URL}] => %{CODE} (%{STATUS})';
+	const patternIssue = pattern?.issue ?? '%{METHOD} [%{URL}] => %{WHAT}';
+	const patternSocket = pattern?.socket ?? '%{METHOD} [%{URL}] => WebSocket Accepted (%{SOCKET})';
+	const patternRequest = pattern?.request ?? '%{METHOD} [%{URL}] => %{MSG}';
+
+	const expandPattern = (pattern: string, index: string | null, params: Record<string, string>): string => {
+		const entry = (index == null ? null : open[index]);
+		if (entry != null)
+			entry.logged = true;
+
+		const values: Record<string, string> = { ...entry?.values, ...params };
+		return pattern.replace(/%\{(\w+)\}/g, (match, key) => values[key] ?? match);
 	};
+
+	const handleLog = (level: LogLevel, date: string, identity: string, msg: string): boolean => {
+		if (!identity.startsWith('request!') && !identity.startsWith('upgrade!'))
+			return false;
+		const endOfId = identity.indexOf('.');
+		const index = (endOfId < 0 ? identity : identity.substring(0, endOfId));
+
+		/* check if this is the initial connection */
+		if (!(index in open)) {
+			const match = msg.match(_logs.REQUEST_CONNECT_REGEX);
+			if (match == null)
+				return false;
+			open[index] = { values: { ENDPOINT: match[1], METHOD: match[2], REMOTE: match[3], URL: match[4], AGENT: match[5] }, logged: false };
+			return true;
+		}
+
+		/* check if the request has been completed */
+		if (msg.match(_logs.REQUEST_COMPLETED_REGEX)) {
+			if (!open[index].logged)
+				target('error', date, identity, expandPattern(patternIssue, index, { WHAT: 'Logger issue', REASON: 'No behavior was found to be logged' }));
+			delete open[index];
+			return true;
+		}
+
+		/* check if the response has been sent (a file response uses the file pattern, if provided) */
+		const response = msg.match(_logs.REQUEST_RESPONSE_REGEX);
+		if (response != null) {
+			const params: Record<string, string> = { CODE: response[1], STATUS: response[2], SIZE: response[3] ?? '-', TYPE: response[4] ?? '-' };
+			const file = (response[5] == null ? null : response[5].match(_logs.REQUEST_FILE_DETAIL_REGEX));
+
+			if (file != null && pattern.file != null)
+				target(level, date, identity, expandPattern(pattern.file, index, { ...params, FILE: file[1] }));
+			else
+				target(level, date, identity, expandPattern(patternResponse, index, params));
+			return true;
+		}
+
+		/* check if a connection issue was encountered */
+		const connection = msg.match(_logs.REQUEST_CONNECTION_STATUS_REGEX);
+		if (connection != null) {
+			target(level, date, identity, expandPattern(patternIssue, index, { WHAT: `Connection ${connection[1]}`, REASON: connection[2] }));
+			return true;
+		}
+
+		/* check if a websocket was accepted */
+		const websocket = msg.match(_logs.REQUEST_WEBSOCKET_REGEX);
+		if (websocket != null) {
+			target(level, date, identity, expandPattern(patternSocket, index, { SOCKET: websocket[1] }));
+			return true;
+		}
+
+		/* expand the default request pattern */
+		target(level, date, identity, expandPattern(patternRequest, index, { MSG: msg }));
+		return true;
+	};
+
+	return settleWrapper((level: LogLevel | null, date: string, identity: string, msg: string): void => {
+		if (level == null)
+			return target(level, date, identity, msg);
+		if (handleLog(level, date, identity, msg))
+			return;
+
+		if (pattern.other != null)
+			target(level, date, identity, expandPattern(pattern.other, null, { MSG: msg }));
+		else
+			target(level, date, identity, msg);
+	});
 }
 
 /** logger class to extend, supporting various logging classes, and writing to the registered log consumer */
-export function createLogger(identity: string): Logger {
+export function createLoggerIdentity(identity: string): Logger {
 	return new Logger(identity);
 }
 export class Logger {
