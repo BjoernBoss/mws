@@ -48,6 +48,8 @@ export const Media = {
 	Gif: { fileEnding: ['gif'], mediaType: 'image/gif', encoding: '', compressible: false },
 	Jpg: { fileEnding: ['jpg', 'jpeg'], mediaType: 'image/jpeg', encoding: '', compressible: false },
 	Svg: { fileEnding: ['svg'], mediaType: 'image/svg+xml', encoding: 'charset=utf-8', compressible: true },
+	Pdf: { fileEnding: ['pdf'], mediaType: 'application/pdf', encoding: '', compressible: false },
+	Markdown: { fileEnding: ['md'], mediaType: 'text/markdown', encoding: 'charset=utf-8', compressible: true },
 	Zip: { fileEnding: ['zip'], mediaType: 'application/zip', encoding: '', compressible: false },
 	Archive7z: { fileEnding: ['7z'], mediaType: 'application/x-7z-compressed', encoding: '', compressible: false },
 	Rar: { fileEnding: ['rar'], mediaType: 'application/vnd.rar', encoding: '', compressible: false },
