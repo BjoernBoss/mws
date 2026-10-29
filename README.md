@@ -2,7 +2,7 @@
 ![TypeScript](https://img.shields.io/badge/language-TypeScript-blue?style=flat-square)
 [![License](https://img.shields.io/badge/license-BSD--3--Clause-brightgreen?style=flat-square)](LICENSE.txt)
 
-A lightweight TypeScript framework for hosting isolated modules behind HTTP/HTTPS and WebSocket endpoints. Each module owns a subtree in the URL space and is isolated from its siblings. Modules compose into trees for path-based routing, hostname routing, and request interception.
+A lightweight TypeScript framework for hosting isolated modules behind HTTP/HTTPS and WebSocket endpoints. Each module owns a subtree in the URL space and is isolated from its siblings. Modules can perform routing to sub-modules, thereby redirecting the URL flow, depending on given behavior or states.
 
 The server integrates various automation features, such as error handling, validations, caching... Further, it contains integrated logging for proper connection tracing and logging.
 
@@ -45,7 +45,7 @@ server.listen(new HelloModule(), {
 
 ## Logging System
 
-The framework defaults to write all of its logs out to `mws.logGlobal`. It in turn passes the raw log components (level, date, identity, message) to all of the loggers registered via `mws.addLogger`; formatting happens inside the individual logger implementations. For convenience, there exist colorful console loggers, file loggers (writes logging contents to a file), log filters, or request loggers, which format the multiple request related logs into single-line logs.
+The framework defaults to write all of its logs out to `mws.logGlobal`. It in turn passes the raw log components (level, date, identity, message) to all of the loggers registered via `mws.addLogger`. Formatting happens inside the individual logger implementations. For convenience, there exist colorful console loggers, file loggers (writes logging contents to a file), log filters, or request loggers, which format the multiple request related logs into single-line logs.
 
 ## Listeners
 
@@ -59,7 +59,7 @@ listener.on('failed', (err) => console.error(`Failed: ${err.message}`));
 listener.on('stopped', () => console.log('Stopped'));
 ```
 
-A serverless listener does not bind to a port. Instead, connections are passed to it manually via `listener.handleRequest()` and `listener.handleUpgrade()` (can also be used for other listeners):
+A serverless listener does not bind to a port. Instead, connections are passed to it manually via `listener.handleRequest()` and `listener.handleUpgrade()` (can also be used on other listeners to feed connections into them):
 
 ```typescript
 const listener = server.listen(handler, { serverless: { secure: false } });
@@ -99,9 +99,9 @@ export class MyModule extends ModuleHandler {
 }
 ```
 
-Only `handleRequest` is required. A module owns its entire subtree: if the handler returns without responding, the framework defaults to `404 Not Found`. Parent modules can intercept any child response - including the auto not-found - via the `patch` interface.
+Only `handleRequest` is required. A module owns its entire subtree: if the handler returns without responding, the framework defaults to `404 Not Found`. Parent modules can intercept any child response (including the auto not-found) via the `patch` interface.
 
-Modules form a tree via `linkModule()`. They only ever see requests relative to their `root`. Path translation happens automatically when dispatching to children - client paths are rebased relative to each child module's position in the tree. A module can be linked to multiple parents and will only be initialized once, on first attachment to a server.
+Modules form a tree via `linkModule()`. They only ever see requests relative to their `root`. Path translation happens automatically when dispatching to children. The client paths are rebased relative to each child module's position in the tree. A module can be linked to multiple parents and will only be initialized once, on first attachment to a server.
 
 ### Remapping Endpoints of Children
 
@@ -118,7 +118,7 @@ protected override async handleRequest(client: ClientRequest): Promise<void> {
 
 Translations are matched by longest path and reversed for any paths the child generates (via `client.makePath`), so links and redirects produced by the child automatically point back into the outer URL space. A `null` target hides a path from the child entirely. A generated path not covered by a translation is identity mapped, and logs a warning.
 
-This makes a module's endpoint layout a default rather than a contract: modules define canonical endpoint paths (typically exported as an `Endpoints` constant), but a parent can fully re-map them - e.g. exposing one endpoint at the mount root and moving the auxiliary endpoints elsewhere - as long as every endpoint the child generates paths for remains mapped.
+This makes a module's endpoint layout a default rather than enforced: modules define canonical endpoint paths (typically exported as an `Endpoints` constant), but a parent can fully re-map them (e.g. exposing one endpoint at the mount root and moving the auxiliary endpoints elsewhere) as long as every endpoint the child generates paths for remains mapped.
 
 The following example maps the child module to `/child` and makes the child's path `/settings` unreachable. Note: paths into `/settings` generated by the child will still be created, but any lookup of them will fail.
 
@@ -135,7 +135,7 @@ All possible mappings are considered when reversing the mappings, not just the t
 
 ### Response Patching
 
-Parent modules can register a `Patcher` to inspect and modify - or entirely replace - responses produced further down the module tree:
+Parent modules can register a `Patcher` to inspect and modify, or entirely replace, responses produced further down the module tree:
 
 ```typescript
 client.patch({
@@ -169,7 +169,7 @@ Calling `module.stop()` detaches the module and waits for its active clients to 
 
 Factory functions create common module patterns without subclassing:
 
-### dispatch - Path Routing
+### Path Routing: `dispatch`
 
 Routes requests to children by longest URL path match. Stops itself once all children have been unlinked.
 
@@ -183,7 +183,7 @@ server.listen(dispatch({
 }), { port: 8080 });
 ```
 
-### host - Hostname Routing
+### Hostname Routing: `host`
 
 Routes requests to children by longest hostname match (supports sub-domain matching).
 
@@ -196,7 +196,7 @@ server.listen(host({
 }), { port: 8080 });
 ```
 
-### bind - Parameter and Translation Binding
+### Parameter and Translation Binding: `bind`
 
 Forwards all requests to a single child handler, optionally injecting `params` and a path `translate` map.
 
@@ -209,7 +209,7 @@ const bound = bind(myModule, {
 });
 ```
 
-### check - Host and Port Validation
+### Host and Port Validation: `check`
 
 Validates the request hostname and port before forwarding. Responds `404` and kills the connection on mismatch.
 
@@ -219,7 +219,7 @@ import { check } from "@bjoernboss/mws";
 const checked = check(myModule, ['localhost', '127.0.0.1'], { port: 8080 });
 ```
 
-### lambda - Callback-Based Handler
+### Callback-Based Handler: `lambda`
 
 Handles requests via callbacks instead of subclassing, with optional attached child modules.
 
@@ -246,7 +246,7 @@ const handler = lambda({
 
 `ClientRequest` automatically manages requests to handle errors, prevent double-responses, and ensure expected HTTP behavior.
 
-Receiving and responding can be started in any order and may overlap (e.g. streaming an upload back out as the response). As soon as a module starts receiving or responding, the request counts as *claimed*: it will not be dispatched to any further modules, and it must be fully completed - response completed, receive consumed - before the handler returns. Leaving a claimed request incomplete aborts its streams and answers the request with an internal error. A module owns its entire subtree - if the handler returns without claiming the request, or does not respond to it, the framework defaults to `404 Not Found`. Parent modules can intercept any response via the `patch` interface.
+Receiving and responding can be started in any order and may overlap (e.g. streaming an upload back out as the response). As soon as a module starts receiving or responding, the request counts as *claimed*: it will not be dispatched to any further modules, and it must be fully completed (response completed, receive consumed) before the handler returns. Leaving a claimed request incomplete aborts its streams and answers the request with an internal error. A module owns its entire subtree. If the handler returns without claiming the request, or does not respond to it, the framework defaults to `404 Not Found`. Parent modules can intercept any response via the `patch` interface.
 
 ### Receiving Data
 
@@ -260,7 +260,7 @@ const text = await client.receiveAllText('utf-8', 1_000_000);
 /* as a readable stream */
 const stream = client.receiveData(1_000_000);
 
-/* directly to a file via the cache (atomic: writes to a temp file, then renames) */
+/* directly to a file via the cache (atomic and durable: writes to a temp file, flushes it to the disk, then renames) */
 await server.cache.write('/uploads/file.bin', client.receiveData(10_000_000));
 
 /* directly to a file via the cache (create-only: throws if the file already exists) */
@@ -273,7 +273,7 @@ await server.cache.write('/uploads/file.bin', client.receiveData(10_000_000), { 
 /* simple text or buffer */
 client.respond('OK', { media: Media.Text, status: Status.Ok });
 
-/* streaming response */
+/* streaming response (full completion must be awaited before returning from the handler) */
 const writer = client.respondData({ media: Media.Json, disableEncoding: true });
 writer.once('error', (e) => failure(e));
 writer.end(JSON.stringify(data));
@@ -361,13 +361,18 @@ When a request arrives for an immutable path, the cache strips the version tag, 
 
 ### Direct Cache Access
 
-These methods are designed for modules to be used, and allows directly to write to the disk, and update the cache at the same time. May throw exceptions.
+These methods are designed for modules to be used, and allows directly to write to the disk, and update the cache at the same time.
 
 ```typescript
 const buffer = await server.cache.read('/path/to/data.json');
 await server.cache.write('/path/to/output.json', JSON.stringify(data));
 await server.cache.write('/path/to/output.bin', readableStream);
 await server.cache.remove('/path/to/old.json');
+
+/* skip the disk flushes for disposable data */
+await server.cache.write('/path/to/scratch.bin', buffer, { durable: false });
+
+/* flush all cached data to ensure they are re-fetched from disk */
 server.cache.flush();
 ```
 
