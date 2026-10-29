@@ -170,12 +170,14 @@ class CacheManager {
 	private totalCapacity: number;
 	private largestSize: number;
 	private nextAge: number;
+	private flushedAge: number;
 
 	public constructor(logger: libLog.Logger, cacheSize: number, fileSizeLimit: number) {
 		this.logger = logger;
 		this.totalCapacity = cacheSize;
 		this.largestSize = fileSizeLimit;
 		this.nextAge = 0;
+		this.flushedAge = 0;
 	}
 
 	private reduce(maximum: number): void {
@@ -189,6 +191,10 @@ class CacheManager {
 
 	public add(path: string, data: Buffer, mtime: number, age: number): void {
 		if (!this.cacheable(data.byteLength))
+			return;
+
+		/* check if the data were fetched before the last flush, in which case the data are considered outdated */
+		if (age <= this.flushedAge)
 			return;
 
 		/* check if the entry is already part of the cache and check if the current entry should be evicted */
@@ -252,6 +258,10 @@ class CacheManager {
 	public flush(): void {
 		this.map = {};
 		this.allocated = 0;
+
+		/* store the flush-age to ensure reads, which were started
+		*	before the flush, cannot re-populate the cache */
+		this.flushedAge = this.nextAge;
 	}
 	public find(path: string, stats: { mtime: number, size: number } | null): CacheEntry | null {
 		const entry = this.map[path] ?? null;
@@ -527,6 +537,14 @@ class ImmutableManager {
 	public invalidate(): void {
 		for (const identifier in this.map)
 			this.map[identifier].fetched = false;
+	}
+	public modified(path: string): void {
+		/* mark all entries bound to the file-system path as unfetched
+		*	to ensure their stats are re-validated on the next access */
+		for (const identifier in this.map) {
+			if (this.map[identifier].fileSystem == path)
+				this.map[identifier].fetched = false;
+		}
 	}
 }
 
@@ -880,7 +898,7 @@ export class CacheHost extends libLog.Logger {
 		return this._immutableManager.make(module, path, options?.checkFreshness ?? false);
 	}
 
-	/** flush all cached data and invalidate immutable stats so they are re-checked on next access */
+	/** flush all cached data and invalidate immutable stats so they are re-checked on next access (includes in-flight reads) */
 	public flush(): void {
 		this.info('Flushing cache and invalidating immutable entries');
 		this._cacheManager.flush();
@@ -926,13 +944,13 @@ export class CacheHost extends libLog.Logger {
 		}
 	}
 
-	/** [throws] write data atomically to the disk and conditionally update the cache (designed for modules
-	 *	to interact with; writes as utf-8; writes data first to temporary file and then replaces the file
-	 *	atomically; for create: must not replace an existing file and writes directly to the destination,
-	 *	hence not atomically; for mtime: apply the given modified-time in milliseconds since the epoch to
-	 *	the written file; empty what string will not log anything; durable (default): flush the data to the
-	 *	disk before replacing the file and the directory afterwards, such that a crash leaves either the old
-	 *	or the complete new file, durable: false skips the flushes for disposable data; ) */
+	/** [throws] write data atomically to the disk and update the cache (designed for modules to interact
+	 *	with; writes as utf-8; writes data first to temporary file and then replaces the file atomically;
+	 *	for create: must not replace an existing file and writes directly to the destination, hence not
+	 *	atomically; for mtime: apply the given modified-time in milliseconds since the epoch to the written
+	 *	file; empty what string will not log anything; durable (default): flush the data to the disk before
+	 *	replacing the file and the directory afterwards, such that a crash leaves either the old or the
+	 *	complete new file, durable: false skips the flushes for disposable data) */
 	public async write(path: string, data: Buffer | string | libStream.Readable | FileReadable, options?: { what?: string, temporary?: string, create?: boolean, mtime?: number, durable?: boolean }): Promise<void> {
 		let collected: Buffer | null = null;
 		if (typeof data == 'string')
@@ -942,8 +960,10 @@ export class CacheHost extends libLog.Logger {
 		else if (isFileReadable(data) && this._cacheManager.cacheable(data.fileSize))
 			data = sniffStream(data, data.fileSize, (sniffed: Buffer) => { collected = sniffed; });
 
-		/* write the data atomically to the destination (let errors propagate out) */
+		/* write the data atomically to the destination (let errors propagate out) and ensure
+		*	the immutable manager is notified in order to potentially re-check its stats */
 		await atomicWrite(path, data, this, { what: (options?.what ?? 'via cache'), temporary: options?.temporary, create: options?.create, mtime: options?.mtime, durable: options?.durable });
+		this._immutableManager.modified(path);
 
 		/* check if the data are available and can be written to the cache (unsized streamed data will not be cached, as their
 		*	size cannot be determined; drop any existing cache entry in that case, as it now contains outdated content) */
@@ -976,8 +996,9 @@ export class CacheHost extends libLog.Logger {
 			existed = false;
 		}
 
-		/* remove the data from the cache */
+		/* remove the data from the cache and ensure any immutable entries of the file are re-validated as well */
 		this._cacheManager.drop(path);
+		this._immutableManager.modified(path);
 		return existed;
 	}
 }

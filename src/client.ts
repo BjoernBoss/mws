@@ -217,7 +217,8 @@ class HttpRequestResponse extends libStream.Writable {
 
 type ClientSocketEvents = { 'data': (data: Buffer) => void, 'close': () => void };
 
-/** look at a response and optionally update or change it (must not perform any asynchronous operations) */
+/** look at a response and optionally update or change it (must not perform any
+ *	asynchronous operations, response must have been fully completed before returning) */
 export interface Patcher {
 	/** inspect and patch/update actual responses */
 	response?: (status: libBase.StatusType, headers: Record<string, string>) => void;
@@ -770,10 +771,13 @@ export class ClientRequest extends ClientBase {
 		if (fullContentSize == null && last && !this.isHead)
 			fullContentSize = (chunk?.byteLength ?? 0);
 
+		/* helper to setup the error message, should the response not succeed (as a patcher responded, for example) */
+		const discarded = () => new Error(this.dropped ? 'Connection broken' : 'Response already claimed');
+
 		/* check if the content should be dynamically encoded */
 		if (resp.disableEncoding) {
 			if (!this.closeHeader(resp.status, resp.headers, { media: resp.contentType, size: fullContentSize ?? undefined }, resp.logDetail))
-				return cb(null);
+				return cb(discarded());
 			return this.sendClientWrite(resp, chunk, last, cb);
 		}
 
@@ -782,7 +786,7 @@ export class ClientRequest extends ClientBase {
 		let encoding = libHelper.negotiateEncoding(this.headers['accept-encoding'] ?? null, fullContentSize ?? chunk?.byteLength ?? null, resp.contentType);
 		if (encoding == null) {
 			if (!this.closeHeader(resp.status, resp.headers, { media: resp.contentType, size: fullContentSize ?? undefined }, resp.logDetail))
-				return cb(null);
+				return cb(discarded());
 			return this.sendClientWrite(resp, chunk, last, cb);
 		}
 		resp.headers['Content-Encoding'] = encoding.name;
@@ -811,7 +815,7 @@ export class ClientRequest extends ClientBase {
 
 		const logDetail = (resp.logDetail ?? '') + (resp.logDetail == null ? 'D' : ' d') + `ynamically [${encoding.name}] encoded`;
 		if (!this.closeHeader(resp.status, resp.headers, { media: resp.contentType, size: fullContentSize ?? undefined }, logDetail))
-			return cb(null);
+			return cb(discarded());
 		return this.sendClientWrite(resp, chunk, last, cb);
 	}
 	private sendClientWrite(resp: HttpRequestResponse, chunk: Buffer | null, last: boolean, cb: (err: any) => void): void {
