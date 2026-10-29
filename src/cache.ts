@@ -5,6 +5,7 @@ import * as libHelper from "./helper.js";
 import * as libBase from "./base.js";
 import * as libFs from "fs";
 import * as libFsPromises from "fs/promises";
+import * as libPath from "path";
 import * as libStream from "stream";
 import * as libCrypto from "crypto";
 
@@ -64,17 +65,35 @@ function sniffStream(stream: libStream.Readable, expected: number | null, callba
 	});
 	return sniffer;
 }
-async function atomicWrite(path: string, content: Buffer | libStream.Readable, logger: libLog.Logger, options?: { what?: string, temporary?: string, create?: boolean, mtime?: number }): Promise<void> {
+async function syncFile(path: string): Promise<void> {
+	/* open the file and flush it (as writable as windows will otherwise not flush) */
+	const handle = await libFsPromises.open(path, 'r+');
+	try { await handle.sync(); }
+	finally { await handle.close().catch(() => { }); }
+}
+async function syncDirectory(path: string, logger: libLog.Logger): Promise<void> {
+	const directory = libPath.dirname(path);
+
+	/* flush the directory containing the path to commits its entries to
+	*	disk (best effort as this does not work for all OS and filesystems) */
+	try {
+		const handle = await libFsPromises.open(directory, 'r');
+		try { await handle.sync(); }
+		finally { await handle.close().catch(() => { }); }
+	} catch (_: any) { }
+}
+async function atomicWrite(path: string, content: Buffer | libStream.Readable, logger: libLog.Logger, options?: { what?: string, temporary?: string, create?: boolean, mtime?: number, durable?: boolean }): Promise<void> {
 	/* default temporary names are unique to prevent concurrent writes to the same path from corrupting each other */
-	const tempPath = (options?.temporary ?? `${path}.${process.pid}-${++nextTemporaryId}.temp`), create = (options?.create === true);
+	const tempPath = (options?.temporary ?? `${path}.${process.pid}-${++nextTemporaryId}.temp`), create = (options?.create === true), durable = (options?.durable !== false);
 	if (options?.what != '')
 		logger.trace(`Writing ${options?.what ?? 'data'} to [${path}]`);
+	const writePath = (create ? path : tempPath);
 
 	/* eagerly create the destination file to let creation failures propagate out immediately and separately from any write failures (for
 	*	create: to detect an already existing file; an open-failure leaves the content stream unconsumed, hence release it explicitly) */
 	let handle: libFsPromises.FileHandle;
 	try {
-		handle = await libFsPromises.open((create ? path : tempPath), (create ? 'wx' : 'w'));
+		handle = await libFsPromises.open(writePath, (create ? 'wx' : 'w'));
 	} catch (err: any) {
 		if (content instanceof libStream.Readable)
 			content.destroy();
@@ -105,21 +124,27 @@ async function atomicWrite(path: string, content: Buffer | libStream.Readable, l
 		/* apply the explicit modified-time (before the rename, to let the file be moved into place fully
 		*	configured; as fractional seconds, to prevent sub-millisecond stat values from being truncated) */
 		if (options?.mtime != null)
-			await libFsPromises.utimes((create ? path : tempPath), options.mtime / 1000, options.mtime / 1000);
+			await libFsPromises.utimes(writePath, options.mtime / 1000, options.mtime / 1000);
+
+		/* check if this is a durable operation, in which case the file needs to be flushed before being renamed */
+		if (durable)
+			await syncFile(writePath);
 		written = true;
 
-		/* move the file into place */
+		/* move the file into place and try to make the new directory entry durable as well */
 		if (!create)
 			await libFsPromises.rename(tempPath, path);
+		if (durable)
+			await syncDirectory(path, logger);
 	} catch (err: any) {
 		if (options?.what != '')
-			logger.trace(`Removing partially written [${create ? path : tempPath}]`);
+			logger.trace(`Removing partially written [${writePath}]`);
 
 		/* try to remove the partial/temporary file */
-		try { await libFsPromises.unlink(create ? path : tempPath); }
+		try { await libFsPromises.unlink(writePath); }
 		catch (err: any) {
 			if (err.code != 'ENOENT')
-				logger.warning(`Failed to remove temporary file [${create ? path : tempPath}]: ${err.message}`);
+				logger.warning(`Failed to remove ${create ? 'partial' : 'temporary'} file [${writePath}]: ${err.message}`);
 		}
 
 		if (written)
@@ -905,8 +930,10 @@ export class CacheHost extends libLog.Logger {
 	 *	to interact with; writes as utf-8; writes data first to temporary file and then replaces the file
 	 *	atomically; for create: must not replace an existing file and writes directly to the destination,
 	 *	hence not atomically; for mtime: apply the given modified-time in milliseconds since the epoch to
-	 *	the written file; empty what string will not log anything) */
-	public async write(path: string, data: Buffer | string | libStream.Readable | FileReadable, options?: { what?: string, temporary?: string, create?: boolean, mtime?: number }): Promise<void> {
+	 *	the written file; empty what string will not log anything; durable (default): flush the data to the
+	 *	disk before replacing the file and the directory afterwards, such that a crash leaves either the old
+	 *	or the complete new file, durable: false skips the flushes for disposable data; ) */
+	public async write(path: string, data: Buffer | string | libStream.Readable | FileReadable, options?: { what?: string, temporary?: string, create?: boolean, mtime?: number, durable?: boolean }): Promise<void> {
 		let collected: Buffer | null = null;
 		if (typeof data == 'string')
 			data = Buffer.from(data, 'utf-8');
@@ -916,7 +943,7 @@ export class CacheHost extends libLog.Logger {
 			data = sniffStream(data, data.fileSize, (sniffed: Buffer) => { collected = sniffed; });
 
 		/* write the data atomically to the destination (let errors propagate out) */
-		await atomicWrite(path, data, this, { what: (options?.what ?? 'via cache'), temporary: options?.temporary, create: options?.create, mtime: options?.mtime });
+		await atomicWrite(path, data, this, { what: (options?.what ?? 'via cache'), temporary: options?.temporary, create: options?.create, mtime: options?.mtime, durable: options?.durable });
 
 		/* check if the data are available and can be written to the cache (unsized streamed data will not be cached, as their
 		*	size cannot be determined; drop any existing cache entry in that case, as it now contains outdated content) */
