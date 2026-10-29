@@ -242,6 +242,48 @@ const handler = lambda({
 });
 ```
 
+### Method and Path Routing: `makeRouter`
+
+`makeRouter` is not a module but a helper for use inside a module. It builds a function that matches the request method and path against a list of routes and invokes the target of the best match. It returns `true` if the client was dispatched or responded to, and `false` if no route matched the path, in which case the client is left untouched.
+
+```typescript
+import { makeRouter, ModuleHandler, ClientRequest } from "@bjoernboss/mws";
+
+export class ApiModule extends ModuleHandler {
+	private router = makeRouter([
+		{ method: 'GET', pattern: '/', target: async (client) => client.respondJson({ ok: true }) },
+		{ method: 'GET', pattern: '/users/:id', target: async (client, args) => client.respondJson(await loadUser(args.id)) },
+		{ method: 'POST', pattern: '/users/:id', target: async (client, args) => { /* ... */ } },
+		{ method: 'GET', pattern: '/files/+path', target: async (client, args) => {
+			if (!await client.tryRespondFile(`/var/www${args.path}`))
+				client.respondNotFound();
+		} },
+		{ method: '*', pattern: '/*', target: async (client) => client.respondNotFound() }
+	]);
+
+	constructor() {
+		super('api');
+	}
+
+	protected override async handleRequest(client: ClientRequest): Promise<void> {
+		await this.router(client);
+	}
+}
+```
+
+Methods are matched on HTTP methods or `*` as wildcard. Pattern components are separated by `/` and are matched against the sanitized request path:
+
+| Component | Matches | Captured Value |
+|---|---|---|
+| `name` | exactly this component (compared URI decoded) | *(nothing)* |
+| `:name` | exactly one component | the component, URI decoded |
+| `+name` | one or more remaining components | sanitized absolute path, e.g. `/a/b` |
+| `*name` | zero or more remaining components | sanitized absolute path, `/` if empty |
+
+A catch-all (`+`, `*`) must be the last component; anything after it is ignored. An empty name (`:`, `+`, `*`) matches but discards the capture. The request path is split into components before decoding, so an encoded slash never acts as a separator.
+
+**Matching:** When several routes match, the highest specificity is chosen. When they match, the method is compared for specificity. If it also matches, they are picked by order.
+
 ## Request Handling
 
 `ClientRequest` automatically manages requests to handle errors, prevent double-responses, and ensure expected HTTP behavior.

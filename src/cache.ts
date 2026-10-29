@@ -80,7 +80,7 @@ async function syncDirectory(path: string, logger: libLog.Logger): Promise<void>
 		const handle = await libFsPromises.open(directory, 'r');
 		try { await handle.sync(); }
 		finally { await handle.close().catch(() => { }); }
-	} catch (_: any) { }
+	} catch (_) { }
 }
 async function atomicWrite(path: string, content: Buffer | libStream.Readable, logger: libLog.Logger, options?: { what?: string, temporary?: string, create?: boolean, mtime?: number, durable?: boolean }): Promise<void> {
 	/* default temporary names are unique to prevent concurrent writes to the same path from corrupting each other */

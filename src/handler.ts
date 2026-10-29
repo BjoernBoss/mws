@@ -714,3 +714,174 @@ export class LambdaModule extends ModuleHandler {
 export type CallbackSetup = (this: ModuleHandler, server: libServer.Server, links: Record<string, AttachedModule>) => Promise<void>;
 export type CallbackHandle = (this: ModuleHandler, client: libClient.ClientRequest, params: Params | undefined, links: Record<string, AttachedModule>) => Promise<void>;
 export type CallbackStop = (this: ModuleHandler, links: Record<string, AttachedModule>) => Promise<void>;
+
+/**
+*	Create a router, which matches client method and path to multiple targets.
+*	Supported patterns are:
+*		[:name]: for a single matching path component
+*		[+name]: a non-empty final catch-all
+*		[*name]: final catch-all (may be empty)
+*	The final components implicitly end the pattern. Empty name strings will simply discard the captured string.
+*	The matching occurs against the URI decoded path components. Variables capture the URI decoded component.
+*	Catch-alls capture sanitized and canonically URI encoded absolute paths.
+*	Both method and path must match for a given route to be taken. The method [*] matches any method.
+*	The 'HEAD' method will implicitly be mapped to 'GET' targets, unless prevented via [headExplicit].
+*
+*	Routes are compared by specificity of the path patterns. On equal patterns,
+*	specificity of the method decides. Should this also match, order decides.
+*
+*	If paths match, but none of the methods, the router responds with [method-not-allowed], unless disabled with [noMethodResponse: true].
+*	Returns true, if the client was dispatched or responded to, and otherwise false.
+*/
+export function makeRouter(routes: Route[], options?: { noMethodResponse?: boolean }): Router {
+	type RouteStep = { match?: string; variable?: string; catchAny?: string; catchRest?: string; };
+	type RouteParsed = { steps: RouteStep[]; method: string; headExplicit?: boolean; target: RouteTarget };
+	type RouteOpen = { route: RouteParsed; args: Record<string, string>; index: number; caught: boolean; scores: number[]; method: number };
+
+	/* scores of the separate steps and methods */
+	const SCORE_STATIC = 3, SCORE_VARIABLE = 2, SCORE_CATCH_REST = 1, SCORE_CATCH_ANY = 0;
+	const SCORE_METHOD_NONE = -1, SCORE_METHOD_WILDCARD = 0, SCORE_METHOD_IMPLICIT = 1, SCORE_METHOD_EXPLICIT = 2;
+
+	/* helper to split the path in components (root path consists of no components) and to compare route matches */
+	const splitComponents = (path: string): string[] => {
+		const sanitized = libHelper.sanitize(path, false);
+		return (sanitized == '/' ? [] : sanitized.substring(1).split('/'));
+	};
+	const compareBestMatch = (a: RouteOpen, b: RouteOpen): boolean => {
+		/* compare by first pattern, then method, and otherwise keep the b route */
+		for (let i = 0; i < Math.min(a.scores.length, b.scores.length); ++i) {
+			if (a.scores[i] != b.scores[i])
+				return (a.scores[i] > b.scores[i]);
+		}
+		if (a.scores.length != b.scores.length)
+			return (a.scores.length < b.scores.length);
+		return (a.method > b.method);
+	};
+
+	/* parse all of the routes into the separate route-steps and setup the corresponding set */
+	const totalRoutes: RouteParsed[] = [];
+	for (const route of routes) {
+		const parsed: RouteParsed = { steps: [], method: route.method, headExplicit: route.headExplicit, target: route.target };
+		totalRoutes.push(parsed);
+
+		/* iterate over the separate path components and construct the route-steps from them */
+		for (const component of splitComponents(route.pattern)) {
+			if (component.startsWith('*')) {
+				parsed.steps.push({ catchAny: component.substring(1) });
+				break;
+			}
+			if (component.startsWith('+')) {
+				parsed.steps.push({ catchRest: component.substring(1) });
+				break;
+			}
+			else if (component.startsWith(':'))
+				parsed.steps.push({ variable: component.substring(1) });
+			else
+				parsed.steps.push({ match: component });
+		}
+	}
+
+	/* setup the router, which finds the best fully matching route */
+	return async (client: libClient.ClientRequest): Promise<boolean> => {
+		/* collect all routes and score their method against the request */
+		const open: RouteOpen[] = totalRoutes.map((route) => {
+			let method = SCORE_METHOD_NONE;
+			if (route.method == client.method)
+				method = SCORE_METHOD_EXPLICIT;
+			else if (route.method == 'GET' && route.headExplicit !== true && client.method == 'HEAD')
+				method = SCORE_METHOD_IMPLICIT;
+			else if (route.method == '*')
+				method = SCORE_METHOD_WILDCARD;
+			return { route, args: {}, index: 0, caught: false, scores: [], method };
+		});
+
+		/* iterate over the path components and apply them to the open set */
+		for (const component of splitComponents(client.path)) {
+			let decoded = component;
+			try { decoded = decodeURIComponent(decoded); } catch (_) { }
+
+			/* match the component against the open routes and remove bad routes */
+			for (let i = 0; i < open.length; ++i) {
+				const entry = open[i];
+
+				/* check if the end of the route has been reached */
+				if (entry.index >= entry.route.steps.length) {
+					open.splice(i--, 1);
+					continue;
+				}
+				const next = entry.route.steps[entry.index];
+
+				/* check if the next component matches */
+				if (next.match != null) {
+					if (decoded == next.match)
+						++entry.index, entry.scores.push(SCORE_STATIC);
+					else
+						open.splice(i--, 1);
+					continue;
+				}
+
+				/* check if its a single variable */
+				if (next.variable != null) {
+					if (next.variable != '')
+						entry.args[next.variable] = decoded;
+					++entry.index, entry.scores.push(SCORE_VARIABLE);
+					continue;
+				}
+
+				/* it must be a catch-all, simply consume the content */
+				const name: string = next.catchRest ?? next.catchAny!;
+				if (name != '')
+					entry.args[name] = libHelper.joinSanitized(entry.args[name] ?? '/', component);
+				entry.caught = true;
+			}
+		}
+
+		/* iterate over the remaining open routes and check if they have reached a valid end condition and find
+		*	the best match of the matching methods, and otherwise collect the methods allowed for this path */
+		let best: RouteOpen | null = null, allowed: string[] = [];
+		for (const entry of open) {
+			/* check if more than a single catch-all remains, in which case the route cannot have been satisfied */
+			if (entry.index + 1 < entry.route.steps.length)
+				continue;
+
+			/* check if the final catch-all is satisfied (ensure the catch-any path is sanitized) */
+			if (entry.index < entry.route.steps.length) {
+				const next = entry.route.steps[entry.index];
+				if (next.catchAny == null && (next.catchRest == null || !entry.caught))
+					continue;
+				if (next.catchAny != null && next.catchAny != '' && !entry.caught)
+					entry.args[next.catchAny] = '/';
+				entry.scores.push(next.catchAny != null ? SCORE_CATCH_ANY : SCORE_CATCH_REST);
+			}
+
+			/* check if the method does not match, in which case only the allowed methods are collected */
+			if (entry.method == SCORE_METHOD_NONE) {
+				if (!allowed.includes(entry.route.method))
+					allowed.push(entry.route.method);
+				if (entry.route.method == 'GET' && entry.route.headExplicit !== true && !allowed.includes('HEAD'))
+					allowed.push('HEAD');
+				continue;
+			}
+
+			/* check if this is the best match yet */
+			if (best == null || compareBestMatch(entry, best))
+				best = entry;
+		}
+
+		/* check if a match was found and execute it */
+		if (best != null) {
+			await best.route.target(client, best.args);
+			return true;
+		}
+
+		/* check if the path was matched by routes of other methods and respond accordingly */
+		if (allowed.length == 0 || options?.noMethodResponse === true)
+			return false;
+		client.respondMethodNotAllowed(client.method, allowed.join(','));
+		return true;
+	};
+}
+
+export type RouteTarget = (client: libClient.ClientRequest, args: Record<string, string>) => Promise<void>;
+export type Route = { method: string, pattern: string, target: RouteTarget, headExplicit?: boolean };
+export type Router = (client: libClient.ClientRequest) => Promise<boolean>;
