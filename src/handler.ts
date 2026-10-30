@@ -731,11 +731,12 @@ export type CallbackStop = (this: ModuleHandler, links: Record<string, AttachedM
 *	specificity of the method decides. Should this also match, order decides.
 *
 *	If paths match, but none of the methods, the router responds with [method-not-allowed], unless disabled with [noMethodResponse: true].
+*	An optional context value (such as the parameters of the module) is passed through to the target of the matched route.
 *	Returns true, if the client was dispatched or responded to, and otherwise false.
 */
-export function makeRouter(routes: Route[], options?: { noMethodResponse?: boolean }): Router {
+export function makeRouter<T = void>(routes: Route<T>[], options?: { noMethodResponse?: boolean }): Router<T> {
 	type RouteStep = { match?: string; variable?: string; catchAny?: string; catchRest?: string; };
-	type RouteParsed = { steps: RouteStep[]; method: string; headExplicit?: boolean; target: RouteTarget };
+	type RouteParsed = { steps: RouteStep[]; method: string; headExplicit?: boolean; target: RouteTarget<T> };
 	type RouteOpen = { route: RouteParsed; args: Record<string, string>; index: number; caught: boolean; scores: number[]; method: number };
 
 	/* scores of the separate steps and methods */
@@ -782,7 +783,7 @@ export function makeRouter(routes: Route[], options?: { noMethodResponse?: boole
 	}
 
 	/* setup the router, which finds the best fully matching route */
-	return async (client: libClient.ClientRequest): Promise<boolean> => {
+	return async (client: libClient.ClientRequest, context: T): Promise<boolean> => {
 		/* collect all routes and score their method against the request */
 		const open: RouteOpen[] = totalRoutes.map((route) => {
 			let method = SCORE_METHOD_NONE;
@@ -870,7 +871,7 @@ export function makeRouter(routes: Route[], options?: { noMethodResponse?: boole
 
 		/* check if a match was found and execute it */
 		if (best != null) {
-			await best.route.target(client, best.args);
+			await best.route.target(client, best.args, context);
 			return true;
 		}
 
@@ -882,6 +883,6 @@ export function makeRouter(routes: Route[], options?: { noMethodResponse?: boole
 	};
 }
 
-export type RouteTarget = (client: libClient.ClientRequest, args: Record<string, string>) => Promise<void>;
-export type Route = { method: string, pattern: string, target: RouteTarget, headExplicit?: boolean };
-export type Router = (client: libClient.ClientRequest) => Promise<boolean>;
+export type RouteTarget<T = void> = (client: libClient.ClientRequest, args: Record<string, string>, context: T) => Promise<void>;
+export type Route<T = void> = { method: string, pattern: string, target: RouteTarget<T>, headExplicit?: boolean };
+export type Router<T = void> = (client: libClient.ClientRequest, context: T) => Promise<boolean>;
